@@ -48,6 +48,11 @@ module_name:
 **Description:** Maximum number of solver iterations (rarely reached if solver converges).  
 **Example:** `max_iterations: 50`
 
+### `work_dir`
+**Type:** `string` (directory path)  
+**Description:** Working directory where output files will be saved. The directory will be created if it doesn't exist. Supports `~` expansion and environment variables. If not specified, outputs are saved in the current directory.  
+**Example:** `work_dir: ~/git/PRESTOS/example/`
+
 ---
 
 ## State Module
@@ -538,6 +543,9 @@ surrogate:
 Here is a complete `run_config.yaml` demonstrating all modules:
 
 ```yaml
+# Working directory for outputs
+work_dir: ~/git/PRESTOS/example/
+
 max_iterations: 50
 
 # Initial plasma state

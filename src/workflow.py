@@ -65,6 +65,14 @@ def run_workflow(setup_file="setup.yaml"):
     with open(setup_file) as f:
         config = yaml.safe_load(f)
 
+    # Set working directory if specified
+    work_dir = config.get("work_dir")
+    if work_dir:
+        work_dir = os.path.expanduser(os.path.expandvars(str(work_dir)))
+        os.makedirs(work_dir, exist_ok=True)
+        os.chdir(work_dir)
+        print(f"Working directory set to: {work_dir}")
+
     # Build state first (supports from_gacode path)
     state = build_state(config.get("state", {}))
 

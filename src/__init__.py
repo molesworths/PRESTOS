@@ -1,5 +1,5 @@
 """
-MinT Standalone Solver
+PRESTOS Standalone Solver
 
 A modular, lightweight transport solver for rapid development and testing.
 """
