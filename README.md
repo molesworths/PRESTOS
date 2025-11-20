@@ -4,8 +4,13 @@
 
 A modular, parametric tokamak plasma transport solver with integrated surrogate modeling for rapid kinetic profile optimization via flux matching.
 
-[![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
+
+---
+
+## Status
+
+Much of the PRESTOS functionality remains under development. Please report issues, suggest improvements, and ask to become a contributor. 
 
 ---
 
@@ -72,7 +77,7 @@ python workflow.py --help
 
 PRESTOS reads plasma state from GACODE format files. Ensure you have an `input.gacode` file with radial profiles of kinetic quantities (ne, te, ti, etc.).
 
-Example location in `setup.yaml`:
+Example location in `run_config.yaml`:
 ```yaml
 state:
   args:
@@ -81,7 +86,7 @@ state:
 
 ### 2. Configure your run
 
-Edit `setup.yaml` to specify:
+Edit `run_config.yaml` to specify:
 - Transport model (Fingerprints, TGLF, Fixed)
 - Solver type (RelaxSolver, FiniteDifferenceSolver, BayesianOptSolver, TimeStepperSolver)
 - Parameterization scheme (SplineParameterModel)
@@ -93,12 +98,12 @@ See [Configuration Guide](#configuration-guide) below.
 ### 3. Run the solver
 
 ```bash
-python workflow.py setup.yaml
+python workflow.py run_config.yaml
 ```
 
 Or using pixi:
 ```bash
-pixi run python workflow.py setup.yaml
+pixi run python workflow.py run_config.yaml
 ```
 
 Output:
@@ -117,7 +122,7 @@ Outputs saved to `analysis_outputs/` by default. See [Analysis & Reporting](#ana
 
 ## Configuration Guide
 
-### `setup.yaml` Structure
+### `run_config.yaml` Structure
 
 The workflow is controlled by a single YAML file specifying all modules and their options.
 
@@ -257,20 +262,20 @@ Surrogates are trained on-the-fly during solver iterations and can replace expen
 ### Basic workflow execution
 
 ```bash
-python workflow.py setup.yaml
+python workflow.py run_config.yaml
 ```
 
 ### Using alternative setup files
 
 ```bash
-python workflow.py path/to/custom_setup.yaml
+python workflow.py path/to/custom_run_config.yaml
 ```
 
 ### Command-line interface
 
 ```bash
 python workflow.py --help
-python workflow.py --setup my_setup.yaml
+python workflow.py --setup my_run_config.yaml
 ```
 
 ### Expected outputs
@@ -293,7 +298,7 @@ PRESTOS includes an automated analysis toolkit for visualizing solver performanc
 analysis_level: standard  # 'minimal' | 'standard' | 'full'
 
 solver_history: solver_history.csv
-setup_file: setup.yaml
+setup_file: run_config.yaml
 output_dir: analysis_outputs
 
 style:
@@ -368,7 +373,7 @@ TRANSPORT_MODELS = {
 }
 ```
 
-3. Use in `setup.yaml`:
+3. Use in `run_config.yaml`:
 
 ```yaml
 transport:
@@ -403,7 +408,7 @@ SOLVER_MODELS = {
 }
 ```
 
-3. Use in `setup.yaml`:
+3. Use in `run_config.yaml`:
 
 ```yaml
 solver:
@@ -414,7 +419,7 @@ solver:
 
 ### Adding options to existing modules
 
-All module options are passed through the `args` dict in `setup.yaml` and accessed via `self.options` in the class constructor.
+All module options are passed through the `args` dict in `run_config.yaml` and accessed via `self.options` in the class constructor.
 
 Example: Add a new option to `FingerprintsModel`:
 
@@ -468,7 +473,7 @@ PRESTOS follows a straightforward iteration loop:
 
 ### Modularity
 
-Each module is instantiated via a factory pattern from `setup.yaml`. Classes are dynamically loaded by `workflow.build_module()`, enabling easy swapping of implementations without code changes.
+Each module is instantiated via a factory pattern from `run_config.yaml`. Classes are dynamically loaded by `workflow.build_module()`, enabling easy swapping of implementations without code changes.
 
 ---
 
@@ -480,7 +485,7 @@ Each module is instantiated via a factory pattern from `setup.yaml`. Classes are
 - Ensure all dependencies are installed: `pixi install` or `pip install -r requirements.txt`
 
 **FileNotFoundError: input.gacode**
-- Check the path in `setup.yaml` under `state.args.from_gacode`
+- Check the path in `run_config.yaml` under `state.args.from_gacode`
 - Use absolute paths or paths relative to execution directory
 
 **Solver not converging**
@@ -502,7 +507,7 @@ If you use PRESTOS in your research, please cite:
 
 ```
 @software{prestos2025,
-  author = {Molesworth, Samuel},
+  author = {Molesworth, Steve},
   title = {PRESTOS: Parametric Rapid Extensible Surrogate Transport Optimization Solver},
   year = {2025},
   url = {https://github.com/molesworths/PRESTOS}
@@ -513,7 +518,7 @@ If you use PRESTOS in your research, please cite:
 
 ## License
 
-MIT License - see LICENSE file for details.
+Not available at this time.
 
 ---
 
