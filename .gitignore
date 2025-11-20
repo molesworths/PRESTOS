@@ -1,0 +1,7 @@
+.pixi/
+.vscode/
+solver_checkpoint.pkl/
+run_config.yaml
+analysis_config.yaml
+pixi.lock
+solver_history.csv

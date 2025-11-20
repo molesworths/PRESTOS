@@ -1,0 +1,33 @@
+# This is a basic pixi environment configuration for Python development
+# For more options, see: https://pixi.sh/docs/reference/pixi.toml/
+
+[project]
+name = "PRESTOS"
+channels = ["conda-forge"]
+platforms = ["linux-64"]
+
+[dependencies]
+python = ">=3.8,<3.13"
+numpy = "*"
+scipy = "*"
+pandas = "*"
+matplotlib = "*"
+seaborn = "*"
+scikit-learn = "*"
+scikit-optimize = "*"
+jax = ">=0.7.2,<0.8"
+jaxlib = ">=0.7.2,<0.8"
+debugpy = ">=1.8.17,<2"
+requests = ">=2.32.5,<3"
+aurora = ">=0.0.1,<0.0.2"
+
+[pypi-dependencies]
+pyqt6 = ">=6.9.1, <7"
+#pytorch = "*"
+#botorch = "*"
+#tensorflow = "*"
+#keras = "*"
+#LightGBM = "*"
+
+#[feature.dev.dependencies]
+# Add development dependencies here, e.g. pytest, black, etc.
