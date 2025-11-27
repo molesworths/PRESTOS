@@ -113,10 +113,56 @@ Output:
 ### 4. Generate analysis plots
 
 ```bash
-python -m analysis.reporting --config analysis/plot_config.yaml
+python analysis.reporting --config analysis/plot_config.yaml
 ```
 
 Outputs saved to `analysis_outputs/` by default. See [Analysis & Reporting](#analysis--reporting) for details.
+
+---
+
+## Running the Example
+
+PRESTOS includes a working example in the `example/` directory with pre-configured files.
+
+### 1. Navigate to example directory
+
+```bash
+cd example
+```
+
+### 2. Run the solver
+
+From the example directory, call the workflow script from the source directory:
+
+```bash
+python <PRESTOS_ROOT>/src/workflow.py ./run_config.yaml
+```
+
+Where `<PRESTOS_ROOT>` is the path to your PRESTOS installation (e.g., `~/git/PRESTOS`).
+
+Using pixi:
+```bash
+pixi run python <PRESTOS_ROOT>/src/workflow.py ./run_config.yaml
+```
+
+This will:
+- Load the plasma state from `input.gacode`
+- Run the solver according to `run_config.yaml`
+- Generate `solver_history.csv` with iteration data
+
+### 3. Run analysis
+
+Generate visualization plots from the solver output:
+
+```bash
+python <PRESTOS_ROOT>/src/analysis.py -c ./analysis_config.yaml -w .
+```
+
+Arguments:
+- `-c, --config`: Path to analysis configuration file
+- `-w, --workdir`: Working directory containing solver output files (use `.` for current directory)
+
+Outputs will be saved to `analysis_outputs/` (configurable in `analysis_config.yaml`).
 
 ---
 
@@ -292,49 +338,67 @@ After a successful run:
 
 PRESTOS includes an automated analysis toolkit for visualizing solver performance and surrogate behavior.
 
-### Configuration: `analysis/plot_config.yaml`
+### Configuration: `analysis_config.yaml`
 
 ```yaml
-analysis_level: standard  # 'minimal' | 'standard' | 'full'
-
-solver_history: solver_history.csv
-setup_file: run_config.yaml
-output_dir: analysis_outputs
-
-style:
-  dpi: 120
-  figsize_small: [6, 4]
-  figsize_medium: [7, 5]
-  figsize_wide: [10, 5]
-
-plots:
-  objective: true
-  residual_channels: true
-  profiles_initial_final: true
-  targets_final: true
-  surrogate_sensitivity: false  # Only in 'full' mode
-  surrogate_pca: true
+reporting:
+  level: standard  # 'minimal' | 'standard' | 'full'
+  
+  data:
+    solver_history: solver_history.csv
+    run_config: run_config.yaml
+  
+  output:
+    directory: analysis_outputs
+  
+  style:
+    dpi: 120
+    figsize:
+      small: [6, 4]
+      medium: [7, 5]
+      wide: [10, 5]
+  
+  sensitivity:
+    n_features: 10  # Number of top features to plot in sensitivity analysis
 ```
 
 ### Analysis levels
 
 - **minimal**: Objective convergence, initial vs final profiles, final target comparison
-- **standard**: minimal + residual channel evolution, PCA on parameter space
-- **full**: standard + surrogate sensitivity analysis
+- **standard**: minimal + residual channel evolution, PCA on parameter space, surrogate heatmap
+- **full**: standard + detailed surrogate sensitivity scatter plots with hierarchical feature importance
 
 ### Generate plots
 
 ```bash
-python -m analysis.reporting --config analysis/plot_config.yaml
+python <PRESTOS_ROOT>/src/analysis.py -c analysis_config.yaml -w <work_directory>
 ```
 
-Outputs saved to `analysis_outputs/`:
+Arguments:
+- `-c, --config`: Path to analysis configuration YAML file
+- `-w, --workdir`: Directory containing `solver_history.csv` and `run_config.yaml`
+
+Outputs saved to configured output directory (default: `analysis_outputs/`):
+
+**Minimal level:**
 - `objective.png`: Objective vs iteration (model vs surrogate markers)
-- `residual_channels.png`: Residual component evolution
 - `profile_<name>.png`: Parameter comparison (initial vs final) for each profile
 - `target_<name>.png`: Model vs target at final iteration
+
+**Standard level (includes minimal plus):**
+- `residual_channels.png`: Residual component evolution
 - `surrogate_pca.png`: PCA component evolution and feature loadings
-- `surrogate_sensitivity.png`: Sensitivity of objective to each parameter (heuristic gradient)
+- `surrogate_heatmap.png`: Feature importance from GP length scales (inverse RBF length scale 1/l_rbf)
+  - Rows: features, Columns: outputs, Color: importance magnitude
+  - Global mode: single heatmap; Local mode: grid of heatmaps per evaluation point
+
+**Full level (includes standard plus):**
+- `surrogate_sensitivity.png`: Scatter plots of top features vs outputs, colored by evaluation index
+  - Feature importance computed hierarchically:
+    1. Permutation importance on rebuilt surrogate models
+    2. Fallback: Mutual information regression
+    3. Final fallback: Pearson correlation
+  - Normalized per output variable
 
 ---
 

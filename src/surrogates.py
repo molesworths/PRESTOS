@@ -181,7 +181,7 @@ class SurrogateManager:
 
     def get_outputs(self, transport: dict, targets: dict) -> np.ndarray:
         """Construct output array for all transport and target variables."""
-        Y_sample = np.empty((len(self.roa_eval), len(self.transport_vars) + len(self.target_vars)))
+        Y_sample = np.empty((len(self.roa_eval), len(self.output_list)))
         for i, roa in enumerate(self.roa_eval):
             transport_sample = np.array([transport[name][i] for name in self.transport_vars], dtype=float)
             targets_sample = np.array([targets[name][i] for name in self.target_vars], dtype=float)
@@ -237,10 +237,16 @@ class SurrogateManager:
         # Transform samples
         X_all_samples = self.x_scaler.fit_transform(X_all_samples.reshape(-1,n_features)).reshape(n_samples,n_roa,n_features)
 
-        for j, key in enumerate(self.output_list):
+        for j, key in enumerate(self.models.keys()):
             if self.mode == 'global':
                 # Reshape to (n_samples * n_roa, n_features)
                 X_fit = X_all_samples.reshape(-1, n_features)
+
+                # Option to transform with PCA here if desired
+                # if self.n_pca is not None:
+                    # pca = PCA(n_components=self.n_pca)
+                    # X_fit = pca.fit_transform(X_fit)
+
                 # Reshape to (n_samples * n_roa,)
                 Y_fit = self.y_scalers[key].fit_transform(Y_all_samples[:, :, j].reshape(-1,1))
                 self.models[key].fit(X_fit, Y_fit)
@@ -249,6 +255,12 @@ class SurrogateManager:
                 for i, model in enumerate(self.models[key]):
                     # X for i-th roa from all samples: (n_samples, n_features)
                     i_features = X_all_samples[:, i, :]
+
+                    # Option to transform with PCA here if desired
+                    # if self.n_pca is not None:
+                        # pca = PCA(n_components=self.n_pca)
+                        # i_features = pca.fit_transform(i_features)
+
                     # Y for i-th roa and j-th output from all samples: (n_samples,)
                     i_outputs = self.y_scalers[key].fit_transform(Y_all_samples[:, i, j].reshape(-1,1))
                     model.fit(i_features, i_outputs)
@@ -256,6 +268,9 @@ class SurrogateManager:
 
         self.trained = True
         self.score = scores # R^2
+        self.hyperparameters = {key: model.get_hyperparameters() if self.mode == 'global' else
+                        [m.get_hyperparameters() for m in model]
+                        for key, model in self.models.items()}
 
     # ------------------------------------------------
     # Evaluation
@@ -307,7 +322,7 @@ class SurrogateManager:
                 summed_value = sum(transport[c] for c in components)
                 # For independent variables, variances add
                 summed_std = np.sqrt(sum(transport_std[c]**2 for c in components))
-                transport[base_var] = summed_value
+                transport[base_var] = summed_value # is this correct?
                 transport_std[base_var] = summed_std
 
         self.transport = transport
@@ -365,7 +380,7 @@ class GaussianProcessSurrogate(SurrogateBase):
         return self.model.score(X,Y)
 
     def get_hyperparameters(self) -> Dict[str, Any]:
-        return {"kernel": str(self.model.kernel_)}
+        return {"C": self.model.kernel_.k1.constant_value**0.5,"l_rbf": self.model.kernel_.k2.length_scale}
 
 
 # -------------------------
