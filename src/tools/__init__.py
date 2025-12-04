@@ -76,6 +76,13 @@ from .geometry import (
     xsec_area_RZ,
 )
 
+from .atomics import (
+    AtomicDataInterpolator,
+    atomic,
+    radiation,
+    get_atom_data,
+)
+
 __all__ = [
     # calc
     'aLy', 'produce_log_gradient', 'integrate_log_gradient', 'produce_gradient_lin', 'integrate_gradient_lin',
@@ -90,4 +97,6 @@ __all__ = [
     'isfloat', 'isint', 'isnum', 'islistarray', 'isAnyNan', 'clipstr', 'get_root',
     # geometry
     'calculateGeometricFactors', 'volp_surf_Miller_vectorized', 'xsec_area_RZ',
+    # atomics
+    'atomic', 'radiation','AtomicDataInterpolator', 'get_atom_data',
 ]

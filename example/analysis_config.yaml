@@ -1,0 +1,47 @@
+# Plotting configuration for analysis/reporting script
+# analysis_level selects subset of figures.
+# Levels:
+#   minimal: objective + profiles + power flows
+#   standard: minimal + residual channels + feature-output heat map
+#   full: standard + surrogate sensitivities
+analysis_level: full
+
+# Paths
+solver_history: solver_history.csv
+setup_file: setup.yaml  # optional; needed for surrogate sensitivity if reconstruction required
+output_dir: analysis_outputs
+
+# Figure style options
+style:
+  dpi: 120
+  figsize_small: [6,4]
+  figsize_medium: [7,5]
+  figsize_wide: [10,5]
+  borders: {
+    top: 0.9,
+    bottom: 0.1,
+    left: 0.1,
+    right: 0.92
+  }
+  hspace: 0.25
+  font_scale: 1.0
+  palette: tab10
+
+# Plot toggles (override by analysis_level)
+plots:
+  objective: true
+  residual_channels: true
+  profiles_initial_final: true
+  targets_final: true
+  surrogate_sensitivity: true
+  surrogate_pca: true
+
+# Sensitivity settings
+sensitivity:
+  n_features: 5
+
+# Saving options
+save:
+  formats: [png]
+  tight_layout: true
+  transparent: false

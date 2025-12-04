@@ -1,0 +1,74 @@
+# Where to store files
+work_dir: 
+
+# Initial plasma state: point to a GACODE profiles file
+state:
+  args:
+    from_gacode: input.gacode
+
+boundary:
+  class: boundary.TwoFluidTwoPoint_PeretSSF
+  args: {}
+    
+
+# Parameter model (optional in current solver flow)
+parameters:
+  class: parameterizations.SplineParameterModel
+  args:
+    knots: [0.88, 0.91, 0.94, 0.97, 1.0] # alt: n_params_per_prof: []
+    spline_type: pchip
+    defined_on: aLy
+    include_zero_grad_on_axis: True
+    sigma: 0.05 # relative uncertainty on parameters, 1 sigma
+
+neutrals:
+  class: neutrals.DiffusiveNeutralModel
+  args:
+    n0_edge: [1e-4,1e-7] # 1e19/m^3
+
+transport:
+  class: transport.FingerprintsModel
+  args:
+    modes: all
+    sigma: 0.05 # relative uncertainty on transport model, 1 sigma
+
+targets:
+  class: targets.AnalyticTargetModel
+  args:
+    scale_Pe_beam: 1.0
+    scale_Pi_beam: 1.0
+    sigma: 0 # relative uncertainty on targets, 1 sigma
+    # example arguments for later on
+
+solver:
+  class: solvers.RelaxSolver
+  args:
+    # map your predicted profiles to target variables from transport/targets
+    predicted_profiles: [ne, te, ti]
+    target_vars: [Ce, Pe, Pi]
+    roa_eval: [0.88, 0.91, 0.94, 0.97, 1.0]
+    domain: [0.88, 1.0]
+    tol: 1e-3
+    max_iter: 1000
+    use_surrogate: true
+    use_jacobian: true
+    objective: mse
+    normalize_residual: true # normalizes ith component by abs(target[i])
+    scale_objective: true # divides total by N_channels
+    step_size: 1e-1
+    bounds: [0,100] # two element list applied to all parameters or list of n_parameters tuples
+    # alt bounds formats: {ne:[0,100],te:[0,100],ti:[0,100]} OR 
+    #       [[lower,upper] for n_params_per_profile] OR
+    #       {predicted_profile[i]:[lower bound, upper bound],...}
+    #   more customized options not yet implemented
+
+# Optional single-output surrogate (currently unused by default)
+surrogate:
+  class: surrogates.SurrogateManager
+  args:
+    type: gp
+    mode: global
+    kwargs:
+      length_scale: 1.0
+      variance: 1.0
+      noise: 1e-4

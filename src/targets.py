@@ -12,8 +12,15 @@ from scipy.integrate import cumulative_trapezoid
 from state import PlasmaState
 from tools import plasma,calc
 from scipy.constants import pi, e, m_u, u, epsilon_0, k
-import aurora
-
+try:
+    import aurora
+    AURORA_AVAILABLE = True
+except ImportError:
+    # Optional: print a warning
+    import warnings
+    warnings.warn("Aurora is not available. Atomic rates will be determined via polynomial interpolation.")
+    import tools.atomics as aurora
+    AURORA_AVAILABLE = False
 class TargetModel:
     """
     Base class for target models.
@@ -202,18 +209,18 @@ class AnalyticTargetModel(TargetModel):
             sp_name = sp['name']
             sp_Z = sp['Z']
 
-            atom_data = aurora.get_atom_data(sp_name, ['acd', 'scd', 'ccd'])
-            _,fZ = aurora.atomic.get_frac_abundances(atom_data, ne_cm3, Te_eV=te_eV, Ti_eV=ti_eV[:,sidx],
-                                                    n0_by_ne=n0_cm3/ne_cm3,plot=False)
-            nZ_cm3, n_total = self._build_nZ_from_fZ(fZ, n0_cm3, ni_cm3, smooth_weight=True)
-
             try:
+                atom_data = aurora.get_atom_data(sp_name, ['acd', 'scd', 'ccd'])
+                _,fZ = aurora.atomic.get_frac_abundances(atom_data, ne_cm3, Te_eV=te_eV, Ti_eV=ti_eV[:,sidx],
+                                                        n0_by_ne=n0_cm3/ne_cm3,plot=False)
+                nZ_cm3, _ = self._build_nZ_from_fZ(fZ, n0_cm3, ni_cm3, smooth_weight=True)
+
                 rad = aurora.radiation.compute_rad(sp_name,nZ_cm3,ne_cm3,te_eV,
-                                                   n0=n0_cm3,Ti=ti_eV,prad_flag=True,
-                                                   thermal_cx_rad_flag=True)
+                                                    n0=n0_cm3,Ti=ti_eV,prad_flag=True,
+                                                    thermal_cx_rad_flag=True)
 
                 q_rad += rad['tot'].sum(axis=1)
-                q_brem += rad['brem'].sum(axis=1)
+                q_brem += rad['brems'].sum(axis=1)
                 q_cont += rad['cont_rad'].sum(axis=1)
                 q_line += rad['line_rad'].sum(axis=1)
                 q_cx += rad['thermal_cx_cont_rad'].sum(axis=1)

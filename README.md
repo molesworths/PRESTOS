@@ -66,7 +66,7 @@ pip install numpy scipy pandas matplotlib seaborn scikit-learn scikit-optimize j
 ### Verify installation
 
 ```bash
-python workflow.py --help
+python <PRESTOS_ROOT>/src/workflow.py --help
 ```
 
 ---
@@ -98,12 +98,12 @@ See [Configuration Guide](#configuration-guide) below.
 ### 3. Run the solver
 
 ```bash
-python workflow.py run_config.yaml
+python <PRESTOS_ROOT>/src/workflow.py run_config.yaml
 ```
 
 Or using pixi:
 ```bash
-pixi run python workflow.py run_config.yaml
+pixi run python <PRESTOS_ROOT>/src/workflow.py run_config.yaml
 ```
 
 Output:
@@ -308,20 +308,20 @@ Surrogates are trained on-the-fly during solver iterations and can replace expen
 ### Basic workflow execution
 
 ```bash
-python workflow.py run_config.yaml
+python <PRESTOS_ROOT>/src/workflow.py run_config.yaml
 ```
 
 ### Using alternative setup files
 
 ```bash
-python workflow.py path/to/custom_run_config.yaml
+python <PRESTOS_ROOT>/src/workflow.py path/to/custom_run_config.yaml
 ```
 
 ### Command-line interface
 
 ```bash
-python workflow.py --help
-python workflow.py --setup my_run_config.yaml
+python <PRESTOS_ROOT>/src/workflow.py --help
+python <PRESTOS_ROOT>/src/workflow.py --setup my_run_config.yaml
 ```
 
 ### Expected outputs
