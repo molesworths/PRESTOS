@@ -63,6 +63,8 @@ class AtomicDataInterpolator:
             if all(col in first_row.index for col in scaler_cols):
                 self.scalers = {col: first_row[col] for col in scaler_cols}
             
+            self.coefficients = {'radiation': {}}
+            
             # Load coefficients
             for _, row in species_data.iterrows():
                 process = row['process']
@@ -70,19 +72,20 @@ class AtomicDataInterpolator:
                 degree = int(row['degree'])
                 n_features = int(row['n_features'])
                 intercept = row['intercept']
-                
                 coeff_cols = [col for col in row.index if col.startswith('coeff_')]
                 coefficients = [row[col] for col in coeff_cols if not pd.isna(row[col])]
-                
-                if process not in self.coefficients:
-                    self.coefficients[process] = {}
-                
-                self.coefficients[process][charge_state_key] = {
+                component = process.replace('radiation_', '') if process.startswith('radiation_') else None
+
+                container = self.coefficients['radiation'].setdefault(component,{}) if component else self.coefficients.setdefault(process, {})
+
+                entry_dict = {
                     'degree': degree,
                     'n_features': n_features,
                     'coefficients': np.array(coefficients),
                     'intercept': intercept,
                 }
+                container[charge_state_key] = entry_dict
+            
         except Exception:
             # Loading failed; keep coefficients empty so caller can handle fallback
             pass
@@ -245,7 +248,7 @@ class AtomicDataInterpolator:
                     component_data = rad_coeffs[internal_name]
                     
                     # Check if this is total radiation (scalar per spatial point)
-                    if isinstance(component_data, dict) and 'coefficients' in component_data:
+                    if component_data.get(-1,None):
                         # Total radiation: (n_spatial,) -> need to broadcast to (n_charge, n_spatial)
                         total_rad = self._poly_radiation(ne, Te, Ti, internal_name, charge_state=None)
                         # For Aurora compatibility, return as (1, n_spatial) or distribute equally

@@ -1,7 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+
+# Pixi/Conda
 .pixi/
-.vscode/
-solver_checkpoint.pkl/
 pixi.lock
+*.conda
+*.tar.bz2
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# PRESTOS specific
+solver_checkpoint.pkl
 solver_history.csv
-.src/__pycache__
-.src/tools/__pycache__
+analysis_outputs/
+*.gacode.backup
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.log
+*.tmp
+.DS_Store

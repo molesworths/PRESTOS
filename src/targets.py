@@ -24,6 +24,10 @@ except ImportError:
 class TargetModel:
     """
     Base class for target models.
+    
+    Supports batch processing:
+    - evaluate(state) handles both single PlasmaState and list of PlasmaState objects
+    - Returns results for single state or list of results for batched states
     """
     def __init__(self, **kwargs):
 
@@ -33,14 +37,47 @@ class TargetModel:
         self.targets.options = dict(kwargs) if kwargs else {}
         self.sigma = self.targets.options.get('sigma', 0.1) # relative epistemic uncertainty for target model outputs
 
+    def _is_batched(self, state) -> bool:
+        """Check if state is a batch (list/array of states) vs single state."""
+        if isinstance(state, (list, tuple)):
+            return True
+        # Check if it's a numpy array of PlasmaState objects
+        if isinstance(state, np.ndarray) and state.dtype == object:
+            return True
+        return False
+
     def evaluate(self, state: PlasmaState) -> Dict[str, np.ndarray]:
+        """Calculate the target quantities for single or batch of plasma states.
+
+        Parameters
+        ----------
+        state : PlasmaState or list of PlasmaState
+            Single plasma state or list of states for batch processing
+
+        Returns
+        -------
+        Dict[str, np.ndarray] or list of Dict[str, np.ndarray]
+            For single state: dictionary of target quantities, e.g., {'Qe': ..., 'Qi': ...}
+            For batch: list of dictionaries, one per state
         """
-        Calculate the target quantities for a given plasma state.
+        if self._is_batched(state):
+            results = []
+            for single_state in state:
+                result = self._evaluate_single(single_state)
+                results.append(result)
+            return results
+        else:
+            return self._evaluate_single(state)
+
+    def _evaluate_single(self, state: PlasmaState) -> Dict[str, np.ndarray]:
+        """Calculate the target quantities for a given plasma state.
+
+        To be overridden by child classes with actual implementation.
 
         Parameters
         ----------
         state : PlasmaState
-            The current plasma state.
+            Single plasma state.
 
         Returns
         -------
@@ -69,7 +106,7 @@ class AnalyticTargetModel(TargetModel):
     def __init__(self, config: Dict):
         super().__init__(**config)
 
-    def evaluate(self, state: PlasmaState) -> Dict[str, np.ndarray]:
+    def _evaluate_single(self, state: PlasmaState) -> Dict[str, np.ndarray]:
         """
         Calculate target heat fluxes (Qe, Qi) based on analytical models for
         fusion heating, radiation, and energy exchange.

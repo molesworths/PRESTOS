@@ -1,10 +1,10 @@
 # Where to store files
-work_dir: 
+work_dir: ~/git/PRESTOS/example/
 
 # Initial plasma state: point to a GACODE profiles file
 state:
   args:
-    from_gacode: input.gacode
+    from_gacode: ~/git/PRESTOS/example/input.gacode
 
 boundary:
   class: boundary.TwoFluidTwoPoint_PeretSSF
@@ -20,6 +20,7 @@ parameters:
     defined_on: aLy
     include_zero_grad_on_axis: True
     sigma: 0.05 # relative uncertainty on parameters, 1 sigma
+    lcfs_aLti_in_params: False
 
 neutrals:
   class: neutrals.DiffusiveNeutralModel
@@ -37,26 +38,31 @@ targets:
   args:
     scale_Pe_beam: 1.0
     scale_Pi_beam: 1.0
+    scale_Qpar_wall: 1.0
+    scale_Qpar_beam: 1.0
     sigma: 0 # relative uncertainty on targets, 1 sigma
     # example arguments for later on
 
 solver:
-  class: solvers.RelaxSolver
+  class: solvers.TimeStepperSolver
   args:
     # map your predicted profiles to target variables from transport/targets
     predicted_profiles: [ne, te, ti]
     target_vars: [Ce, Pe, Pi]
     roa_eval: [0.88, 0.91, 0.94, 0.97, 1.0]
     domain: [0.88, 1.0]
-    tol: 1e-3
+    tol: 1e-4
     max_iter: 1000
-    use_surrogate: true
-    use_jacobian: true
+    use_surrogate: False
+    surrogate_warmup: 5
+    use_jacobian: True
     objective: mse
-    normalize_residual: true # normalizes ith component by abs(target[i])
-    scale_objective: true # divides total by N_channels
-    step_size: 1e-1
-    bounds: [0,100] # two element list applied to all parameters or list of n_parameters tuples
+    normalize_residual: True # normalizes ith component by abs(target[i])
+    scale_objective: True # divides total by N_channels
+    step_size: 0.1
+    adaptive_step: True
+    bounds: [0,100] # [[0,10],[0,15],[0,20],[0,25],[0,100]]  
+    # two element list applied to all parameters or list of n_parameters tuples
     # alt bounds formats: {ne:[0,100],te:[0,100],ti:[0,100]} OR 
     #       [[lower,upper] for n_params_per_profile] OR
     #       {predicted_profile[i]:[lower bound, upper bound],...}
@@ -71,4 +77,6 @@ surrogate:
     kwargs:
       length_scale: 1.0
       variance: 1.0
-      noise: 1e-4
+      noise: 1e-3
+      ard: False
+      scaling: standard

@@ -21,7 +21,7 @@ PRESTOS is designed for efficient transport analysis and profile optimization in
 - **Modular architecture**: Swap boundary conditions, transport models, neutrals, parameterizations, and solvers via configuration
 - **Surrogate acceleration**: Gaussian process surrogates reduce expensive transport evaluations during optimization
 - **Flexible parameterization**: Spline-based profile representation with customizable knot placement and bounds
-- **Multiple solvers**: Relaxation, finite-difference, Bayesian optimization, and time-stepping methods
+- **Multiple solvers**: Relaxation, Bayesian optimization, and time-stepping methods
 - **Built-in analysis**: Automated plotting and reporting tools for convergence, profiles, and surrogate sensitivity
 
 PRESTOS aims to provide rapid iteration capabilities compared to heavier frameworks like MITIM-fusion/PORTALS, with a focus on extensibility and ease of experimentation.
@@ -31,7 +31,7 @@ PRESTOS aims to provide rapid iteration capabilities compared to heavier framewo
 ## Installation
 
 ### Requirements
-- Python 3.8+
+- Python 3.11+
 - [pixi](https://pixi.sh/) (recommended) or conda/mamba
 
 ### Using pixi (recommended)
@@ -88,7 +88,7 @@ state:
 
 Edit `run_config.yaml` to specify:
 - Transport model (Fingerprints, TGLF, Fixed)
-- Solver type (RelaxSolver, FiniteDifferenceSolver, BayesianOptSolver, TimeStepperSolver)
+- Solver type (RelaxSolver, BayesianOptSolver, TimeStepperSolver)
 - Parameterization scheme (SplineParameterModel)
 - Target variables and evaluation domain
 - Surrogate settings

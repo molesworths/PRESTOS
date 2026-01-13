@@ -26,6 +26,8 @@ from scipy.interpolate import interp1d, Akima1DInterpolator as akima, PchipInter
 from tools import calc
 from scipy.special import erf
 from scipy.optimize import curve_fit
+import scipy as sp  
+from scipy.optimize import least_squares
 
 # -------------------------
 # Base parameter model
@@ -170,8 +172,12 @@ class SplineParameterModel(ParameterBase):
         if self.spline_type not in ('akima', 'pchip', 'cubic'):
             raise ValueError("spline_type must be 'akima', 'pchip', or 'cubic'")
         self.param_names = [self.defined_on+str(i) for i in range(len(self.knots))]
+        self.lcfs_aLti_in_params = options.get('lcfs_aLti_in_params', False)
+        if self.lcfs_aLti_in_params:
+            #raise NotImplementedError("lcfs_aLti_in_params=True not implemented for SplineParameterModel.")
+            self.param_names ['aLti_lcfs']
         self.n_params_per_profile = len(self.knots)
-        self._splines: Dict[str, Any] = {}
+        self.splines: Dict[str, Any] = {}
         self.a = 1.0  # Default value, will be updated in parameterize()
         self.sigma = options.get('sigma', 0.1)  # default relative uncertainty for covariance estimates
 
@@ -200,12 +206,12 @@ class SplineParameterModel(ParameterBase):
         else:
             raise ValueError(f"Unknown spline_type: {self.spline_type}")
         
-        self._splines[prof] = spline
+        self.splines[prof] = spline
         return spline
     
     def _get_spline(self, prof: str):
         """Retrieve a cached spline."""
-        spline = self._splines.get(prof)
+        spline = self.splines.get(prof)
         if spline is None:
             raise KeyError(f"Spline for profile '{prof}' not initialized.")
         return spline
@@ -234,11 +240,13 @@ class SplineParameterModel(ParameterBase):
         
         # y(x) = y_bc * exp(-∫[bc_loc to x] (aLy/a) dx')
         # Note: aLy spline is already in units of a/Ly, so we need to divide by a
-        # But since we're in normalized coords where a=1 effectively, the formula becomes:
+        # Since x = r/a is dimensionless and aLy ≡ a/Ly,
+        # the integral ∫ aLy dx is dimensionless and no extra factor of a appears.
         # y(x) = y_bc * exp(-∫[bc_loc to x] aLy dx')
         #phase = -integral / self.a  # Divide by a to convert aLy → gradient
 
-        phase = -spl.antiderivative()(x_eval) + spl.antiderivative()(bc_loc)
+        F = spl.antiderivative()
+        phase = -(F(x_eval) - F(bc_loc))
         
         return bc_value * np.exp(phase)
 
@@ -323,7 +331,7 @@ class SplineParameterModel(ParameterBase):
                 y = self._integrate_aLy(prof, x_eval, spline, bc["value"], bc["location"])
             else:
                 raise ValueError(f"Invalid defined_on: {self.defined_on}")
-            out[prof] = y
+            out[prof] = np.clip(y, a_min=0, a_max=None)
         self.y = out
         return out
 
@@ -350,7 +358,7 @@ class SplineParameterModel(ParameterBase):
                 aLy = -self.a * dy / y_safe
             else:
                 raise ValueError(f"Invalid defined_on: {self.defined_on}")
-            out[prof] = aLy
+            out[prof] = np.clip(aLy, a_min=0, a_max=None)
         self.aLy = out
         return out
 
@@ -397,8 +405,389 @@ class SplineParameterModel(ParameterBase):
             out[prof] = curv
         self.curv = out
         return out
+    
+    def enforce_bc(self, X, bc_dict: Dict[str, Any]):
+        """Enforce boundary conditions from provided dict.
+        X: Dict[str, np.ndarray] of profiles to modify in place.
+        bc_dict: Dict[str, Any] of BC specifications.
+        """
+        self.build_bcs(bc_dict)
+        for key, entries in self.bc_dict.items():
+            for bc in entries:
+                loc = bc["location"]
+                val = bc["value"]
+                if key in X:
+                    # Find nearest index to location
+                    x_array = np.asarray(X[key])
+                    idx = int(np.argmin(np.abs(x_array - loc)))
+                    X[key][idx] = val  # enforce BC
+
+        return X
+
+    
+
+class GaussianDipoleRBFParameterModel(ParameterBase):
+    """
+    Dipole Gaussian curvature parameterization with scaled separation.
+
+    Parameters:
+        A       : curvature strength (signed, finite)
+        c       : center location
+        w       : width (physics length scale)
+        eps     : dimensionless bifurcation parameter (>= 0)
+
+    Separation:
+        Delta = eps * w
+    """
+
+    def __init__(self):
+        self.params = None   # [A, c, w, eps]
+        self.C0 = 0.0
+        self.C1 = 0.0
+
+    # -------------------------
+    # Parameter management
+    # -------------------------
+    def update(self, params):
+        self.params = np.asarray(params, dtype=float)
 
 
+class GaussianDipoleRBFParameterModel:
+    """
+    Curvature-based radial profile parameterization using a dipole Gaussian model.
+
+    This class represents the profile y(x) indirectly by parameterizing its
+    curvature k(x) = d^2y/dx^2 and reconstructing both the gradient and the
+    profile itself through analytic integration.
+
+    Model definition
+    ----------------
+    The curvature is modeled as a dipole Gaussian,
+
+        k(x) = A [
+            exp(-(x - c + eps*w/2)^2 / (2 w^2))
+        - exp(-(x - c - eps*w/2)^2 / (2 w^2))
+        ],
+
+    where:
+        A   : curvature amplitude (signed)
+        c   : radial location of the transition center
+        w   : characteristic width
+        eps : dimensionless separation (bifurcation) parameter
+
+    As eps -> 0, the model smoothly collapses to a single localized curvature
+    structure corresponding to an inflection-dominated profile.
+
+    Reconstruction
+    --------------
+    The gradient g(x) = dy/dx and the profile y(x) are obtained by integration:
+
+        g(x) = ∫_0^x k(ξ) dξ + C1
+        y(x) = ∫_0^x g(η) dη + C0
+
+    The normalized gradient is identified as a/Ly(x) = -g(x).
+
+    Boundary conditions
+    -------------------
+    The integration constants C0 and C1 are uniquely determined by boundary
+    conditions imposed at x = 1:
+
+        y(1)     = y0
+        a/Ly(1)  = (a/Ly)_0
+
+    leading to the exact expressions:
+
+        C1 = -(a/Ly)_0 - ∫_0^1 k(x) dx
+        C0 = y0 - ∫_0^1 ∫_0^η k(x) dx dη - C1
+
+    This guarantees exact enforcement of boundary conditions without iteration.
+
+    Physical interpretation
+    -----------------------
+    The curvature parameters control the global shape of the profile, while the
+    integration constants enforce anchoring at the separatrix. Additional physical
+    constraints, such as vanishing core gradients, must be imposed directly on the
+    curvature parameters and not through the integration constants.
+
+    This formulation is well suited for surrogate modeling, uncertainty
+    propagation, and reduced transport modeling where only a small number of
+    model evaluations are available.
+    """
+
+
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+        self.aLti_in_params = options.get('aLti_in_params', False)
+        if self.aLti_in_params:
+            raise NotImplementedError("aLti_in_params=True not implemented for GaussianDipoleRBFParameterModel.")
+        else:
+            self.param_names = ['A', 'c', 'w', 'eps']
+            self.params = np.array([1.0, 0.5, 0.05, 0.5])  # default initial params
+            self.C0 = 0.0
+            self.C1 = 0.0
+    
+    def parameterize(self, state, bc_dict: Dict[str, Any]):
+        """
+        Determine an initial curvature-parameter set from given profiles
+        and enforce boundary conditions.
+
+        Parameters
+        ----------
+        state  : PlasmaState
+        bc_dict   : Dict[str, Any], optional
+            Boundary condition specifications.
+        """
+
+        self.build_bcs(bc_dict)
+        x = np.asarray(state.x)
+
+        for prof in self.predicted_profiles:
+            prof_name = f"{prof}"
+            y_prof = getattr(state, prof_name)
+            aLy_prof = getattr(state, f"aL{prof_name}")
+            if y_prof.ndim == 2:
+                y = y_prof[:, 0].flatten()
+            else:
+                y = np.asarray(y_prof).flatten()
+            if aLy_prof.ndim == 2:
+                aLy = aLy_prof[:, 0].flatten()
+            else:
+                aLy = np.asarray(aLy_prof).flatten()
+            # ------------------------------------
+            # 1. Construct numerical curvature
+            # ------------------------------------
+            dy_dx = - (aLy / state.a) * y
+            k_num = np.gradient(dy_dx, x, edge_order=2)
+
+            # ------------------------------------
+            # 2. Initial guesses (robust heuristics)
+            # ------------------------------------
+            c0 = x[np.argmax(np.abs(k_num))]
+            w0 = 0.05
+            A0 = sp.integrate.trapezoid(np.abs(k_num), x)
+            eps0 = 0.5
+
+            theta0 = np.array([A0, c0, w0, eps0])
+
+            # ------------------------------------
+            # 3. Fit curvature parameters
+            # ------------------------------------
+            def residual(theta):
+                self.update(theta)
+                return self.get_curvature(x) - k_num
+
+            sol = least_squares(residual, theta0)
+            self.update(sol.x)
+
+            # ------------------------------------
+            # 4. Enforce BCs exactly
+            # ------------------------------------
+            y1 = self.bc_dict["y"][1.0]
+            aLy1 = self.bc_dict["aLy"][1.0]
+
+            # ∫₀¹ k(x) dx
+            I1 = np.trapz(self.get_curvature(x), x)
+
+            # ∫₀¹ ∫₀^η k(x) dx dη
+            g_shape = np.cumsum(self.get_curvature(x)) * (x[1] - x[0])
+            I2 = np.trapz(g_shape, x)
+
+            self.C1 = -aLy1 - I1
+            self.C0 = y1 - I2 - self.C1
+        
+        return self.params
+
+
+    # -------------------------
+    # Helpers
+    # -------------------------
+    @staticmethod
+    def _phi(x, mu, w):
+        return np.exp(-0.5 * ((x - mu) / w) ** 2)
+
+    @staticmethod
+    def _z(x, mu, w):
+        return (x - mu) / (np.sqrt(2.0) * w)
+
+    # -------------------------
+    # Core evaluations
+    # -------------------------
+    def get_curvature(self, x):
+        A, c, w, eps = self.params
+        Delta = eps * w
+        muL = c - 0.5 * Delta
+        muR = c + 0.5 * Delta
+        return A * (self._phi(x, muL, w) - self._phi(x, muR, w))
+
+    def get_dydx(self, x):
+        A, c, w, eps = self.params
+        Delta = eps * w
+        muL = c - 0.5 * Delta
+        muR = c + 0.5 * Delta
+
+        pref = w * np.sqrt(np.pi / 2)
+        return (
+            A * pref * (erf(self._z(x, muL, w)) - erf(self._z(x, muR, w)))
+            + self.C1
+        )
+
+    def get_y(self, x):
+        A, c, w, eps = self.params
+        Delta = eps * w
+        muL = c - 0.5 * Delta
+        muR = c + 0.5 * Delta
+
+        def G(mu):
+            z = self._z(x, mu, w)
+            return w**2 * (
+                np.exp(-z**2)
+                + np.sqrt(np.pi / 2) * (x - mu) / w * erf(z)
+            )
+
+        return (
+            A * (G(muL) - G(muR))
+            + self.C1 * x
+            + self.C0
+        )
+
+    # -------------------------
+    # Analytic Jacobian
+    # -------------------------
+    def get_jacobian(self, x):
+        """
+        Jacobian of y(x) with respect to [A, c, w, eps].
+        """
+        x = np.atleast_1d(x)
+        J = np.zeros((len(x), 4))
+
+        A, c, w, eps = self.params
+        Delta = eps * w
+        muL = c - 0.5 * Delta
+        muR = c + 0.5 * Delta
+
+        zL = self._z(x, muL, w)
+        zR = self._z(x, muR, w)
+
+        expL = np.exp(-zL**2)
+        expR = np.exp(-zR**2)
+        erfL = erf(zL)
+        erfR = erf(zR)
+
+        # ∂y / ∂A
+        J[:, 0] = (
+            w**2 * (
+                expL - expR
+                + np.sqrt(np.pi / 2) * (
+                    (x - muL) / w * erfL
+                    - (x - muR) / w * erfR
+                )
+            )
+        )
+
+        # ∂y / ∂c
+        J[:, 1] = A * (
+            -(x - muL) * expL + (x - muR) * expR
+            - np.sqrt(np.pi / 2) * w * (erfL - erfR)
+        )
+
+        # ∂y / ∂w
+        J[:, 2] = A * (
+            2 * w * (expL - expR)
+            + ((x - muL)**2 / w) * expL
+            - ((x - muR)**2 / w) * expR
+            - np.sqrt(np.pi / 2) * (
+                (x - muL) * erfL - (x - muR) * erfR
+            )
+            - eps * 0.5 * (
+                (x - muL) * expL + (x - muR) * expR
+            )
+        )
+
+        # ∂y / ∂eps
+        J[:, 3] = 0.5 * A * w * (
+            (x - muL) * expL + (x - muR) * expR
+            + np.sqrt(np.pi / 2) * w * (erfL + erfR)
+        )
+
+        return J
+
+    def enforce_bc(self, bc_dict: Dict[str, Any]):
+        # numerical quadrature over [0,1]
+        I1 = sp.integrate.quad(self.get_curvature, 0.0, 1.0)[0]
+        I2 = sp.integrate.quad(lambda eta:
+                sp.integrate.quad(self.get_curvature, 0.0, eta)[0],
+                0.0, 1.0)[0]
+        
+        self.build_bcs(bc_dict)
+        for key, entries in self.bc_dict.items():
+            # only allow one BC per profile
+            if len(entries) > 1:
+                raise ValueError(f"Multiple BC entries for profile '{key}' not supported in GaussianDipoleRBFParameterModel.")
+            for bc in entries:
+                loc = bc["location"]
+                val = bc["value"]
+                if loc != 1.0:
+                    raise ValueError("Only BCs at location=1.0 (edge) are supported in GaussianDipoleRBFParameterModel.")
+                if key.startswith("aL"):
+                    # aL profile BC
+                    aLy0 = val
+                else:
+                    # y profile BC
+                    y0 = val
+
+        self.C1 = -aLy0 - self.compute_I1()
+        self.C0 = y0 - self.compute_I2() - self.C1
+
+
+        return self.C0, self.C1
+
+    def compute_I1(self):
+        """
+        Analytic integral I1 = ∫_0^1 k(x) dx for the dipole Gaussian curvature.
+        """
+        A, c, w, eps = self.params
+
+        mu_minus = c - 0.5 * eps * w
+        mu_plus  = c + 0.5 * eps * w
+
+        pref = A * w * np.sqrt(np.pi / 2.0)
+
+        def E(mu):
+            return erf((1.0 - mu) / (np.sqrt(2.0) * w)) - erf((-mu) / (np.sqrt(2.0) * w))
+
+        I1 = pref * (E(mu_minus) - E(mu_plus))
+        return I1
+    
+    def compute_I2(self):
+        """
+        Analytic integral I2 = ∫_0^1 ∫_0^η k(x) dx dη
+                            = ∫_0^1 (1 - x) k(x) dx
+        """
+        A, c, w, eps = self.params
+
+        mu_minus = c - 0.5 * eps * w
+        mu_plus  = c + 0.5 * eps * w
+
+        def F(mu):
+            term_exp = (
+                np.exp(-(1.0 - mu)**2 / (2.0 * w**2))
+                - np.exp(-mu**2 / (2.0 * w**2))
+            )
+
+            term_erf = (
+                (1.0 - mu)
+                * (
+                    erf((1.0 - mu) / (np.sqrt(2.0) * w))
+                    - erf((-mu) / (np.sqrt(2.0) * w))
+                )
+            )
+
+            return w**2 * term_exp + w * np.sqrt(np.pi / 2.0) * term_erf
+
+        I2 = A * (F(mu_minus) - F(mu_plus))
+        return I2
+
+    
 class RbfParameterModel(ParameterBase):
     """
     Two-Gaussian curvature parameterization using a separation factor B such that δ = B * σ.

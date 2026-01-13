@@ -125,8 +125,10 @@ class TwoFluidTwoPoint_PeretSSF(BoundaryConditions):
         lambda_T0 = 1 / (1 / lambda_pe0 - 1 / lambda_n0)
 
         # Solve
-        sol = least_squares(equations, [lambda_pe0, lambda_n0, lambda_T0], bounds=(1e-6,0.2), max_nfev=int(1e5))
+        sol = least_squares(equations, [lambda_pe0, lambda_n0, lambda_T0], bounds=(1e-6,0.2), max_nfev=int(1e2))
         # fsolve(equations, [lambda_pe0, lambda_n0, lambda_T0])
+        if sol.success is False:
+            raise Exception("Peret SSF solver did not converge")
         lambda_pe, lambda_n, lambda_T = sol.x
 
         beta = f_Delta*(1/Lambda + lambda_pe/lambda_T)
@@ -257,9 +259,9 @@ class TwoFluidTwoPoint_PeretSSF(BoundaryConditions):
         self.aLTi = (self.pe/self.pi)*self.aLTe  # TODO: implement proper ion scale length
 
         # Store results. (value, location in roa or rho)
-        self.bc_dict = {y: (val, 1) for y, val in zip(
+        self.bc_dict = {y: [val, 1] for y, val in zip(
             ['ne', 'te', 'ti', 'ni'], [self.ne*1e-19, self.te*1e-3, self.ti*1e-3, self.ni*1e-19])}
-        self.bc_dict.update({aLy: (aLy_val, 1) for aLy, aLy_val in zip(
+        self.bc_dict.update({aLy: [aLy_val, 1] for aLy, aLy_val in zip(
             ['aLne', 'aLte', 'aLti', 'aLni'], [self.aLne, self.aLTe, self.aLTi, self.aLne])})
         self.converged = converged
 

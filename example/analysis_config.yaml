@@ -8,7 +8,6 @@ analysis_level: full
 
 # Paths
 solver_history: solver_history.csv
-setup_file: setup.yaml  # optional; needed for surrogate sensitivity if reconstruction required
 output_dir: analysis_outputs
 
 # Figure style options
@@ -34,7 +33,6 @@ plots:
   profiles_initial_final: true
   targets_final: true
   surrogate_sensitivity: true
-  surrogate_pca: true
 
 # Sensitivity settings
 sensitivity:
