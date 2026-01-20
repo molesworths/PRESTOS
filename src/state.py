@@ -327,65 +327,87 @@ class PlasmaState:
         self.alphat_norm = (3.13e-18)*self.n_norm*self.R0*(self.q_cyl**2)*self.Zeff/(1e6*self.T_norm**2)
 
 
-    def _update_w0_by_decompose(self, store_key: str = 'wtor'):
-        """Decompose and update toroidal + diamagnetic rotation components using available vtor, vpol fields.
-        
-        This needs corrections.
-        
+    def _update_w0_by_decompose(self):
         """
-        eps = 1e-12
+        Update Er, ExB shear, and parallel flow diagnostics consistently with
+        GACODE rotation theory.
 
-        first_iter = not hasattr(self, store_key)
-        if first_iter:
-            # if hasattr(self, "vtor"):
-            #     wtor = np.copy(self.vtor / np.maximum(self.R, eps))
-            # else:
-            #     wtor = np.copy(getattr(self, 'w0', np.zeros_like(self.r)))
-            wtor = np.copy(getattr(self, 'w0', np.zeros_like(self.r)))
-            setattr(self, store_key, wtor)
-        else:
-            wtor = getattr(self, store_key)
+        Evolved quantity:
+            w0(r)  -- toroidal angular frequency (flux function)
 
-        dpdr = np.gradient(self.pi,self.r)
+        Derived each call (can change as profiles evolve):
+            Er, gamma_exb, gamma_par, vpar, Mach, etc.
+        """
 
-        ni_SI = self.ni * 1e19
-        Er_dia = dpdr / np.maximum(self.Z_ref * e * ni_SI, eps)
-        # E×B poloidal velocity component (poloidal), vpol ≈ (Er × B)·e_pol / B^2 ≈ Er * B_T / B^2
-        vpol = Er_dia * self.B_T / np.maximum(self.B**2, eps)
+        eps = 1e-14
 
-        wpol = np.nan_to_num(Er_dia / np.maximum(self.R * self.B_p, eps), 0.0)
-
-        if first_iter:
-            wtor -= wpol
-            setattr(self, store_key, wtor)
-
-        w0 = wtor + wpol
-
-        dwtordr = np.gradient(wtor, self.r)
-        dw0dr = np.gradient(w0, self.r)
-        dvpoldr = np.gradient(vpol, self.r)
-
-        aLw0 = calc.aLy(self.r, w0)
-
-        gamma_par = -self.R * dwtordr
-        vpar_shear = gamma_par * self.a / np.maximum(self.c_s, 1e-30)
-        vpar = self.rmaj * wtor / np.maximum(self.c_s, 1e-30)
-
-        gamma_exb_tor = -(self.r / np.maximum(np.abs(self.q), eps)) * dwtordr
-        gamma_exb_pol = dvpoldr
-        vexb_shear = (np.abs(gamma_exb_tor) + np.abs(gamma_exb_pol)) * self.a / np.maximum(self.c_s, 1e-30)
-
+        # -------------------------------------------------
+        # 1. Toroidal rotation (DO NOT MODIFY)
+        # -------------------------------------------------
+        w0 = np.copy(getattr(self, "w0", np.zeros_like(self.r)))
         self.w0 = w0
-        self.aLw0 = aLw0
-        self.vpar = vpar
-        self.vpar_shear = vpar_shear
-        self.vexb_shear = vexb_shear
+
+        # -------------------------------------------------
+        # 2. Ion pressure gradient (evolving)
+        # -------------------------------------------------
+        dpdr = np.gradient(self.pi, self.r)
+        ni = self.ni * 1e19  # SI
+
+        # -------------------------------------------------
+        # 3. Radial electric field from force balance
+        #    (GACODE definition)
+        # -------------------------------------------------
+        Er = (
+            - dpdr / (self.Z_ref * e * np.maximum(ni, eps))
+            - self.R * self.B_p * w0
+        )
+
+        self.Er = Er
+
+        # -------------------------------------------------
+        # 4. ExB velocity and shearing rate
+        # -------------------------------------------------
+        v_exb = Er / np.maximum(self.B, eps)
+
+        # γ_E = r d/dr (v_E / r)
+        gamma_exb = self.r * np.gradient(
+            v_exb / np.maximum(self.r, eps),
+            self.r
+        )
+
+        self.gamma_exb = gamma_exb
+        self.vexb_shear = np.abs(gamma_exb) * self.a / np.maximum(self.c_s, eps)
+
+        # -------------------------------------------------
+        # 5. Parallel flow and shear (diagnostic)
+        # -------------------------------------------------
+        vpar = (self.B_T / np.maximum(self.B, eps)) * self.R * w0
+        self.vpar = vpar / np.maximum(self.c_s, eps)
+
+        dwdR = np.gradient(w0, self.r)
+        gamma_par = self.R * dwdR
+
         self.gamma_par = gamma_par
-        self.gamma_exb_tor = gamma_exb_tor
-        self.gamma_exb_pol = gamma_exb_pol
-        self.gamma_exb = abs(gamma_exb_tor) + abs(gamma_exb_pol) # TODO FIX
-        self.vpol = vpol
-        self.vtor = self.R * wtor
+        self.vpar_shear = gamma_par * self.a / np.maximum(self.c_s, eps)
+
+        # -------------------------------------------------
+        # 6. Toroidal velocity & Mach number (diagnostic)
+        # -------------------------------------------------
+        self.vtor = self.R * w0
+        self.Mach = self.vtor / np.maximum(self.c_s, eps)
+
+        # -------------------------------------------------
+        # 7. Optional: log-gradient of rotation
+        # -------------------------------------------------
+        self.aLw0 = calc.aLy(self.r, w0)
+
+        # -------------------------------------------------
+        # 8. Normed results
+        # -------------------------------------------------     
+        self.gamma_exb_norm = self.gamma_exb * self.tau_norm
+        self.gamma_par_norm = self.gamma_par * self.tau_norm   
+
+        return
 
     def _get_power_flows(self):
         self.Gbeam_e = calc.integrated_flux(getattr(self,'qpar_beam',np.zeros_like(self.roa)), self.r, self.dVdr, self.surfArea) / self.n_norm

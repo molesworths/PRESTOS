@@ -68,7 +68,7 @@ class SurrogateManager:
         self.models: Dict[str, Any] = {}
         self.X_train: List[Dict[str, np.ndarray]] = []
         self.Y_train: List[Dict[str, np.ndarray]] = []
-        self.max_train_samples = options.get("max_train_samples", 50)  # Increased default for better coverage
+        self.max_train_samples = options.get("max_train_samples", 10)  # Increased default for better coverage
         self.min_train_samples = options.get("min_train_samples", 5)
         self.min_score_threshold = options.get("min_score_threshold", 0.5)  # Minimum R² to use surrogate
         self.trained = False
@@ -272,7 +272,7 @@ class SurrogateManager:
         # Process params based on input type
         if input_type == 'dict':
             # Single dict input - extract param values
-            param_vector = np.array([X_params[pfeat.split('_')[0]][pfeat.split('_')[1]] 
+            param_vector = np.array([X_params[pfeat.split('_', 1)[0]][pfeat.split('_', 1)[1]] 
                                      for pfeat in self.param_features], dtype=float)
             # param_vector is (n_params, n_roa) or scalar per param
             
@@ -293,8 +293,8 @@ class SurrogateManager:
         else:
             # Array input (flat or batched) - params_array is (n_batch, n_params) where params includes all roa
             for b in range(n_batch):
-                param_vector = np.array([params_array[b, pfeat.split('_')[0]][pfeat.split('_')[1]] 
-                                     for pfeat in self.param_features], dtype=float) # this needs fixing
+                param_vector = np.array([params_array[b, pfeat.split('_', 1)[0]][pfeat.split('_', 1)[1]] 
+                                     for pfeat in self.param_features], dtype=float)
                 for i, roa in enumerate(self.roa_eval):
                     loc_sample_state = state_feature_matrix[b,i]
                     

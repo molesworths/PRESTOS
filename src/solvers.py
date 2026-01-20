@@ -15,7 +15,8 @@ Design assumptions (can be revisited):
 """
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable
+import re
 from pathlib import Path
 import copy
 import numpy as np
@@ -305,7 +306,7 @@ class SolverBase:
         self.converged = False
         self.stalled = False
         self.iter = 0
-        self.model_iter_to_stall = int(self.options.get("model_iter_to_stall", 3))
+        self.model_iter_to_stall = int(self.options.get("model_iter_to_stall", 10))
         self.Z = None               
         self._last_model_Z: Optional[float] = None
         self._last_model_iter: Optional[int] = None
@@ -339,6 +340,7 @@ class SolverBase:
 
         # Bounds & iteration controls
         self.bounds = self._parse_bounds(self.options.get("bounds"))
+        self.bounds_dict: Dict[str, Dict[str, np.ndarray]] = self._build_bounds_dict()
         self.max_iter = int(self.options.get("max_iter", 100))
 
         # Surrogate configuration / datasets
@@ -352,7 +354,7 @@ class SolverBase:
 
         # Current parameter vector
         self.X = None             # type: Optional[np.ndarray]
-        self.bounds_dict: Dict[str, Dict[str, np.ndarray]] = {}
+        
         
         # Module references (set during run)
         self._state = None
@@ -384,6 +386,85 @@ class SolverBase:
         self.jacobian_recompute_tol = float(self.options.get("jacobian_recompute_tol", 0.1))  # ||R_new - R_old|| / ||R_old|| threshold
         self.jacobian_use_surrogate_grads = bool(self.options.get("jacobian_use_surrogate_grads", True))  # use SurrogateManager.get_grads if available
         
+        # solution constraints
+        self.constraints = self.options.get("constraints", None)
+        self.VAR_MAP = {
+            "Ti": "state.ti",
+            "Te": "state.te",
+            "Pi": "state.Pi",
+            "Pe": "state.Pe",
+            "ne": "state.ne",
+            "ni": "state.ni",
+        }
+        self.ALIASES = {
+            "T_i": "Ti",
+            "T_e": "Te",
+            "n_e": "ne",
+            "n_i": "ni",
+            "P_i": "Pi",
+            "P_e": "Pe",
+        }
+        self.compiled_constraints: List[Dict[str, Any]] = []
+        self.constraint_compilation()
+
+
+    def constraint_compilation(self):
+        """Compile user-defined constraints into evaluable functions."""
+        if self.constraints is not None:
+            for i, c in enumerate(self.constraints):
+
+                loc = float(c["location"])
+                weight = float(c.get("weight", 1.0))
+                norm = c.get("norm", None)
+                enforcement = c.get("enforcement", "exact")
+
+                user_expr = c["expression"]
+                expr_norm = self._normalize_expression(user_expr, self.ALIASES)
+
+                lhs, rhs, op = self._parse_constraint(expr_norm)
+
+                # canonical form
+                if op == "=":
+                    canon = f"({lhs}) - ({rhs})"
+                elif op == ">=":
+                    canon = f"({lhs}) - ({rhs})"
+                elif op == "<=":
+                    canon = f"({rhs}) - ({lhs})"
+
+                # backend mapping
+                backend = self._backend_expr(canon, self.VAR_MAP)
+
+                # optional log normalization
+                if norm == "log":
+                    backend = f"np.log(np.abs({backend}) + 1e-12)"
+
+                # compile callable
+                code = compile(backend, "<constraint>", "eval")
+
+                def _make_eval(compiled_code):
+                    def _eval(state):
+                        return eval(compiled_code, {"np": np}, {"state": state})
+                    return _eval
+
+                eval_fn = _make_eval(code)
+
+                # print transparency
+                print(f"[PRESTOS] Constraint {i}")
+                print(f"  read:        {user_expr}")
+                print(f"  normalized:  {expr_norm}")
+                print(f"  enforcing:   {backend}")
+                print(f"  location:    r/a = {loc}")
+                print(f"  weight:      {weight}")
+                print(f"  enforcement: {enforcement}")
+
+                self.compiled_constraints.append({
+                    "location": loc,
+                    "weight": weight,
+                    "op": op,
+                    "eval": eval_fn,
+                    "enforcement": enforcement,
+                })
+
 
     # --------------------- helpers ---------------------
     def get_initial_parameters(self):
@@ -391,10 +472,8 @@ class SolverBase:
         _ = self._targets.evaluate(self._state)
         self._boundary.get_boundary_conditions(self._state, self._targets)
         self.X, self.X_std = self._parameters.parameterize(self._state, self._boundary.bc_dict)
-
+        self._project_bounds(self.X)
         self._flatten_params(self.X)  # sets self.schema
-        # Refresh bounds with any new boundary conditions
-        self._refresh_bounds_with_bc()
 
 
     def _update_from_params(self, X: np.ndarray):
@@ -406,11 +485,6 @@ class SolverBase:
         self._state.update(X, self._parameters)
         self._neutrals.solve(self._state)
         _ = self._targets.evaluate(self._state)
-        # Refresh bounds with any new boundary conditions
-        try:
-            self._refresh_bounds_with_bc()
-        except Exception:
-            pass
 
     # --------------------- bounds helpers (schema + BC) ---------------------
     def _build_bounds_dict(self):
@@ -431,6 +505,8 @@ class SolverBase:
             if self.bounds is None or prof not in self.bounds or idx >= len(self.bounds.get(prof, [])):
                 lo, hi = -1e6, 1e6
             else:
+
+                
                 lo, hi = self.bounds[prof][idx]
                 lo = float(lo) if np.isfinite(lo) else -1e6
                 hi = float(hi) if np.isfinite(hi) else 1e6
@@ -438,67 +514,6 @@ class SolverBase:
             profile_counts[prof] += 1
         self.bounds_dict = bd
 
-    def _apply_boundary_condition_bounds(self):
-        """Restrict bounds to boundary condition values where parameter name encodes location.
-
-        Mapping rule:
-        - For schema element (prof, pname) where pname matches pattern 'aLy{index}'
-          and boundary condition list contains key 'aL{prof}' with an entry whose
-          location matches self.roa_eval[index], set bounds to [value, value].
-        Updates self.bounds_dict, self.bounds (list form) accordingly.
-        """
-        if not hasattr(self, 'schema') or self.schema is None:
-            return
-        if not hasattr(self._boundary, 'bc_dict') or self._boundary.bc_dict is None:
-            return
-        # Ensure bounds_dict exists
-        if not self.bounds_dict:
-            self._build_bounds_dict()
-        import re
-        # Build lookup for profile param index mapping
-        profile_param_index: Dict[str, int] = {}
-        # We'll reconstruct bounds list per profile after modifications
-        temp_bounds_lists: Dict[str, List[Tuple[float, float]]] = {prof: list(self.bounds.get(prof, [])) for prof in self.bounds_dict.keys()}
-        for flat_idx, (prof, pname) in enumerate(self.schema):
-            match = re.match(r'aLy(\d+)$', pname)
-            if not match:
-                continue
-            knot_index = int(match.group(1))
-            if knot_index >= self.roa_eval.size:
-                continue
-            target_location = self.roa_eval[knot_index]
-            bc_key = f'aL{prof}'  # boundary condition gradient key
-            entries = np.asarray(self._boundary.bc_dict.get(bc_key, []), dtype=float)
-            if entries.size == 0:
-                continue
-            entries = entries[np.newaxis, :] if entries.ndim == 1 else entries
-            locs = entries[:,1]
-            # if no valid numeric locations, skip
-            if np.all(np.isnan(locs)):
-                continue
-            diffs = np.abs(locs - target_location)
-            sel = int(np.nanargmin(diffs))
-            if np.isnan(locs[sel]) or not np.isclose(locs[sel], target_location, atol=1e-3):
-                continue  # no close BC at this knot
-            # Extract value: dict['value'] or tuple/list first element
-            chosen = entries[sel]
-            val = float(chosen[0])
-            # Update bounds_dict
-            self.bounds_dict.setdefault(prof, {})[pname] = np.asarray([val*0.99,val*1.01], dtype=float)
-            # Update original bounds list representation
-            # Determine per-profile parameter index
-            prof_count_before = sum(1 for p, _pn in self.schema[:flat_idx] if p == prof)
-            # Ensure list large enough
-            while len(temp_bounds_lists.get(prof, [])) <= prof_count_before:
-                temp_bounds_lists.setdefault(prof, []).append([-1e6, 1e6])
-            temp_bounds_lists[prof][prof_count_before] = [val*0.99, val*1.01]
-        # Write back to self.bounds with updated tuples preserving ordering
-        self.bounds = {prof: temp_bounds_lists[prof] for prof in temp_bounds_lists}
-
-    def _refresh_bounds_with_bc(self):
-        """Public helper to recompute bounds_dict and apply BC restrictions."""
-        self._build_bounds_dict()
-        self._apply_boundary_condition_bounds()
 
     def _parse_bounds(self, bounds):
         """Normalize bounds specification from config.
@@ -566,7 +581,7 @@ class SolverBase:
                 Xc[prof] = {}
                 
                 # Get parameter names in sorted order for consistent indexing
-                param_names = sorted(pvals.keys())
+                param_names = list(pvals.keys())
                 
                 for idx, pname in enumerate(param_names):
                     val = pvals[pname]
@@ -578,12 +593,12 @@ class SolverBase:
                         Xc[prof][pname] = val
 
             # Warn if any parameters w/o boundary conditions hit bounds
-            if self.R is not None:
-                mask_ix = np.where(np.isclose(self.R, 0))[0]
-                X_flat = self._flatten_params(X)[0]
-                Xc_flat = self._flatten_params(Xc)[0]
-                if np.any(np.any(np.delete(Xc_flat,mask_ix) == lo) or np.any(np.delete(Xc_flat,mask_ix) == hi)):
-                    raise Warning("Parameter values hit bounds and were clipped. Try reducing step size.")
+            # if self.R is not None:
+            #     mask_ix = np.where(np.isclose(self.R, 0))[0]
+            #     X_flat = self._flatten_params(X)[0]
+            #     Xc_flat = self._flatten_params(Xc)[0]
+            #     if np.any(np.any(np.delete(Xc_flat,mask_ix) == lo) or np.any(np.delete(Xc_flat,mask_ix) == hi)):
+            #         raise Warning("Parameter values hit bounds and were clipped. Try reducing step size.")
             
             return Xc
 
@@ -662,8 +677,66 @@ class SolverBase:
                 nblocks = R.size // n if n > 0 else 0
                 for b in range(nblocks):
                     R[b * n + k] = 0.0
+
+        # ---------------------------------------------------------
+        # Constraint residuals
+        # ---------------------------------------------------------
+        if hasattr(self, "compiled_constraints") and self.compiled_constraints:
+
+            R_constraints = []
+
+            for c in self.compiled_constraints:
+
+                # nearest radial index
+                k = int(np.argmin(np.abs(self.roa_eval - c["location"])))
+
+                try:
+                    val = c["eval"](self.state)
+                except Exception:
+                    val = np.nan
+
+                # inequality handling (hinge)
+                if c["op"] in (">=", "<="):
+                    val = min(0.0, val)
+
+                # ramp enforcement
+                if c["enforcement"] == "ramp":
+                    ramp = min(1.0, self.iter / max(1, self.max_iter // 5))
+                    val *= ramp
+
+                R_constraints.append(np.sqrt(c["weight"]) * val)
+
+            if R_constraints:
+                R = np.concatenate([R, np.array(R_constraints)])
+
         self.R = np.nan_to_num(R, nan=1e6, posinf=1e6, neginf=-1e6)
+
         return R
+    
+    # --------------------- constraint helpers ---------------------
+    def _normalize_expression(self, expr: str, aliases: Dict[str, str]) -> str:
+        expr_norm = expr
+        for k, v in aliases.items():
+            expr_norm = re.sub(rf"\b{k}\b", v, expr_norm)
+        return expr_norm
+    
+    def _parse_constraint(self, expr: str):
+        if ">=" in expr:
+            lhs, rhs = expr.split(">=")
+            return lhs.strip(), rhs.strip(), ">="
+        if "<=" in expr:
+            lhs, rhs = expr.split("<=")
+            return lhs.strip(), rhs.strip(), "<="
+        if "=" in expr:
+            lhs, rhs = expr.split("=")
+            return lhs.strip(), rhs.strip(), "="
+        raise ValueError(f"Unsupported constraint expression: {expr}")
+
+    def _backend_expr(self, expr: str, var_map: Dict[str, str]) -> str:
+        out = expr
+        for k, v in var_map.items():
+            out = re.sub(rf"\b{k}\b", v, out)
+        return out
     
     # --------------------- Parameter dict helpers ---------------------
     def _flatten_params(self, X_dict: Dict[str, Dict[str, float]]) -> Tuple[np.ndarray, List[Tuple[str, str]]]:
@@ -679,9 +752,9 @@ class SolverBase:
         if not hasattr(self, 'schema'):
             schema = []
             values = []
-            for prof in sorted(X_dict.keys()):
+            for prof in list(X_dict.keys()):
                 param_dict = X_dict[prof]
-                for pname in sorted(param_dict.keys()):
+                for pname in list(param_dict.keys()):
                     schema.append((prof, pname))
                     values.append(float(param_dict[pname]))
             self.schema = schema
@@ -990,8 +1063,8 @@ class SolverBase:
             Xm[j] -= eps
             
             # Convert to dict if needed
-            Xp_dict = self._unflatten_params(Xp, schema) if schema else Xp
-            Xm_dict = self._unflatten_params(Xm, schema) if schema else Xm
+            Xp_dict = self._project_bounds(self._unflatten_params(Xp, schema) if schema else Xp)
+            Xm_dict = self._project_bounds(self._unflatten_params(Xm, schema) if schema else Xm)
             
             # Forward perturbation
             self._update_from_params(Xp_dict)
@@ -1298,6 +1371,7 @@ class SolverBase:
         targets.output_vars = self.target_vars
         parameters.predicted_profiles = self.predicted_profiles
         parameters.bounds = self.bounds
+        parameters.domain = self.domain
         data = SolverData()
 
         # initialize parameter vector
@@ -1352,17 +1426,6 @@ class SolverBase:
                     if self.converged or (self.Z >= data.Z[-1]):
                         self.stalled = True
                 
-                # Restore best model evaluation if stalled
-                if self.stalled and self._best_model_X is not None:
-                    if self._best_model_Z < self.Z:
-                        print(f'Restoring best model evaluation from iteration {self._best_model_iter} (Z={self._best_model_Z:.6e} < current Z={self.Z:.6e})')
-                        self.X = copy.deepcopy(self._best_model_X)
-                        self.Y = {k: v.copy() for k, v in self._best_model_Y.items()}
-                        self.Y_target = {k: v.copy() for k, v in self._best_model_Y_target.items()}
-                        self.R = self._best_model_R.copy() if self._best_model_R is not None else None
-                        self.Z = self._best_model_Z
-                        self._update_from_params(self.X)
-                
                 if self.converged:
                     print('Convergence achieved. Solver run complete.')
                 elif self.stalled:
@@ -1378,6 +1441,17 @@ class SolverBase:
                         self._evaluate(use_surr=use_surr, in_place=True)
                         self.check_convergence(self.Y, self.Y_target)
                     print('Max iterations reached. Solver run complete.')
+
+            # Restore best model evaluation if stalled or max_iter reached
+            if self.stalled and self._best_model_X is not None:
+                if self._best_model_Z < self.Z:
+                    print(f'Restoring best model evaluation from iteration {self._best_model_iter} (Z={self._best_model_Z:.6e} < current Z={self.Z:.6e})')
+                    self.X = copy.deepcopy(self._best_model_X)
+                    self.Y = {k: v.copy() for k, v in self._best_model_Y.items()}
+                    self.Y_target = {k: v.copy() for k, v in self._best_model_Y_target.items()}
+                    self.R = self._best_model_R.copy() if self._best_model_R is not None else None
+                    self.Z = self._best_model_Z
+                    self._update_from_params(self.X)
 
             data.add(self.iter, self.X, self.X_std, self.R, self.R_std, \
                      self.Z, self.Z_std, self.Y, self.Y_std, self.Y_target, self.Y_target_std, use_surr)
@@ -1477,6 +1551,11 @@ class RelaxSolver(SolverBase):
             X_new = self._project_bounds(X_new_wo_bounds)
 
         X_new_std = {prof: {name: abs(val)*self._parameters.sigma for name, val in X_new[prof].items()} for prof in X_new}
+        for prof in X_new.keys():
+            for param in X_new[prof].keys():
+                if param.startswith('log_'):
+                    # stay in log space for std
+                    X_new_std[prof][param] = X_new[prof][param] + np.log(self._parameters.sigma)
         return X_new, X_new_std
 
 
@@ -1844,7 +1923,7 @@ class BayesianOptSolver(SolverBase):
         return X_new, X_new_std
 
 
-class TimeStepperSolver(SolverBase):
+class IvpSolver(SolverBase):
     """SolverBase child that integrates parameter evolution in pseudo-time."""
 
     def __init__(self, options=None):
@@ -1966,7 +2045,7 @@ class TimeStepperSolver(SolverBase):
 SOLVER_MODELS = {
     "relax": RelaxSolver,
     "bayesian_opt": BayesianOptSolver,
-    "timestepper": TimeStepperSolver,
+    "ivp": IvpSolver,
 }
 
 def create_solver(config: Any) -> SolverBase:

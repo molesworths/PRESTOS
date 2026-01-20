@@ -4,7 +4,7 @@
 
 A modular, parametric tokamak plasma transport solver with integrated surrogate modeling for rapid kinetic profile optimization via flux matching.
 
-[![Python](https://img.shields.io/badge/python-3.8%2B-blue)](https://www.python.org/downloads/)
+[![Python](https://img.shields.io/badge/python-3.11%2B-blue)](https://www.python.org/downloads/)
 
 ---
 
@@ -209,16 +209,45 @@ Available models:
 
 ```yaml
 parameters:
-  class: parameterizations.SplineParameterModel
+  class: parameterizations.Spline  # Spline | Gaussian | GaussianDipole | Mtanh
   args:
+    # Spline options:
     knots: [0.88, 0.91, 0.94, 0.97, 1.0]  # Radial locations (rho or roa)
-    spline_type: pchip  # 'pchip' | 'cubic' | 'linear'
+    spline_type: pchip  # 'pchip' | 'akima' | 'cubic'
     defined_on: aLy  # 'aLy' (gradient scale length) | 'y' (raw profile)
+    
+    # Gaussian options:
+    # (no knots needed - uses continuous Gaussian model)
+    # Parameters: log_A (amplitude), b (baseline), c (center), w (width)
+    
+    # GaussianDipole options:
+    # (curvature-based model with morphology parameter)
+    # Parameters: log_A, x_c (center), w (width), S (symmetry 0-1)
+    
+    # Common options:
     include_zero_grad_on_axis: true  # Force zero gradient at axis
-    sigma: 0.05  # Relative uncertainty on parameters (1-sigma)
+    sigma: 0.1  # Relative uncertainty on parameters (1-sigma)
 ```
 
-This converts kinetic profiles into parameter vectors (e.g., spline coefficients) and reconstructs profiles during optimization.
+This converts kinetic profiles into parameter vectors and reconstructs profiles during optimization.
+
+**Available parameterization models:**
+- `Spline`: Spline-based a/Ly interpolation at user-defined knots
+- `Gaussian`: Direct gradient model using `a/Ly = b + A·G(x; c, w)` with analytical integration
+- `GaussianDipole`: Curvature-based model with morphological transition parameter
+- `Mtanh`: Modified-tanh pedestal model (stub)
+
+**Gaussian model details:**
+- Models gradient scale length directly: `a/Ly(x) = b + A·exp[-(x-c)²/(2w²)]`
+- Width `w` automatically determined from boundary conditions
+- Closed-form profile reconstruction via error function integrals
+- Parameters stored in log-space (`log_A`) for proper uncertainty handling
+
+**GaussianDipole model details:**
+- Models curvature: `k(x) = d²y/dx²` using composite Gaussian structures
+- Morphology parameter `S` transitions between single-lobe (0) and dipole (1)
+- Fixed separation `δ = 2.5w` ensures quasi-sinusoidal profiles
+- Double integration with exact boundary condition enforcement
 
 #### Transport Model
 
@@ -228,11 +257,11 @@ transport:
   args:
     modes: all  # 'all' | 'ITG' | 'ETG' | 'KBM' | 'neo'
     ExBon: true  # Include ExB shear suppression
-    ExB_source: model  # 'model' | 'state-pol' | 'state-both'
+    ExB_source: state  # 'state' (uses gamma_exb_norm from state) | 'model' (compute from gradients)
     ExB_scale: 1.0  # Scaling factor for ExB shear
     non_local: false  # Use non-local closure
     ITG_lcorr: 0.1  # ITG correlation length [m]
-    sigma: 0.05  # Relative model uncertainty (1-sigma)
+    sigma: 0.1  # Relative model uncertainty (1-sigma)
 ```
 
 Available models:
@@ -248,30 +277,46 @@ targets:
   args:
     scale_Pe_beam: 1.0  # Scaling for electron beam power
     scale_Pi_beam: 1.0  # Scaling for ion beam power
-    sigma: 0.0  # Relative target uncertainty (1-sigma)
+    scale_Qpar_wall: 1.0  # Scaling for parallel wall heat flux
+    scale_Qpar_beam: 1.0  # Scaling for parallel beam heat flux
+    sigma: 0.1  # Relative target uncertainty (1-sigma)
 ```
 
 Available models:
-- `AnalyticTargetModel`: Construct targets from auxililary heating, fusion, radiation, etc.
+- `AnalyticTargetModel`: Construct targets from auxiliary heating, fusion, radiation, etc.
 
 #### Solver
 
 ```yaml
 solver:
-  class: solvers.RelaxSolver
+  class: solvers.RelaxSolver  # RelaxSolver | BayesianOptSolver | IvpSolver
   args:
     predicted_profiles: [ne, te, ti]  # Profiles to optimize
     target_vars: [Ce, Pe, Pi]  # Target quantities (fluxes/powers)
     roa_eval: [0.88, 0.91, 0.94, 0.97, 1.0]  # Radial evaluation grid (normalized minor radius)
     domain: [0.88, 1.0]  # Radial domain for solver
-    tol: 1e-3  # Convergence tolerance on objective
+    tol: 1e-4  # Convergence tolerance on objective
     max_iter: 1000  # Maximum iterations
-    objective: mse  # 'mse' | 'mae' | 'sse'
+    model_iter_to_stall: 10  # Iterations without improvement before stall
+    objective: mse  # 'mse' | 'mae' | 'sse' | 'rmse'
     normalize_residual: true  # Normalize residual by |target|
     scale_objective: true  # Divide objective by number of channels
-    step_size: 1e-1  # Relaxation step size (alpha)
-    use_jacobian: true  # Use Jacobian for gradient-based update (RelaxSolver)
-    bounds: [0, 100]  # Parameter bounds (uniform or per-profile dict)
+    step_size: 0.1  # Relaxation step size (RelaxSolver)
+    adaptive_step: true  # Adaptive step sizing (RelaxSolver)
+    use_jacobian: true  # Use Jacobian for gradient-based update
+    bounds: [[0,10], [0.0,100.0], [0.9,1.2]]  # Parameter bounds
+    
+    # Optional constraints (example):
+    # constraints:
+    #   - location: 0.88  # Radial location (r/a)
+    #     expression: "Ti/Te = Pi/Pe"  # Constraint expression
+    #     weight: 1.0  # Penalty weight
+    #     norm: log  # Optional: 'log' normalization
+    #     enforcement: ramp  # 'exact' | 'ramp' (gradual activation)
+    #   - location: 0.95
+    #     expression: "ne >= 3.0"  # Inequality constraint
+    #     weight: 0.5
+    #     enforcement: ramp
 ```
 
 **Bounds formats:**
@@ -279,11 +324,16 @@ solver:
 - Per-profile dict: `{ne: [0,100], te: [0,100], ti: [0,100]}`
 - Per-parameter list: `[[lower, upper], [lower, upper], ...]` (length = n_params_per_profile)
 
-Available solvers:
-- `RelaxSolver`: Simple relaxation with optional Jacobian
-- `FiniteDifferenceSolver`: Finite-difference gradient descent
-- `BayesianOptSolver`: Bayesian optimization with acquisition function
-- `TimeStepperSolver`: Pseudo-time integration of parameter evolution
+**Available solvers:**
+- `RelaxSolver`: Simple relaxation with optional Jacobian-assisted gradient
+- `BayesianOptSolver`: Bayesian optimization with Monte Carlo acquisition functions
+- `IvpSolver`: Pseudo-time integration using scipy.integrate ODE solvers
+
+**Constraint support:**
+- Expression parsing with aliases (Ti/Te, Pi/Pe, ne, etc.)
+- Equality (`=`) and inequality (`>=`, `<=`) constraints
+- Optional logarithmic normalization for ratio constraints
+- Ramp enforcement for gradual constraint activation during iterations
 
 #### Surrogate
 

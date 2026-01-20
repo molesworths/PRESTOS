@@ -171,12 +171,8 @@ class FingerprintsModel(TransportBase):
 
         if self.ExBon:
             exb_src = getattr(self, 'ExB_source', self.options.get('ExB_source', 'model'))
-            if exb_src == 'state-pol':
-                gamma_ExB = np.abs(getattr(state, 'gamma_exb_pol_hat', state.tau_norm * np.gradient(getattr(state, 'vpol', 0*x), state.r)))
-            elif exb_src == 'state-both':
-                gpol = np.abs(getattr(state, 'gamma_exb_pol_hat', state.tau_norm * np.gradient(getattr(state, 'vpol', 0*x), state.r)))
-                gtor = np.abs(getattr(state, 'gamma_exb_tor_hat', state.tau_norm * getattr(state, 'gamma_exb_tor', 0*x)))
-                gamma_ExB = gpol + gtor
+            if exb_src == 'state':
+                gamma_ExB = getattr(state, 'gamma_exb_norm', np.zeros_like(x))
             else:
                 V_ExB = rhostar*dpi_dx/ni
                 gamma_ExB = rhostar*d2pi_dx2/ni + aLni*V_ExB

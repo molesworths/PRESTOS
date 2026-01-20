@@ -13,14 +13,14 @@ boundary:
 
 # Parameter model (optional in current solver flow)
 parameters:
-  class: parameterizations.SplineParameterModel
+  class: parameterizations.Gaussian
   args:
-    knots: [0.88, 0.91, 0.94, 0.97, 1.0] # alt: n_params_per_prof: []
-    spline_type: pchip
-    defined_on: aLy
+    # knots: [0.88, 0.91, 0.94, 0.97, 1.0] # alt: n_params_per_prof: []
+    # spline_type: pchip
+    # defined_on: aLy
     include_zero_grad_on_axis: True
-    sigma: 0.05 # relative uncertainty on parameters, 1 sigma
-    lcfs_aLti_in_params: False
+    sigma: 0.1 # relative uncertainty on parameters, 1 sigma
+    # lcfs_aLti_in_params: False
 
 neutrals:
   class: neutrals.DiffusiveNeutralModel
@@ -31,7 +31,8 @@ transport:
   class: transport.FingerprintsModel
   args:
     modes: all
-    sigma: 0.05 # relative uncertainty on transport model, 1 sigma
+    sigma: 0.1 # relative uncertainty on transport model, 1 sigma
+    ExB_source: state
 
 targets:
   class: targets.AnalyticTargetModel
@@ -40,11 +41,11 @@ targets:
     scale_Pi_beam: 1.0
     scale_Qpar_wall: 1.0
     scale_Qpar_beam: 1.0
-    sigma: 0 # relative uncertainty on targets, 1 sigma
+    sigma: 0.1 # relative uncertainty on targets, 1 sigma
     # example arguments for later on
 
 solver:
-  class: solvers.TimeStepperSolver
+  class: solvers.IvpSolver
   args:
     # map your predicted profiles to target variables from transport/targets
     predicted_profiles: [ne, te, ti]
@@ -52,21 +53,37 @@ solver:
     roa_eval: [0.88, 0.91, 0.94, 0.97, 1.0]
     domain: [0.88, 1.0]
     tol: 1e-4
+    model_iter_to_stall: 10
     max_iter: 1000
     use_surrogate: False
     surrogate_warmup: 5
+    surrogate_retrain_every: 5
     use_jacobian: True
     objective: mse
     normalize_residual: True # normalizes ith component by abs(target[i])
     scale_objective: True # divides total by N_channels
     step_size: 0.1
     adaptive_step: True
-    bounds: [0,100] # [[0,10],[0,15],[0,20],[0,25],[0,100]]  
-    # two element list applied to all parameters or list of n_parameters tuples
-    # alt bounds formats: {ne:[0,100],te:[0,100],ti:[0,100]} OR 
-    #       [[lower,upper] for n_params_per_profile] OR
-    #       {predicted_profile[i]:[lower bound, upper bound],...}
-    #   more customized options not yet implemented
+    bounds:  [[0,10], [0.0,100.0], [0.9,1.2]]
+    # [[0,10],[0,15],[0,25],[0,50],[0,100]]  # [0,100] #
+
+        # two element list applied to all parameters or list of n_parameters tuples
+        # alt bounds formats: {ne:[0,100],te:[0,100],ti:[0,100]} OR 
+        #       [[lower,upper] for n_params_per_profile] OR
+        #       {predicted_profile[i]:[lower bound, upper bound],...}
+        #   more customized options not yet implemented
+
+    # constraints:
+    #   - location: 0.88
+    #     expression: "Ti/Te = Pi/Pe"
+    #     weight: 1.0
+    #     norm: log        # optional
+    #     enforcement: ramp # or exact
+    #   - location: 0.88
+    #     expression: "ne >= 3.0" # assume 1e19 m^-3
+    #     weight: 0.5
+    #     norm: None
+    #     enforcement: ramp # or exact
 
 # Optional single-output surrogate (currently unused by default)
 surrogate:

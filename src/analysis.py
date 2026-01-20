@@ -315,6 +315,60 @@ def plot_residual_channels(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], 
 
     _save(fig, outdir/'residual_channels')
 
+def plot_parameter_history(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], outdir: Path):
+    param_cols = [i for i in hist_df.columns if i[:2]=='X_' and 'std' not in i]
+    n_params = len(param_cols)
+    roa_eval = modules['solver'].roa_eval
+    n_roa = len(roa_eval)
+    pred_profs = modules['solver'].predicted_profiles
+    n_profs = len(pred_profs)
+
+    if str(modules['parameters']).split(' ')[0].split('.')[1] == 'Spline':
+
+        fig, ax = plt.subplots(1,n_roa,figsize=tuple(cfg['style'].get('figsize_wide', (10,5))))
+        if n_params == 1:
+            ax = [ax]
+        _subplots_adjust(fig, cfg['style'])
+
+        for ix in range(len(ax)):
+            # Find parameter columns for this roa
+            # Assumes naming convention X_{profile}_{param}{roaIndex}
+            col = None
+            for c in param_cols:
+                if c.endswith(f'{ix}'):
+                    col = c
+                    data_label = c[2:-len(f'{ix}')]
+                    ax[ix].plot(hist_df['iter'], hist_df[col], label=data_label, marker='o', ms=3)
+            if col is None:
+                continue
+
+            ax[ix].set_xlabel('Iteration')
+            ax[ix].set_title(f'Parameter: {col}')
+            ax[ix].grid(alpha=0.3)
+            ax[ix].legend(fontsize=8)
+    else:
+
+        fig, ax = plt.subplots(1,n_profs,figsize=tuple(cfg['style'].get('figsize_wide', (10,5))))
+        if n_params == 1:
+            ax = [ax]
+        _subplots_adjust(fig, cfg['style'])
+    
+        for c in param_cols:
+            ix = pred_profs.index(c.split('_')[1])
+            col = c
+            data_label = c[5:]
+            ax[ix].plot(hist_df['iter'], hist_df[c], label=data_label, marker='o', ms=3)
+
+        for p in range(n_profs):
+            ax[p].set_xlabel('Iteration')
+            ax[p].set_title(pred_profs[p])
+            ax[p].grid(alpha=0.3)
+            ax[p].legend(fontsize=8)
+
+    fig.suptitle('Parameter History')
+    fig.tight_layout()
+    _save(fig, outdir/f'parameter_history')
+
 
 def plot_profiles(modules, hist_df: pd.DataFrame, cfg: Dict[str, Any], outdir: Path):
 
@@ -325,6 +379,7 @@ def plot_profiles(modules, hist_df: pd.DataFrame, cfg: Dict[str, Any], outdir: P
     X_ = [Xi,Xf]
 
     pred_prof = modules['solver'].predicted_profiles
+    param_names = modules['parameters'].param_names
     domain = modules['solver'].domain
     x_eval = modules['solver'].roa_eval
     x = modules['state'].roa
@@ -347,15 +402,30 @@ def plot_profiles(modules, hist_df: pd.DataFrame, cfg: Dict[str, Any], outdir: P
             label = 'final'
             style = 's-'
             X_std = Xf_std
+            Xm = X-X_std if X_std is not None else X
+            Xp = X+X_std if X_std is not None else X
+            if 'c' in param_names:
+                # ensure center of Gaussian parameters remain on original side of 1
+                # due to bifurcation
+                c_pos = param_names.index('c')  # 0-indexed position of 'c' in param_names
+                n_params_per_prof = len(param_names)
+                for prof_ix, prof in enumerate(pred_prof):
+                    base_ix = prof_ix * n_params_per_prof + c_pos  # index of c parameter in flattened array
+                    if X[base_ix] < 1.0:
+                        Xm[base_ix] = min(Xm[base_ix], 0.9999)
+                        Xp[base_ix] = min(Xp[base_ix], 0.9999)
+                    if X[base_ix] > 1.0:
+                        Xm[base_ix] = max(Xm[base_ix], 1.0001)
+                        Xp[base_ix] = max(Xp[base_ix], 1.0001)
 
         for prof, ax_i in zip(pred_prof, ax):
             profile_vals = getattr(modules['state'], prof)
             plot_vals = np.interp(plot_x, x, profile_vals)
             ax_i.plot(plot_x, plot_vals, style, markevery=eval_ix, label=label)
             if X_std is not None:
-                _update_from_params(modules, X-X_std)
+                _update_from_params(modules, Xm)
                 profile_vals_lb = getattr(modules['state'], prof)
-                _update_from_params(modules, X+X_std)
+                _update_from_params(modules, Xp)
                 profile_vals_ub = getattr(modules['state'], prof)
                 ax_i.fill_between(x, profile_vals_lb, profile_vals_ub, color='C1', alpha=0.2, label=f'1 std')
                 _update_from_params(modules,X) # restore state
@@ -373,10 +443,10 @@ def plot_power_flows(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], outdir
 
     domain = modules['solver'].domain
     x = modules['solver'].roa_eval[:-1]
-    Yf = hist_df[[i for i in hist_df.columns if 'model_' in i and 'std' not in i]].iloc[-1][:-1]
-    Yf_std = hist_df[[i for i in hist_df.columns if 'model_' in i and 'std' in i]].iloc[-1][:-1]
-    Ytf = hist_df[[i for i in hist_df.columns if 'target_' in i and 'std' not in i]].iloc[-1][:-1]
-    Ytf_std = hist_df[[i for i in hist_df.columns if 'target_' in i and 'std' in i]].iloc[-1][:-1]
+    Yf = hist_df[[i for i in hist_df.columns if 'model_' in i and 'std' not in i]].iloc[-1]
+    Yf_std = hist_df[[i for i in hist_df.columns if 'model_' in i and 'std' in i]].iloc[-1]
+    Ytf = hist_df[[i for i in hist_df.columns if 'target_' in i and 'std' not in i]].iloc[-1]
+    Ytf_std = hist_df[[i for i in hist_df.columns if 'target_' in i and 'std' in i]].iloc[-1]
 
     transport_components = list(set([str.split(i,'_')[-1] for i in modules['solver'].transport_vars]))
     target_vars = modules['solver'].target_vars
@@ -723,7 +793,8 @@ def _save(fig, path: Path):
     path.parent.mkdir(parents=True, exist_ok=True)
     for ext in ['png']:
         fig.savefig(f"{path}.{ext}", bbox_inches='tight')
-    plt.close(fig)
+    # Keep figures open for interactive viewing
+    # plt.close(fig)
 
 # ---------------------------------------------------------------------------
 # Main runner
@@ -750,13 +821,15 @@ def run_report(config_path: str, work_path: str):
             return False
         if name == 'surrogate_pca' and level not in ('standard','full'):
             return False
-        if level == 'minimal' and name not in ('objective','profiles','power_flows'):
+        if level == 'minimal' and name not in ('objective','residual_channels',
+                                               'parameter_history','profiles','power_flows'):
             return False
         return plots_cfg.get(name, True)
 
     #try:
     if enabled('objective'):    plot_objective(hist_df, cfg, outdir)
     if enabled('residual_channels'):    plot_residual_channels(hist_df, modules, cfg, outdir)
+    if enabled('parameter_history'):    plot_parameter_history(hist_df, modules, cfg, outdir)
     if enabled('profiles'):   plot_profiles(modules, hist_df, cfg, outdir)
     if enabled('power_flows'):    plot_power_flows(hist_df, modules, cfg, outdir)
     if enabled('surrogate_heatmap'):
@@ -777,6 +850,7 @@ def main():
     parser.add_argument('--workdir', '-w', default='.', help='Working directory containing files to analyze.')
     args = parser.parse_args()
     run_report(args.config,args.workdir)
+    plt.show()
 
 if __name__ == '__main__':
     main()
