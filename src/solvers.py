@@ -25,9 +25,7 @@ from datetime import datetime, timezone
 import pickle
 from surrogates import SurrogateManager
 import scipy as sp
-from math import sqrt
 from contextlib import contextmanager
-from functools import partial
 
 
 # ---------------------------------------------------------------------------
@@ -41,6 +39,7 @@ class SolverData:
     X_std: List[Dict[str, Dict[str, float]]] = field(default_factory=list)  # parameter std dicts
     R: List[Optional[np.ndarray]] = field(default_factory=list)  # residual vector
     R_std: List[Optional[np.ndarray]] = field(default_factory=list)  # residual std vector
+    R_dict: List[Optional[Dict[str, np.ndarray]]] = field(default_factory=list)  # residual blocks
     Z: List[Optional[float]] = field(default_factory=list)       # objective scalar
     Z_std: List[Optional[float]] = field(default_factory=list)       # objective std scalar
     Y: List[Dict[str, np.ndarray]] = field(default_factory=list)
@@ -50,15 +49,16 @@ class SolverData:
     used_surrogate: List[bool] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
-    def add(self, i: int, X: Dict[str, Dict[str, float]], X_std: Dict[str, Dict[str, float]], R: Optional[np.ndarray], R_std: Optional[np.ndarray], Z: Optional[float],
-            Z_std: Optional[float], Y: Dict[str, np.ndarray], Y_std: Dict[str, np.ndarray], Y_target: Dict[str, np.ndarray],
-            Y_target_std: Dict[str, np.ndarray], used_surr: bool):
+    def add(self, i: int, X: Dict[str, Dict[str, float]], X_std: Dict[str, Dict[str, float]], R: Optional[np.ndarray], R_std: Optional[np.ndarray],
+            R_dict: Optional[Dict[str, np.ndarray]], Z: Optional[float], Z_std: Optional[float], Y: Dict[str, np.ndarray],
+            Y_std: Dict[str, np.ndarray], Y_target: Dict[str, np.ndarray], Y_target_std: Dict[str, np.ndarray], used_surr: bool):
         self.iterations.append(int(i))
         # Deep copy dicts to avoid mutation issues
         self.X.append(copy.deepcopy(X))
         self.X_std.append({k: copy.deepcopy(v) for k, v in (X_std or {}).items()})
         self.R.append(None if R is None else np.asarray(R).copy())
         self.R_std.append(None if R_std is None else np.asarray(R_std).copy())
+        self.R_dict.append({k: np.asarray(v).copy() for k, v in (R_dict or {}).items()} if R_dict is not None else {})
         self.Z.append(None if Z is None else float(Z))
         self.Z_std.append(None if Z_std is None else float(Z_std))
         self.Y.append({k: np.asarray(v).copy() for k, v in (Y or {}).items()})
@@ -93,6 +93,13 @@ class SolverData:
                 for j, rval in enumerate(self.R[i]):
                     row[f"R_{j}"] = rval
                     row[f"R_std_{j}"] = self.R_std[i][j]
+
+            # Flatten residual blocks
+            if i < len(self.R_dict) and self.R_dict[i]:
+                for block, arr in self.R_dict[i].items():
+                    arr_flat = np.asarray(arr).flatten()
+                    for j, val in enumerate(arr_flat):
+                        row[f"R_{block}_{j}"] = val
             
             # Flatten Y model outputs: var__idx -> value
             if i < len(self.Y) and self.Y[i]:
@@ -301,8 +308,7 @@ class SolverBase:
         self.step_size = float(self.options.get("step_size", 1e-2))
         self.min_step_size = float(self.options.get("min_step_size", 1e-3))
         self.adaptive_step = bool(self.options.get("adaptive_step", True))
-        self.normalize_residual = bool(self.options.get("normalize_residual", True))
-        self.residual_on_lcfs = bool(self.options.get("residual_on_lcfs", False))
+
         self.converged = False
         self.stalled = False
         self.iter = 0
@@ -322,6 +328,9 @@ class SolverBase:
         self._best_model_Y: Optional[Dict[str, np.ndarray]] = None
         self._best_model_Y_target: Optional[Dict[str, np.ndarray]] = None
         self._best_model_R: Optional[np.ndarray] = None
+        self._best_model_R_dict: Optional[Dict[str, np.ndarray]] = None
+        self.R: Optional[np.ndarray] = None
+        self.R_dict: Dict[str, np.ndarray] = {}
 
         # Mapping predicted profiles to target variables
         self.predicted_profiles = list(self.options.get("predicted_profiles", []))
@@ -330,13 +339,20 @@ class SolverBase:
         self.model_vars = self.transport_vars+self.target_vars
         self.n_params_per_profile = int(self.options.get("n_params_per_profile", 0))
 
-        # Evaluation grid
+        # Evaluation grid, #TODO: push eval_coord through. eval_loc instead of roa_eval, etc.
+        self.eval_coord = options.get('eval_coord', 'roa').lower()
         self.domain = self.options.get("domain", [0.85, 1.0])
         self.roa_eval = np.asarray(self.options.get("roa_eval", []), float)
         if self.roa_eval.size == 0:
             self.n_eval = int(self.options.get("n_eval", 32))
             self.roa_eval = np.linspace(self.domain[0], self.domain[1], self.n_eval)
         else: self.n_eval = self.roa_eval.size
+
+        # Residual controls
+        self.residual_weights = self.options.get("residual_weights", {'flux': 0.5, 
+                                        'boundary_conditions': 0.25, 'constraints': 0.25})  # dict of var -> weight
+        self.normalize_residual = bool(self.options.get("normalize_residual", True))
+        self.residual_on_lcfs = bool(self.options.get("residual_on_lcfs", False))
 
         # Bounds & iteration controls
         self.bounds = self._parse_bounds(self.options.get("bounds"))
@@ -349,6 +365,7 @@ class SolverBase:
         self.surr_retrain_every = int(self.options.get("surrogate_retrain_every", 10))
         self.surr_verify_on_converge = bool(self.options.get("surrogate_verify_on_converge", True))
         self._surr_trained = False
+        self._use_surr_iter = False
         #self._surrogate_models = {}        # var_name / var_name__col -> model
         #self._surrogate_sigmas = {}        # var_name / var_name__col -> sigma vector
 
@@ -368,23 +385,21 @@ class SolverBase:
         self.J = None
         self.use_jacobian = bool(self.options.get("use_jacobian", True))
         self.jacobian_reg = float(self.options.get("jacobian_reg", 1e-8))
-        self.fd_epsilon = float(self.options.get("fd_epsilon", 0.1))
-        self.jacobian_methods = [
-            "jacobian_wrt_parameters",
-            "compute_jacobian",
-            "residual_jacobian",
-            "jacobian",
-            "get_jacobian",
-        ]
+        self.fd_epsilon = float(self.options.get("fd_epsilon", 0.05))
+        self.gradient_clip = float(self.options.get("gradient_clip", 1e6))  # max norm for gradient clipping
         
         # Jacobian caching & adaptive recomputation
         self._J_cache = None              # cached Jacobian matrix
         self._J_cache_iter = -1           # iteration when last computed
         self._R_cache = None              # cached residual for change detection
         self.jacobian_cache_enabled = bool(self.options.get("jacobian_cache_enabled", True))
-        self.jacobian_recompute_every = int(self.options.get("jacobian_recompute_every", 10))  # recompute every k iters
+        self.jacobian_recompute_every = int(self.options.get("jacobian_recompute_every", 5))  # recompute every k iters
         self.jacobian_recompute_tol = float(self.options.get("jacobian_recompute_tol", 0.1))  # ||R_new - R_old|| / ||R_old|| threshold
         self.jacobian_use_surrogate_grads = bool(self.options.get("jacobian_use_surrogate_grads", True))  # use SurrogateManager.get_grads if available
+        
+        # Parameter scaling/preconditioning
+        self.use_parameter_preconditioning = bool(self.options.get("use_parameter_preconditioning", True))
+        self.param_scales: Optional[Dict[str, Dict[str, float]]] = None  # set during run
         
         # solution constraints
         self.constraints = self.options.get("constraints", None)
@@ -468,22 +483,32 @@ class SolverBase:
 
     # --------------------- helpers ---------------------
     def get_initial_parameters(self):
-        self._neutrals.solve(self._state)
         _ = self._targets.evaluate(self._state)
         self._boundary.get_boundary_conditions(self._state, self._targets)
         self.X, self.X_std = self._parameters.parameterize(self._state, self._boundary.bc_dict)
-        self._project_bounds(self.X)
+        self.X = self._project_bounds(self.X)
         self._flatten_params(self.X)  # sets self.schema
+        self._build_bounds_dict()
+        initial_profiles_list = [
+            (str(prof),getattr(self._state, prof)) for prof in self.predicted_profiles
+        ] + [(f'aL{prof}', getattr(self._state, f'aL{prof}')) for prof in self.predicted_profiles]
+        self._state.initial_profiles = dict(initial_profiles_list)  # store initial state for reference
 
 
     def _update_from_params(self, X: np.ndarray):
+        """
+        Update state from parameters and evaluate targets with a self-consistent state.
+
+        PlasmaState.process is responsible for handling neutrals.
+        """
         self._boundary.get_boundary_conditions(self._state, self._targets)
-        # delegate to parameters to reconstruct profiles
+        # Delegate to parameters to reconstruct profiles
         if isinstance(X, np.ndarray):
-            X = self._unflatten_params(X, self.schema)
+            X = self._unflatten_params(X)
         self._parameters.update(X, self._boundary.bc_dict, self.roa_eval)
-        self._state.update(X, self._parameters)
-        self._neutrals.solve(self._state)
+        self._state.update(X, self._parameters, neutrals=self._neutrals)
+        
+        # Evaluate targets with self-consistent state
         _ = self._targets.evaluate(self._state)
 
     # --------------------- bounds helpers (schema + BC) ---------------------
@@ -561,15 +586,15 @@ class SolverBase:
         return None
 
     def _project_bounds(self, X):
-        """Clip parameters using bounds.
+        """Clip parameters using bounds. """
         
-        Expects self.bounds as dict with keys = self.predicted_profiles
-        and values = [(lower, upper), ...] for each parameter.
-        """
         if self.bounds is None:
             return X
 
         if isinstance(X, dict):
+            # Get cached bc_dict from previous iteration (already computed in _update_from_params)
+            bc_dict = getattr(self._boundary, 'bc_dict', {}) if self._boundary is not None else {}
+            
             Xc = {}
             for prof, pvals in X.items():
                 if prof not in self.bounds:
@@ -577,7 +602,7 @@ class SolverBase:
                     Xc[prof] = pvals
                     continue
                 
-                bounds_list = self.bounds[prof]  # List of (lower, upper) tuples
+                bounds_list = self.bounds[prof]  # List of (lower, upper) tuples from static config
                 Xc[prof] = {}
                 
                 # Get parameter names in sorted order for consistent indexing
@@ -585,27 +610,46 @@ class SolverBase:
                 
                 for idx, pname in enumerate(param_names):
                     val = pvals[pname]
+                    
+                    # Start with static bounds
                     if idx < len(bounds_list):
                         lo, hi = bounds_list[idx]
-                        Xc[prof][pname] = float(np.clip(val, lo, hi, ))
                     else:
-                        # No bounds for this parameter index
-                        Xc[prof][pname] = val
+                        lo, hi = -1e6, 1e6  # Wide default bounds
+                    
+                    # Clip parameter to final bounds
+                    Xc[prof][pname] = float(np.clip(val, lo, hi))
 
-            # Warn if any parameters w/o boundary conditions hit bounds
-            # if self.R is not None:
-            #     mask_ix = np.where(np.isclose(self.R, 0))[0]
-            #     X_flat = self._flatten_params(X)[0]
-            #     Xc_flat = self._flatten_params(Xc)[0]
-            #     if np.any(np.any(np.delete(Xc_flat,mask_ix) == lo) or np.any(np.delete(Xc_flat,mask_ix) == hi)):
-            #         raise Warning("Parameter values hit bounds and were clipped. Try reducing step size.")
-            
             return Xc
 
         return X
 
+    def _get_bounds_vectors(self) -> Tuple[np.ndarray, np.ndarray]:
+        """Return flat lower/upper bound arrays aligned with a schema.
+
+        Falls back to wide bounds when bounds_dict is missing an entry.
+        """
+        schema = self.schema
+        lo_list = []
+        hi_list = []
+        for prof, pname in schema:
+            if self.bounds_dict and prof in self.bounds_dict and pname in self.bounds_dict[prof]:
+                lo, hi = self.bounds_dict[prof][pname]
+            else:
+                lo, hi = -1e6, 1e6
+            lo_list.append(float(lo))
+            hi_list.append(float(hi))
+        return np.asarray(lo_list, float), np.asarray(hi_list, float)
+
     def _use_surrogate_iteration(self) -> bool:
-        # Surrogates used after warm-up on scheduled evaluation iterations
+        """Check if we should use surrogate for prediction (not training).
+        
+        Returns False during:
+        - Warmup period
+        - Retraining iterations
+        - When converged
+        - When surrogate is disabled/unavailable
+        """
         if self._surrogate is None:
             return False
         if self.use_surrogate==False:
@@ -614,13 +658,24 @@ class SolverBase:
             return False
         if self.converged==True: 
             return False
+        # Don't use surrogate on retraining iterations (full model evaluation)
         if (self.iter % self.surr_retrain_every) == 0:
             return False
         
         return True
     
+    def _train_surrogate(self):
+        """Train surrogate model if enabled and we have enough data."""
+        if self._surrogate is None or self._use_surr_iter==False:
+            return
+        if (self.iter % self.surr_retrain_every) == 0 or (self.iter == self.surr_warmup-1):
+            self._surrogate.fit()
+            self._surr_trained = True
+        return
+
+
     def _evaluate(self, X: Optional[Dict[str, Dict[str, float]]] = None,
-                  use_surr: bool = False, in_place: bool = True):
+                      in_place: bool = True, is_fd_sample: bool = False):
         """Evaluate transport + target (or surrogate) optionally without mutating solver attributes.
 
         Parameters
@@ -629,19 +684,18 @@ class SolverBase:
             State instance to evaluate on (can be a copy).
         X : dict, optional
             Parameter dict associated with evaluation (used for surrogate sample when in_place).
-        use_surr : bool
-            If True and surrogate available, evaluate surrogate instead of full models.
         in_place : bool
             When True, store results on self; otherwise just return them.
+        is_fd_sample : bool
+            If True, don't add to surrogate training (preserves diversity vs FD perturbations).
 
         Returns
         -------
         Y_model, Y_model_std, Y_target, Y_target_std : tuple(dict,dict,dict,dict)
         """
         X_current = self.X if X is None else X
-        if use_surr and self._surrogate is not None:
-            train = in_place and ((self.iter % self.surr_retrain_every) == 0 or (self.iter == self.surr_warmup-1))
-            Y, Y_std = self._surrogate.evaluate(X_current, self._state, train=train)
+        if self._use_surr_iter and self._surrogate is not None:
+            Y, Y_std = self._surrogate.evaluate(X_current, self._state)
             Y_model = self._surrogate.transport
             Y_model_std = getattr(self._surrogate, 'transport_std', {})
             Y_target = self._surrogate.targets
@@ -650,7 +704,7 @@ class SolverBase:
             Y_model, Y_model_std = self._transport.evaluate(self._state)
             Y_target, Y_target_std = self._targets.evaluate(self._state)
             if in_place and self._surrogate is not None:
-                self._surrogate.add_sample(self._state, X_current, Y_model, Y_target)
+                self._surrogate.add_sample(self._state, X_current, Y_model, Y_target, is_fd_sample=is_fd_sample)
         if in_place:
             self.Y = Y_model
             self.Y_std = Y_model_std
@@ -661,22 +715,69 @@ class SolverBase:
 
     def _compute_residuals(self, Y_model: Dict[str, Any], Y_target: Dict[str, Any]) -> Optional[np.ndarray]:
         normalize = self.normalize_residual
+        R_bc = np.array([], float)
+        R_constraints = np.array([], float)
 
-        R_dict = {k: np.array(Y_model[k]) - np.array(Y_target[k]) \
+        R_flux_dict = {k: np.array(Y_model[k]) - np.array(Y_target[k]) \
                   for k in Y_target.keys() if k in Y_model.keys()}
-        R = np.concatenate([R_dict[k] for k in sorted(R_dict.keys())])
+        R_flux = np.concatenate([R_flux_dict[k] for k in sorted(R_flux_dict.keys())])
         Y_target_concat = np.concatenate([np.array(Y_target[k]) for k in Y_target.keys() if k in Y_model])
         if normalize:
-            R = R / (np.abs(Y_target_concat) + 1e-8)
+            R_flux = R_flux / (np.abs(Y_target_concat) + 1e-8)
         if not self.residual_on_lcfs:
             idx = np.where(np.isclose(self.roa_eval, 1.0, atol=1e-3))[0]
             if idx.size == 1:
                 n = len(self.roa_eval)
                 k = int(idx[0])
+                nblocks = R_flux.size // n if n > 0 else 0
                 # Zero the LCFS residual element for each variable block
-                nblocks = R.size // n if n > 0 else 0
-                for b in range(nblocks):
-                    R[b * n + k] = 0.0
+                # for b in range(nblocks):
+                #     R_flux[b * n + k] = 0.0
+
+                # Drop the LCFS residual element for each variable block
+                R_flux = np.concatenate([R_flux[b * n : b * n + k] for b in range(nblocks)] +
+                                  [R_flux[b * n + k + 1 : (b + 1) * n] for b in range(nblocks)])
+                
+        # Apply flux residual weighting  
+        R = R_flux * self.residual_weights.get('flux',0.5)
+
+        # ---------------------------------------------------------
+        # Boundary condition residuals (optional block)
+        # ---------------------------------------------------------
+        bc_residuals = []   
+        bc_dict = getattr(self._boundary, "bc_dict", {}) if hasattr(self, "_boundary") else {}
+        if bc_dict and self.residual_weights.get('boundary_conditions',0.0) != 0.0:
+            x_arr = np.asarray(self._state.roa, float).ravel()
+            for name, entry in bc_dict.items():
+                # Entry can be dict-like {"val": v, "loc": l} or a list/tuple [v, l]
+                if isinstance(entry, dict):
+                    target_val = entry.get("val")
+                    target_loc = entry.get("loc")
+                elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                    target_val, target_loc = entry[0], entry[1]
+                else:
+                    continue
+
+                if target_val is None or target_loc is None:
+                    continue
+                if not hasattr(self._state, name):
+                    continue
+                if not any(name in i or f'aL{i}' in name for i in self.predicted_profiles):
+                    continue
+
+                y_arr = np.asarray(getattr(self._state,name), float).ravel()
+                if y_arr.size != x_arr.size or y_arr.size == 0:
+                    continue
+
+                pred_val = float(np.interp(float(target_loc), x_arr, y_arr))
+                denom = abs(float(target_val)) + 1e-8 if normalize else 1.0
+                resid = (pred_val - float(target_val)) / denom
+                
+                bc_residuals.append(resid * self.residual_weights.get('boundary_conditions',0.25))
+
+        R_bc = np.asarray(bc_residuals, float)
+        if bc_residuals:
+            R = np.concatenate([R, R_bc])
 
         # ---------------------------------------------------------
         # Constraint residuals
@@ -707,9 +808,11 @@ class SolverBase:
                 R_constraints.append(np.sqrt(c["weight"]) * val)
 
             if R_constraints:
-                R = np.concatenate([R, np.array(R_constraints)])
+                R_constraints = np.array(R_constraints) * self.residual_weights.get('constraints',0.25)
+                R = np.concatenate([R, R_constraints])
 
         self.R = np.nan_to_num(R, nan=1e6, posinf=1e6, neginf=-1e6)
+        self.R_dict = {'flux': R_flux, 'boundary_conditions': R_bc, 'constraints': R_constraints}
 
         return R
     
@@ -766,30 +869,28 @@ class SolverBase:
 
         return np.array(values, dtype=float), schema
     
-    def _unflatten_params(self, X_flat: np.ndarray, schema: List[Tuple[str, str]]) -> Dict[str, Dict[str, float]]:
+    def _unflatten_params(self, X_flat: np.ndarray) -> Dict[str, Dict[str, float]]:
         """Convert flat array back to dict-of-dicts using schema.
         
         Parameters
         ----------
         X_flat : np.ndarray
             Flattened parameter vector
-        schema : List[Tuple[str, str]]
-            List of (profile, param_name) tuples defining the order
-            
+
         Returns
         -------
         X_dict : Dict[str, Dict[str, float]]
             Reconstructed dict-of-dicts parameters
         """
         X_dict = {}
-        for i, (prof, pname) in enumerate(schema):
+        for i, (prof, pname) in enumerate(self.schema):
             if prof not in X_dict:
                 X_dict[prof] = {}
             X_dict[prof][pname] = float(X_flat[i])
         return X_dict
     
     # --------------------- Jacobian helpers ---------------------
-    def _objective_at(self, X: Dict[str, Dict[str, float]], use_surr: bool) -> float:
+    def _objective_at(self, X: Dict[str, Dict[str, float]]) -> float:
         """Compute objective at params X on the current solver object.
 
         When called inside `with self.sandbox():`, this operates on the sandboxed
@@ -798,7 +899,7 @@ class SolverBase:
         """
         solver = self._active_sandbox if self._active_sandbox is not None else self
         solver._update_from_params(X)
-        Y_model, _, Y_target, _ = solver._evaluate(X, use_surr=use_surr, in_place=False)
+        Y_model, _, Y_target, _ = solver._evaluate(X, in_place=False)
         R = solver._compute_residuals(Y_model, Y_target)
         if R is None or R.size == 0:
             return float("inf")
@@ -820,22 +921,24 @@ class SolverBase:
             self._active_sandbox = None
                 # Rp = sb2._compute_residuals(Ymp, Ytp)
 
-    def _attempt_get_jacobian(self, X: np.ndarray, R: np.ndarray, surrogate=None):
-        """Compute or retrieve cached Jacobian with adaptive recomputation and diagnostic checks.
+    def _attempt_get_jacobian(self, X: np.ndarray, R: np.ndarray):
+        """Compute Jacobian with caching and staged fallbacks.
         
         Priority order:
         1. Return cached J if recompute check passes
-        2. Try surrogate gradients (fastest, if available and trained)
-        3. Try FD on surrogate (fast, if surrogate trained)
-        4. Fall back to FD on full model (expensive)
+        2. Surrogate analytic gradients (if available)
+        3. FD on surrogate (if requested and trained)
+        4. FD on full model
         """
+        surrogate = self._surrogate if (self._use_surr_iter and self._surrogate is not None) else None
+
         # Handle dict-of-dicts parameters: flatten for Jacobian computation
         if isinstance(X, dict):
-            X_flat, schema = self._flatten_params(X)
+            X_flat, _ = self._flatten_params(X)
             X_dict = X  # Keep original for reconstruction
         else:
-            X_flat = X
-            X_dict = self._unflatten_params(X, self.schema) if hasattr(self, 'schema') else None
+            X_flat = np.asarray(X, float)
+            X_dict = self._unflatten_params(X)
         
         # Check if we should reuse cached Jacobian
         if self.jacobian_cache_enabled and self._J_cache is not None:
@@ -844,38 +947,28 @@ class SolverBase:
                 return self._J_cache
         
         J = None
-        source = None
-        
+
         # Priority 1: Surrogate gradients (analytic, fastest if available)
         if (self.jacobian_use_surrogate_grads and surrogate is not None and 
-            hasattr(surrogate, 'trained') and surrogate.trained):
+            surrogate.trained):
             try:
                 J = self._jacobian_from_surrogate_grads(X_flat, X_dict, surrogate)
-                if J is not None:
-                    source = 'surrogate_grads'
             except Exception:
-                pass
+                J = None
         
-        # Priority 2: Finite difference on a trained surrogate model
-        if J is None and surrogate is not None:
-            try:
-                J = self._fd_jacobian_on_surrogate(X_flat, R, surrogate)
-                if J is not None:
-                    source = 'fd_surrogate'
-            except Exception:
-                pass
+        # Priority 2: Finite difference using surrogate evaluations (if trained)
+        if J is None and surrogate is not None and surrogate.trained:
+            J = self._fd_jacobian(X_flat, R)
 
         # Priority 3: Finite difference on the full, expensive models
         if J is None:
-            J = self._fd_jacobian_on_full_model(X_flat, R, surrogate)
-            source = 'fd_full'
+            J = self._fd_jacobian(X_flat, R)
         
-        # Cache the result and run diagnostics
-        if J is not None:
-            if self.jacobian_cache_enabled:
-                self._J_cache = J
-                self._J_cache_iter = self.iter
-                self._R_cache = R.copy() if R is not None else None
+        # Cache the result
+        if J is not None and self.jacobian_cache_enabled:
+            self._J_cache = J
+            self._J_cache_iter = self.iter
+            self._R_cache = R.copy() if R is not None else None
         
         return J
 
@@ -975,125 +1068,79 @@ class SolverBase:
             return True
         
         return False
-        
-
-    def _fd_jacobian_on_surrogate(self, X: np.ndarray, R: np.ndarray, surrogate=None):
-        """Fast Jacobian via finite differences on the surrogate model.
-        
-        Parameters
-        ----------
-        schema : List[Tuple[str, str]], optional
-            If provided, X is flat and needs to be unflattened to dict for evaluate calls
-        """
+    
+    def _fd_jacobian(self, X: np.ndarray, R: np.ndarray):
+        """Finite-difference Jacobian with bound projection and adaptive step sizing."""
+        X_flat = np.asarray(X, float)
         m = R.size
-        n = X.size
-        J = np.zeros((m, n), float)
-        eps_rel = self.fd_epsilon
-
-        # Convert X to dict
-        schema = self.schema
-        X_dict = self._unflatten_params(X, schema)
-
-        # get baseline
-        # with sandbox() as sb:
-        self._update_from_params(X_dict, self._state)
-        Y, Y_std = surrogate.evaluate(X_dict, self._state)
-        Y_model_base = {**surrogate.transport, **surrogate.targets}
-        Y_target_base, _ = self._targets.evaluate(self._state)
-        R_base = self._compute_residuals(Y_model_base, Y_target_base)
-        if R_base is None:
+        n = X_flat.size
+        if m == 0 or n == 0:
             return None
-
-        for j in range(n):
-            xj = X[j]
-            eps = eps_rel * abs(xj) if xj != 0 else eps_rel
-            
-            # Perturb parameters (in flat space)
-            Xp = X.copy()
-            Xp[j] += eps
-            
-            # Convert to dict if needed
-            Xp_dict = self._unflatten_params(Xp, schema) if schema else Xp
-            
-            # with self.sandbox() as sb:
-            self._update_from_params(Xp_dict, self._state)
-            Y, Y_std = surrogate.evaluate(Xp_dict, self._state)
-            Y_model_p = {**surrogate.transport, **surrogate.targets}
-            Rp = self._compute_residuals(Y_model_p, Y_target_base)
-            if Rp is None: return None
-
-            J[:, j] = (Rp - R_base) / eps
-
-        # restore state to baseline X
-        self._update_from_params(X_dict)
-            
-        return J
-
-    def _fd_jacobian_on_full_model(self, X: np.ndarray, R: np.ndarray, surrogate=None):
-        """Central finite-difference Jacobian on full transport/targets models.
         
-        Parameters
-        ----------
-        schema : List[Tuple[str, str]], optional
-            If provided, X is flat and needs to be unflattened to dict for evaluate calls
-        """
-        m = R.size
-        n = X.size
         J = np.zeros((m, n), float)
-        eps_rel = self.fd_epsilon
+        lo_arr, hi_arr = self._get_bounds_vectors()
+        X_base_dict = self._unflatten_params(X_flat)
 
-        # Convert X to dict
-        schema = self.schema
-        X_dict = self._unflatten_params(X, schema)
+        def _project_flat(x_flat: np.ndarray) -> Tuple[np.ndarray, Dict[str, Dict[str, float]]]:
+            x_dict = self._unflatten_params(x_flat)
+            x_proj = self._project_bounds(x_dict)
+            x_proj_flat, _ = self._flatten_params(x_proj)
+            return x_proj_flat, x_proj
 
-        base_obj = self._objective_at(X, use_surr=False)
-        if not np.isfinite(base_obj):
-            return None
-            
-        for j in range(n):
-            xj = X[j]
-            eps = eps_rel * abs(xj)
-            if eps == 0:
-                eps = eps_rel
-                
-            # Perturb in flat space
-            Xp = X.copy()
-            Xm = X.copy()
-            Xp[j] += eps
-            Xm[j] -= eps
-            
-            # Convert to dict if needed
-            Xp_dict = self._project_bounds(self._unflatten_params(Xp, schema) if schema else Xp)
-            Xm_dict = self._project_bounds(self._unflatten_params(Xm, schema) if schema else Xm)
-            
-            # Forward perturbation
-            self._update_from_params(Xp_dict)
-            Ymp, _ = self._transport.evaluate(self._state)
-            Ytp, _ = self._targets.evaluate(self._state)
-            Rp = self._compute_residuals(Ymp, Ytp)
-            
-            # Backward perturbation
-            self._update_from_params(Xm_dict)
-            Ymm, _ = self._transport.evaluate(self._state)
-            Ytm, _ = self._targets.evaluate(self._state)
-            Rm = self._compute_residuals(Ymm, Ytm)
-
-            # Store samples in surrogate if provided
-            if surrogate is not None:
-                surrogate.add_sample(self._state, Xp_dict, Ymp, Ytp)
-                surrogate.add_sample(self._state, Xm_dict, Ymm, Ytm)
-            
-            if Rp is None or Rm is None or Rp.size != Rm.size:
+        def _eval_residual(x_flat_eval: np.ndarray) -> Optional[np.ndarray]:
+            try:
+                self._update_from_params(x_flat_eval)
+                self._evaluate(in_place=True, is_fd_sample=True)
+                return self._compute_residuals(self.Y, self.Y_target)
+            except Exception:
                 return None
-            J[:, j] = (Rp - Rm) / (2.0 * eps)
-            
+
+        R_base = np.asarray(R, float) if R is not None else _eval_residual(X_flat)
+        if R_base is None or not np.all(np.isfinite(R_base)):
+            return None
+
+        for j in range(n):
+            span = hi_arr[j] - lo_arr[j]
+            scale_j = max(abs(X_flat[j]), 0.5 * span if np.isfinite(span) and span > 0 else 0.0, 1.0)
+            h = self.fd_epsilon * scale_j
+
+            Xp = X_flat.copy(); Xm = X_flat.copy()
+            Xp[j] += h; Xm[j] -= h
+
+            Xp_clip, _ = _project_flat(Xp)
+            Xm_clip, _ = _project_flat(Xm)
+
+            eps_eff = Xp_clip[j] - Xm_clip[j]
+            eps_floor = 1e-8 * max(scale_j, 1.0)
+
+            Rp = _eval_residual(Xp_clip) if np.any(Xp_clip != X_flat) else None
+            Rm = _eval_residual(Xm_clip) if np.any(Xm_clip != X_flat) else None
+
+            if Rp is not None and Rm is not None and abs(eps_eff) >= eps_floor:
+                J[:, j] = (Rp - Rm) / eps_eff
+                continue
+
+            if Rp is not None:
+                step = Xp_clip[j] - X_flat[j]
+                if abs(step) >= eps_floor:
+                    J[:, j] = (Rp - R_base) / step
+                    continue
+
+            if Rm is not None:
+                step = X_flat[j] - Xm_clip[j]
+                if abs(step) >= eps_floor:
+                    J[:, j] = (R_base - Rm) / step
+                    continue
+
+            # If all evaluations failed or step collapsed, leave column as zeros
+
         # Restore state to baseline X
-        self._update_from_params(X_dict)
+        self._update_from_params(X_base_dict)
 
         return J
 
     # --------------------- Main methods to override ---------------------
-    def propose_parameters(self, use_surr = False) -> np.ndarray:
+    def propose_parameters(self) -> np.ndarray:
         # Default: keep current (no change)
         return self.X.copy()
     
@@ -1123,6 +1170,10 @@ class SolverBase:
             # Build residual covariance (tries Jacobian linearization if param sigmas present)
             X_dict = self.X if isinstance(self.X, dict) else None
             C_R = self._build_residual_cov(self.R, X_dict, use_jacobian=self.use_jacobian)
+            
+            # Propagate parameter uncertainty to model output variables (uses cached Jacobian from _build_residual_cov)
+            if self.J is not None:
+                self._propagate_param_uncertainty_to_outputs(self.J)
 
             # If residuals were normalized (division by Y_target), propagate that transform:
             if self.normalize_residual and C_R is not None:
@@ -1185,7 +1236,8 @@ class SolverBase:
             return repr(x)
 
         module_specs = {}
-        for name in ("solver","state", "surrogate", "transport", "targets", "boundary", "parameters", "neutrals"):
+        for name in ("solver", "state", "surrogate", "transport", "targets", "boundary",
+                 "parameters", "neutrals"):
             obj = bundle.get(name) if name != "solver" else self
             if obj is None:
                 continue
@@ -1215,6 +1267,80 @@ class SolverBase:
     
     # --------------------- uncertainty helpers ---------------------
 
+    def _propagate_param_uncertainty_to_outputs(self, J_R: Optional[np.ndarray] = None) -> None:
+        """
+        Propagate parameter uncertainty to model output variables via Jacobian linearization.
+        
+        Updates self.Y_std by adding parameter contribution: var_param = J_Y @ Cx @ J_Y^T
+        This is called from check_convergence to populate Y_std with parameter uncertainty
+        without requiring repeated Jacobian computations.
+        
+        Parameters
+        ----------
+        J_R : np.ndarray, optional
+            Jacobian of residuals w.r.t. parameters (nR x nX). If None, uses cached self.J.
+            The flux portion of J_R corresponds to dY_model/dX.
+        """
+        if not self.use_jacobian:
+            return
+        
+        # Get Jacobian (use provided or cached)
+        J = J_R if J_R is not None else self.J
+        if J is None:
+            return
+        
+        # Get parameter std flattened
+        try:
+            if self._parameters is None or not hasattr(self._parameters, 'param_std'):
+                return
+            sigma_X_dict = self._parameters.param_std
+            if not sigma_X_dict:
+                return
+            
+            sigma_X, _ = self._flatten_params(sigma_X_dict)
+            if sigma_X is None or sigma_X.size == 0:
+                return
+        except Exception:
+            return
+        
+        # Build parameter covariance matrix
+        Cx = np.diag(sigma_X**2)
+        
+        # Extract flux block of Jacobian and propagate to outputs
+        try:
+            y_keys = sorted([k for k in (self.Y_target or {}).keys() if k in (self.Y or {})])
+            
+            row_idx = 0
+            for k in y_keys:
+                y_array = np.asarray(self.Y[k], dtype=float)
+                n_elements = y_array.size
+                
+                # Extract Jacobian block for this output variable
+                if row_idx + n_elements > J.shape[0]:
+                    break
+                J_Y_k = J[row_idx:row_idx + n_elements, :]
+                
+                # Propagate: Cov_param = J_Y @ Cx @ J_Y^T, then extract diagonal for std
+                try:
+                    cov_k = J_Y_k @ Cx @ J_Y_k.T
+                    std_param_k = np.sqrt(np.maximum(0.0, np.diag(cov_k)))
+                except Exception:
+                    # If covariance computation fails, skip this variable
+                    row_idx += n_elements
+                    continue
+                
+                # Add parameter contribution to existing model uncertainty
+                y_std_existing = np.asarray(self.Y_std.get(k, np.zeros_like(y_array)), dtype=float).ravel()
+                y_std_combined = np.sqrt(y_std_existing**2 + std_param_k**2)
+                
+                # Store back with original shape
+                self.Y_std[k] = y_std_combined.reshape(y_array.shape)
+                
+                row_idx += n_elements
+        except Exception:
+            # If anything fails, just leave Y_std as is
+            pass
+
     def _build_residual_cov(self,
                             R: np.ndarray,
                             X_dict: Optional[Dict[str, Dict[str, float]]],
@@ -1228,25 +1354,68 @@ class SolverBase:
           - target uncertainty (self.Y_target_std)
         Returns dense covariance matrix (nR x nR) or None when nothing available.
         """
-        # Collect model and target stds in the same ordering as R
-        # R ordering is based on sorted keys of Y_target intersection Y_model (see _compute_residuals)
-        # Build arrays of stds for each block
+        # Build measurement/model covariance C_meas from all residual blocks
+        # R consists of: flux + boundary_conditions + constraints (from self.R_dict keys)
         try:
-            y_keys = sorted([k for k in (self.Y_target or {}).keys() if k in (self.Y or {})])
-            # build model std vector and target std vector in same order
-            model_sig_list = []
-            target_sig_list = []
-            for k in y_keys:
-                mstd = np.asarray(self.Y_std.get(k, np.zeros_like(self.Y[k])), dtype=float)
-                tstd = np.asarray(self.Y_target_std.get(k, np.zeros_like(self.Y_target[k])), dtype=float)
-                # flatten to 1D and append
-                model_sig_list.append(mstd.ravel())
-                target_sig_list.append(tstd.ravel())
-            sigma_model_vec = np.concatenate([s.ravel() for s in model_sig_list]) if model_sig_list else np.zeros(R.size)
-            sigma_target_vec = np.concatenate([s.ravel() for s in target_sig_list]) if target_sig_list else np.zeros(R.size)
-            # total measurement/model std for residual
-            sigma_resid = np.sqrt(np.maximum(0.0, sigma_model_vec**2 + sigma_target_vec**2))
-            C_meas = np.diag(sigma_resid**2)
+            sigma_list = []
+            
+            # --- Flux block: model + target uncertainty ---
+            if 'flux' in (self.R_dict or {}):
+                y_keys = sorted([k for k in (self.Y_target or {}).keys() if k in (self.Y or {})])
+                model_sig_list = []
+                target_sig_list = []
+                for k in y_keys:
+                    mstd = np.asarray(self.Y_std.get(k, np.zeros_like(self.Y[k])), dtype=float)
+                    tstd = np.asarray(self.Y_target_std.get(k, np.zeros_like(self.Y_target[k])), dtype=float)
+                    model_sig_list.append(mstd.ravel())
+                    target_sig_list.append(tstd.ravel())
+                sigma_model_vec = np.concatenate(model_sig_list) if model_sig_list else np.empty(0)
+                sigma_target_vec = np.concatenate(target_sig_list) if target_sig_list else np.empty(0)
+                sigma_flux = np.sqrt(np.maximum(0.0, sigma_model_vec**2 + sigma_target_vec**2))
+                if not self.residual_on_lcfs:
+                    idx = np.where(np.isclose(self.roa_eval, 1.0, atol=1e-3))[0]
+                    if idx.size == 1:
+                        n = len(self.roa_eval)
+                        k = int(idx[0])
+                        nblocks = len(sigma_flux) // n if n > 0 else 0
+                        # Drop the LCFS sigma element for each variable block
+                        sigma_flux = np.concatenate([sigma_flux[b * n : b * n + k] for b in range(nblocks)] +
+                                                  [sigma_flux[b * n + k + 1 : (b + 1) * n] for b in range(nblocks)])
+                sigma_list.append(sigma_flux)
+            
+            # --- Boundary conditions block: fixed sigma from self._boundary ---
+            if 'boundary_conditions' in (self.R_dict or {}):
+                bc_size = np.asarray(self.R_dict['boundary_conditions']).size
+                bc_sigma = float(getattr(self._boundary, 'sigma', 0.01)) if hasattr(self, '_boundary') else 0.01
+                sigma_bc = np.full(bc_size, bc_sigma, dtype=float)
+                sigma_list.append(sigma_bc)
+            
+            # --- Constraints block: sigma from each compiled constraint ---
+            if 'constraints' in (self.R_dict or {}):
+                constraints_size = np.asarray(self.R_dict['constraints']).size
+                if constraints_size > 0 and hasattr(self, 'compiled_constraints'):
+                    sigma_constraints = []
+                    for c in self.compiled_constraints:
+                        # Get sigma from constraint dict or use default
+                        c_sigma = float(c.get('sigma', 0.01)) if isinstance(c, dict) else 0.01
+                        sigma_constraints.append(c_sigma)
+                    # Replicate to match constraints_size if needed
+                    sigma_constraints_arr = np.array(sigma_constraints)
+                    if sigma_constraints_arr.size < constraints_size:
+                        # Pad or replicate if fewer sigmas than constraints
+                        sigma_constraints_arr = np.tile(sigma_constraints_arr, 
+                                                         (constraints_size // sigma_constraints_arr.size) + 1)[:constraints_size]
+                    sigma_constraints_vec = sigma_constraints_arr[:constraints_size]
+                else:
+                    sigma_constraints_vec = np.full(constraints_size, 0.01, dtype=float)
+                sigma_list.append(sigma_constraints_vec)
+            
+            # Concatenate all sigma vectors and build diagonal covariance
+            if sigma_list:
+                sigma_resid = np.concatenate(sigma_list)
+                C_meas = np.diag(sigma_resid**2) if sigma_resid.size > 0 else None
+            else:
+                C_meas = None
         except Exception:
             C_meas = None
         self.C_meas = C_meas
@@ -1257,7 +1426,7 @@ class SolverBase:
             # try to compute Jacobian (this will attempt training surrogate / FD as configured)
             try:
                 X_flat, schema = self._flatten_params(X_dict)
-                J = self._attempt_get_jacobian(X_flat, R, self._surrogate)
+                J = self._attempt_get_jacobian(X_flat, R)
                 if J is not None:
                     self.J = J
                     # get sigma_X diag
@@ -1268,7 +1437,6 @@ class SolverBase:
                         C_param = J @ Cx @ J.T
             except Exception:
                 C_param = None
-        self.C_param = C_param
         
         # Combine
         if C_meas is None and C_param is None:
@@ -1291,15 +1459,15 @@ class SolverBase:
                 C_total[:, [b * n + k for b in range(nblocks)]] = 0.0
                 C_total[[b * n + k for b in range(nblocks)], :] = 0.0
 
-        self.C_Xpost = self._compute_posterior_parameter_uncertainty()
+        # Compute posterior parameter uncertainty (may populate self.J as side effect)
+        _ = self._compute_posterior_parameter_uncertainty()
 
         return C_total
     
     def _compute_posterior_parameter_uncertainty(self):
-        """
-        CALLED THROUGH _build_residual_cov TO SET self.C_Xposterior
-
-        Compute posterior parameter covariance via linearized update:
+        """Compute posterior parameter covariance via linearized Bayesian update.
+        
+        Formula:
             Cx_post = (J^T (C_meas)^-1 J + Cx_prior^-1)^-1
         where C_meas includes model and target uncertainty.
         Using Moore-Penrose pseudoinverses for non-square matrices.
@@ -1308,8 +1476,7 @@ class SolverBase:
         if self.J is None and self.use_jacobian:
             self.J = self._attempt_get_jacobian(
                 self.X if isinstance(self.X, dict) else self.X,
-                self.R,
-                self._surrogate
+                self.R
             )
         else: return None
         # Posterior covariance
@@ -1320,12 +1487,12 @@ class SolverBase:
             return None
 
 
-    def check_stalled(self, use_surr: bool) -> None:
+    def check_stalled(self) -> None:
         """Set self.stalled when model Z shows < self.tol improvement over model_iter_to_stall consecutive evaluations.
         
         Special case: model_iter_to_stall=0 means stall immediately on any non-improvement.
         """
-        if use_surr or self.Z is None or self.iter < self.surr_warmup:
+        if self._use_surr_iter or self.Z is None or self.iter < self.surr_warmup:
             return
 
         # Skip stall check if counter disabled
@@ -1355,6 +1522,19 @@ class SolverBase:
     # --------------------- main loop ---------------------
     def run(self, state, boundary, parameters, neutrals, transport, targets, surrogate=None) -> SolverData:
 
+        # migrate info to modules
+        state.domain = self.domain
+        state._trim()
+        transport.roa_eval = self.roa_eval
+        transport.output_vars = self.transport_vars + self.target_vars
+        targets.roa_eval = self.roa_eval
+        targets.output_vars = self.target_vars
+        parameters.predicted_profiles = self.predicted_profiles
+        parameters.bounds = self.bounds
+        parameters.domain = self.domain
+        parameters.roa_eval = self.roa_eval
+        data = SolverData()
+
         # Store module references for Jacobian calls
         self._state = state
         self._parameters = parameters
@@ -1363,16 +1543,6 @@ class SolverBase:
         self._transport = transport
         self._targets = targets
         self._surrogate = surrogate
-
-        # migrate info to modules
-        transport.roa_eval = self.roa_eval
-        transport.output_vars = self.transport_vars + self.target_vars
-        targets.roa_eval = self.roa_eval
-        targets.output_vars = self.target_vars
-        parameters.predicted_profiles = self.predicted_profiles
-        parameters.bounds = self.bounds
-        parameters.domain = self.domain
-        data = SolverData()
 
         # initialize parameter vector
         self.get_initial_parameters()
@@ -1396,17 +1566,19 @@ class SolverBase:
         while not self.converged and not self.stalled and self.iter <= self.max_iter:
             # apply parameters → state
             X_current, it = self.X, self.iter
-            self._update_from_params(X_current)
+            if it > 0: self._update_from_params(X_current)
 
-            # surrogate or full model
-            use_surr = self._use_surrogate_iteration()
-            self._evaluate(use_surr=use_surr, in_place=True)
+            # On retraining iterations: run full model and add sample for training
+            # On other iterations: use surrogate for prediction if available
+            self._use_surr_iter = self._use_surrogate_iteration()
+            self._train_surrogate()
+            self._evaluate(in_place=True)
         
             # convergence
             self.check_convergence(self.Y, self.Y_target)
             
             # Track best model evaluation (not surrogate)
-            if not use_surr and self.Z is not None and np.isfinite(self.Z):
+            if not self._use_surr_iter and self.Z is not None and np.isfinite(self.Z):
                 if self._best_model_Z is None or self.Z < self._best_model_Z:
                     self._best_model_Z = float(self.Z)
                     self._best_model_iter = self.iter
@@ -1414,14 +1586,15 @@ class SolverBase:
                     self._best_model_Y = {k: np.asarray(v).copy() for k, v in self.Y.items()}
                     self._best_model_Y_target = {k: np.asarray(v).copy() for k, v in self.Y_target.items()}
                     self._best_model_R = np.asarray(self.R).copy() if self.R is not None else None
+                    self._best_model_R_dict = {k: np.asarray(v).copy() for k, v in (self.R_dict or {}).items()}
             
-            self.check_stalled(use_surr=use_surr)
+            self.check_stalled()
 
             if self.converged or self.stalled:
-                if use_surr and self.surr_verify_on_converge:
+                if self._use_surr_iter and self.surr_verify_on_converge:
                     # verify on full model
-                    use_surr = False
-                    self._evaluate(use_surr=use_surr, in_place=True)
+                    self._use_surr_iter = False
+                    self._evaluate(in_place=True)
                     self.check_convergence(self.Y, self.Y_target)
                     if self.converged or (self.Z >= data.Z[-1]):
                         self.stalled = True
@@ -1435,10 +1608,10 @@ class SolverBase:
                 if self.iter < self.max_iter: 
                     if self.iter % self.iter_between_save == 0: self.save(module_bundle)
                 else:
-                    if use_surr:
+                    if self._use_surr_iter:
                         # final evaluation on full model
-                        use_surr = False
-                        self._evaluate(use_surr=use_surr, in_place=True)
+                        self._use_surr_iter = False
+                        self._evaluate(in_place=True)
                         self.check_convergence(self.Y, self.Y_target)
                     print('Max iterations reached. Solver run complete.')
 
@@ -1450,16 +1623,19 @@ class SolverBase:
                     self.Y = {k: v.copy() for k, v in self._best_model_Y.items()}
                     self.Y_target = {k: v.copy() for k, v in self._best_model_Y_target.items()}
                     self.R = self._best_model_R.copy() if self._best_model_R is not None else None
+                    self.R_dict = {k: np.asarray(v).copy() for k, v in (self._best_model_R_dict or {}).items()}
                     self.Z = self._best_model_Z
                     self._update_from_params(self.X)
 
-            data.add(self.iter, self.X, self.X_std, self.R, self.R_std, \
-                     self.Z, self.Z_std, self.Y, self.Y_std, self.Y_target, self.Y_target_std, use_surr)
+            data.add(self.iter, self.X, self.X_std, self.R, self.R_std, self.R_dict, \
+                     self.Z, self.Z_std, self.Y, self.Y_std, self.Y_target, self.Y_target_std, self._use_surr_iter)
             self.save(module_bundle)
 
-            # propose next parameters, dict of keys = self.predicted profiles, values = parameter arrays
-            self.X, self.X_std = self.propose_parameters(use_surr=use_surr)
-            # Note: J cache is now managed internally by _attempt_get_jacobian; don't manually reset
+            # propose new parameters
+            X, X_std = self.propose_parameters()
+            self.X = self._project_bounds(X)
+            self.X_std = X_std
+
             self.iter += 1
 
         return data
@@ -1473,23 +1649,10 @@ class RelaxSolver(SolverBase):
         super().__init__(options)
 
     # --- proposal logic ---
-    def propose_parameters(self, use_surr: bool = True):
-        """Generate new parameter proposal.
+    def propose_parameters(self):
+        """Relaxation-based parameter update with gradient clipping for numerical stability."""
 
-        Supports dict-of-dicts parameter format. When Jacobian is enabled and
-        parameters are dict-of-dicts, they are flattened for Jacobian computation
-        and then unflattened for the result.
-        """
-        residual = self.R
-
-        if self.X is None:
-            # Should have been initialized in run(); safeguard anyway
-            return None
-
-        if residual is None or np.size(residual) == 0:
-            return copy.deepcopy(self.X)
-
-        R = np.asarray(residual, float)
+        R = np.asarray(self.R, float)
 
         if self.adaptive_step:
             # adaptive step size based on residual norm
@@ -1506,14 +1669,13 @@ class RelaxSolver(SolverBase):
             J = getattr(self, 'J', None)
             if J is None:
                 try:
-                    surr = self._surrogate if use_surr else None
                     J = self._attempt_get_jacobian(
-                        X_flat, R, surr
+                        X_flat, R
                     )
                     self.J = J
                 except Exception:
                     J = None
-
+        
             if J is not None:
                 # Column preconditioning: scale columns of J to unit norm
                 col_norms = np.linalg.norm(J, axis=0)
@@ -1532,23 +1694,25 @@ class RelaxSolver(SolverBase):
 
                 X_new_flat = X_flat + step_size * direction
                 # Unflatten back to dict
-                X_new_wo_bounds = self._unflatten_params(X_new_flat, schema)
-
+                X_new_wo_bounds = self._unflatten_params(X_new_flat)
             else:
-                # Simple relaxation: uniform step on all parameters
-                sign_term = float(np.sign(np.nanmean(R)))
-                step = -self.step_size * sign_term
-                X_new_wo_bounds = {}
-                for prof, param_dict in self.X.items():
-                    new_inner = {}
-                    for pname, pval in (param_dict or {}).items():
-                        try:
-                            new_inner[pname] = float(pval) + step
-                        except Exception:
-                            new_inner[pname] = pval  # leave non-numeric untouched
-                    X_new_wo_bounds[prof] = new_inner
-            # Apply bounds projection
-            X_new = self._project_bounds(X_new_wo_bounds)
+                X_new_wo_bounds = copy.deepcopy(self.X)
+
+        else:
+            # Simple relaxation: uniform step on all parameters
+            sign_term = float(np.sign(np.nanmean(R)))
+            step = -self.step_size * sign_term
+            X_new_wo_bounds = {}
+            for prof, param_dict in self.X.items():
+                new_inner = {}
+                for pname, pval in (param_dict or {}).items():
+                    try:
+                        new_inner[pname] = float(pval) + step
+                    except Exception:
+                        new_inner[pname] = pval  # leave non-numeric untouched
+                X_new_wo_bounds[prof] = new_inner
+        # Apply bounds projection
+        X_new = self._project_bounds(X_new_wo_bounds)
 
         X_new_std = {prof: {name: abs(val)*self._parameters.sigma for name, val in X_new[prof].items()} for prof in X_new}
         for prof in X_new.keys():
@@ -1557,7 +1721,6 @@ class RelaxSolver(SolverBase):
                     # stay in log space for std
                     X_new_std[prof][param] = X_new[prof][param] + np.log(self._parameters.sigma)
         return X_new, X_new_std
-
 
 class BayesianOptSolver(SolverBase):
     """
@@ -1598,7 +1761,7 @@ class BayesianOptSolver(SolverBase):
     # ----------------------
     # propose_parameters
     # ----------------------
-    def propose_parameters(self, use_surr: bool = True):
+    def propose_parameters(self):
         """Batch MC BO using surrogate gradients when available.
 
         Acquisition on inverse objective -Z:
@@ -1610,7 +1773,7 @@ class BayesianOptSolver(SolverBase):
         """
         # --- Warmup fallback --------------------------------------------------
         if getattr(self, 'iter', 0) < getattr(self, 'surr_warmup', 5):
-            return RelaxSolver.propose_parameters(self, use_surr=False)
+            return RelaxSolver.propose_parameters(self)
 
         # --- Flatten current parameters & schema ------------------------------
         X_flat0, schema = self._flatten_params(self.X)
@@ -1637,7 +1800,7 @@ class BayesianOptSolver(SolverBase):
         seed        = int(getattr(self, 'seed', 0)) + int(self.iter)
         rng         = np.random.default_rng(seed)
         normalize_resid = bool(self.normalize_residual)
-        use_surr = True if self._surrogate is not None else False
+        self._use_surr_iter = True if self._surrogate is not None else False
 
         # --- Current best objective -------------------------------------------
         Z_best = float(self.Z) if (hasattr(self, 'Z') and self.Z is not None and np.isfinite(self.Z)) else float('inf')
@@ -1672,8 +1835,8 @@ class BayesianOptSolver(SolverBase):
 
         def _acq_single(x_flat):
             # Convert flat -> dict for surrogate call
-            X_dict = self._unflatten_params(x_flat, schema)
-            Y_model, Y_model_std, Y_target, Y_target_std = self._evaluate(use_surr=use_surr, in_place=True)
+            X_dict = self._unflatten_params(x_flat)
+            Y_model, Y_model_std, Y_target, Y_target_std = self._evaluate(in_place=True)
 
             eps = rng.normal(size=(n_mc, len(Y_model), n_roa))
             y_samples = np.array(list(Y_model.values()))[None, :, :] + np.array(list(Y_model_std.values()))[None, :, :] * eps  # (n_mc, n_tgt, n_roa)
@@ -1717,7 +1880,7 @@ class BayesianOptSolver(SolverBase):
                 self._update_from_params(x_batch[b])
                 state_b = copy.deepcopy(self._state)
                 states.append(state_b)
-            Y_model, Y_model_std, Y_target, Y_target_std = self.evaluate(x_batch, states, use_surr=use_surr, in_place=False)
+            Y_model, Y_model_std, Y_target, Y_target_std = self._evaluate(x_batch, states, in_place=False)
 
             # return to original state
             self._update_from_params(self.X)
@@ -1781,9 +1944,8 @@ class BayesianOptSolver(SolverBase):
                     self._update_from_params(x_batch[b])
                     state_b = copy.deepcopy(self._state)
                     states.append(state_b)
-                _ = self._surrogate.evaluate(x_batch, states, train=False)
                 
-                Y_model, Y_model_std, Y_target, Y_target_std = self.evaluate(x_batch, states, use_surr=use_surr, in_place=False)
+                Y_model, Y_model_std, Y_target, Y_target_std = self._evaluate(x_batch, states, in_place=False)
 
                 # return to original state
                 self._update_from_params(self.X)
@@ -1915,7 +2077,7 @@ class BayesianOptSolver(SolverBase):
             best_x = X_flat0.copy()
 
         # --- Convert to dict & build std dict ---------------------------------
-        X_new = self._unflatten_params(best_x, schema)
+        X_new = self._unflatten_params(best_x)
         X_new = self._project_bounds(X_new)
         X_new_std = {prof: {pname: abs(val) * getattr(self._parameters, 'sigma', 0.0)
                             for pname, val in prof_dict.items()}
@@ -1924,7 +2086,7 @@ class BayesianOptSolver(SolverBase):
 
 
 class IvpSolver(SolverBase):
-    """SolverBase child that integrates parameter evolution in pseudo-time."""
+    """SolverBase child that integrates parameter evolution in pseudo-time using BDF for stiff systems."""
 
     def __init__(self, options=None):
         super().__init__(options)
@@ -1933,7 +2095,7 @@ class IvpSolver(SolverBase):
         self.vectorized = bool(self.options.get("vectorized", False))
 
 
-    def _ode_rhs(self, t, X_flat, use_surr: bool):
+    def _ode_rhs(self, t, X_flat):
         """Compute dX/dt = -α*R for residual-driven dynamics.
         
         Uses direct residual feedback rather than gradient descent.
@@ -1941,7 +2103,7 @@ class IvpSolver(SolverBase):
         """
         # Update state with current parameters
         self._update_from_params(X_flat)
-        self._evaluate(use_surr=use_surr, in_place=True)
+        self._evaluate(in_place=True)
         R = self._compute_residuals(self.Y, self.Y_target)
         if R is None:
             return np.zeros_like(X_flat)
@@ -1949,8 +2111,7 @@ class IvpSolver(SolverBase):
         # Cache Jacobian for potential use by solve_ivp's jac callback
         # Only compute if not already cached for this timestep
         if not hasattr(self, '_J_cache') or self._J_cache is None:
-            surr = self._surrogate if use_surr else None
-            self._J_cache = self._attempt_get_jacobian(X_flat, R, surr)
+            self._J_cache = self._attempt_get_jacobian(X_flat, R)
         
         if self._J_cache is not None:
             # J is (m_residuals, n_params), we want to map R (m,) -> dX (n,)
@@ -1962,7 +2123,7 @@ class IvpSolver(SolverBase):
         
         return dX
 
-    def _jacobian(self, t, X_flat, use_surr: bool):
+    def _jacobian(self, t, X_flat):
         """Jacobian ∂(dX/dt)/∂X for implicit ODE methods.
         
         Reuses cached J from _ode_rhs to avoid redundant computation.
@@ -1974,12 +2135,11 @@ class IvpSolver(SolverBase):
         else:
             # Compute if not cached (shouldn't happen if _ode_rhs called first)
             self._update_from_params(X_flat)
-            self._evaluate(use_surr=use_surr, in_place=True)
+            self._evaluate(in_place=True)
             R = self._compute_residuals(self.Y, self.Y_target)
             if R is None:
                 return np.zeros((X_flat.size, X_flat.size))
-            surr = self._surrogate if use_surr else None
-            J = self._attempt_get_jacobian(X_flat, R, surr)
+            J = self._attempt_get_jacobian(X_flat, R)
             if J is None:
                 return np.zeros((X_flat.size, X_flat.size))
             self._J_cache = J
@@ -1989,19 +2149,16 @@ class IvpSolver(SolverBase):
         J_pinv = sp.linalg.pinv(J)
         return -J_pinv @ J
 
-    def propose_parameters(self, use_surr: bool = False):
+    def propose_parameters(self):
         """Advance one pseudo-time step (Δt) using residual-driven dynamics."""
         if self.X is None:
             raise RuntimeError("Parameters are not initialized; run get_initial_parameters() first.")
 
         # Ensure we have a flat parameter vector and schema
         if isinstance(self.X, dict):
-            X0_flat, schema = self._flatten_params(self.X)
+            X0_flat,_= self._flatten_params(self.X)
         else:
             X0_flat = np.asarray(self.X, dtype=float)
-            schema = getattr(self, "schema", None)
-        if schema is None:
-            raise RuntimeError("Parameter schema is not initialized; call get_initial_parameters() before stepping.")
 
         X0 = np.asarray(X0_flat, float)
         t_curr = self.iter * self.dt
@@ -2019,7 +2176,7 @@ class IvpSolver(SolverBase):
             y0=X0,
             method=self.method,
             t_eval=[t_next],
-            args=(use_surr,),
+            args=(),
             max_step=self.dt,
             first_step=self.dt*0.5,
             vectorized=self.vectorized,
@@ -2030,7 +2187,7 @@ class IvpSolver(SolverBase):
         )
 
         X_new_flat = np.asarray(sol.y[:, -1])
-        X_new = self._unflatten_params(X_new_flat, schema)
+        X_new = self._unflatten_params(X_new_flat)
         X_new = self._project_bounds(X_new)
         X_new_std = {prof: {pname: abs(val) * getattr(self._parameters, "sigma", 0.0)
                             for pname, val in prof_dict.items()}

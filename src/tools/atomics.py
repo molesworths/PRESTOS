@@ -117,14 +117,10 @@ class AtomicDataInterpolator:
             CX_rates: charge exchange (N, Zmax+1)
         """
 
-        # Convert units to CSV convention
-        ne = ne_cm3 * 1e-19 * 1e6  # cm^-3 -> 1e19/m^3
-        Te = Te_eV / 1000.0  # eV -> keV
-        Ti = Ti_eV / 1000.0  # eV -> keV
-        
-        ne = np.atleast_1d(ne)
-        Te = np.atleast_1d(Te)
-        Ti = np.atleast_1d(Ti)
+        # Keep Aurora units (cm^-3, eV) to match fitted polynomials
+        ne = np.atleast_1d(ne_cm3)
+        Te = np.atleast_1d(Te_eV)
+        Ti = np.atleast_1d(Ti_eV)
         
         # Determine max charge state from polynomial coefficients
         n_charge = max([max(self.coefficients.get('ionization', {}).keys(), default=0) + 1, 1])
@@ -165,13 +161,10 @@ class AtomicDataInterpolator:
         tuple
             (fZ, None) where fZ has shape (N, Zmax+1)
         """
-        ne = ne_cm3 * 1e-19 * 1e6  # cm^-3 -> 1e19/m^3
-        Te = Te_eV / 1000.0  # eV -> keV
-        Ti = Ti_eV / 1000.0  # eV -> keV
-        
-        ne = np.atleast_1d(ne)
-        Te = np.atleast_1d(Te)
-        Ti = np.atleast_1d(Ti)
+        # Keep Aurora units (cm^-3, eV) to match fitted polynomials
+        ne = np.atleast_1d(ne_cm3)
+        Te = np.atleast_1d(Te_eV)
+        Ti = np.atleast_1d(Ti_eV)
         
         # Determine charge states from coefficients
         if 'fZ' in self.coefficients:
@@ -219,13 +212,10 @@ class AtomicDataInterpolator:
             Radiation components with arrays of shape (n_charge_states, n_spatial):
             {'tot', 'line_rad', 'cont_rad', 'brems', 'thermal_cx_cont_rad', 'synchrotron'}
         """
-        ne = ne_cm3 * 1e-19 * 1e6  # cm^-3 -> 1e19/m^3
-        Te = Te_eV / 1000.0  # eV -> keV
-        Ti = Ti_eV / 1000.0 if Ti_eV is not None else Te
-        
-        ne = np.atleast_1d(ne)
-        Te = np.atleast_1d(Te)
-        Ti = np.atleast_1d(Ti)
+        # Keep Aurora units (cm^-3, eV) to match fitted polynomials
+        ne = np.atleast_1d(ne_cm3)
+        Te = np.atleast_1d(Te_eV)
+        Ti = np.atleast_1d(Ti_eV if Ti_eV is not None else Te_eV)
         
         n_spatial = ne.size
         result = {}
@@ -281,11 +271,11 @@ class AtomicDataInterpolator:
         Parameters
         ----------
         ne : array
-            Electron density [1e19/m^3]
+            Electron density [cm^-3]
         Te : array
-            Electron temperature [keV]
+            Electron temperature [eV]
         Ti : array
-            Ion temperature [keV]
+            Ion temperature [eV]
         process : str
             'ionization', 'recombination', or 'charge_exchange'
         charge_state : int
@@ -294,7 +284,7 @@ class AtomicDataInterpolator:
         Returns
         -------
         rate : array
-            Rate coefficient [m^3/s] or similar
+            Rate coefficient in Aurora units (same as fitted data)
         """
         if process not in self.coefficients or charge_state not in self.coefficients[process]:
             return np.zeros_like(ne)
@@ -327,11 +317,11 @@ class AtomicDataInterpolator:
         Parameters
         ----------
         ne : array
-            Electron density [1e19/m^3]
+            Electron density [cm^-3]
         Te : array
-            Electron temperature [keV]
+            Electron temperature [eV]
         Ti : array
-            Ion temperature [keV]
+            Ion temperature [eV]
         charge_state : int
             Charge state index
         
@@ -370,11 +360,11 @@ class AtomicDataInterpolator:
         Parameters
         ----------
         ne : array
-            Electron density [1e19/m^3]
+            Electron density [cm^-3]
         Te : array
-            Electron temperature [keV]
+            Electron temperature [eV]
         Ti : array
-            Ion temperature [keV]
+            Ion temperature [eV]
         component : str
             Radiation component ('tot', 'line', 'cont', 'brems', 'cx')
         charge_state : int or None
@@ -383,7 +373,7 @@ class AtomicDataInterpolator:
         Returns
         -------
         rad : array
-            Radiation power density [W/cm^3]
+            Radiation power density in Aurora units (same as fitted data)
         """
         if 'radiation' not in self.coefficients or component not in self.coefficients['radiation']:
             return np.zeros_like(ne)

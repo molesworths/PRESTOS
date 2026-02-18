@@ -1,0 +1,18 @@
+#-------------------------------------------------------------------------
+# Template input.qlgyro file (controls-only)
+#-------------------------------------------------------------------------
+
+N_PARALLEL = 1
+N_RUNS = 1
+GAMMA_E = 0.0
+CODE = 1
+KYGRID_MODEL = 1
+KY = 0.3
+NKY = 12
+XNU_MODEL = 3
+AUTO_BOX_SIZE = 0
+KX_MAX_BOX = 1000000.0
+SAT_RULE = 1
+N_PX0 = 1
+PX0GRID_MODEL = 1
+RESTART_MODE = 0

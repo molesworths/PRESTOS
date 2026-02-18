@@ -38,42 +38,52 @@ from scipy.optimize import fmin_l_bfgs_b
 
 try:
     from sklearn.gaussian_process import GaussianProcessRegressor
-    from sklearn.preprocessing import StandardScaler, MinMaxScaler
+    from sklearn.preprocessing import StandardScaler
     from sklearn.gaussian_process.kernels import (
-        RBF, ConstantKernel as C,
-        Matern,
-        RationalQuadratic as RQ,
-        WhiteKernel as White,
+        RBF, ConstantKernel as C, Matern
     )
     _SKLEARN_AVAILABLE = True
 except Exception:
     _SKLEARN_AVAILABLE = False
 
 
-
 class SurrogateManager:
-    """Handles multiple surrogate models (local or global) consistent with solver structure."""
+    """Manages multiple surrogate models with progressive feature enrichment.
+    
+    Implements two-stage transformation pipeline:
+    1. Input normalization (MinMaxScaler)
+    2. Output standardization (per output)
+    """
 
     def __init__(self, options: Dict[str, Any], **kwargs):
         self.transport_vars: List[str] = []
         self.target_vars: List[str] = []
         self.options = options
         self.roa_eval: Optional[np.ndarray] = None
-        self.transport_split = ['turb','neo']
         self.mode = options.get("mode", "global").lower()
         self.model_config = dict(options.get("kwargs", {}))
-        self.scaling = options.get("scaling", "standard") # standard | minmax | physics
-        self.features = options.get("features", None)
         self.output_list: List[str] = []
         self.models: Dict[str, Any] = {}
         self.X_train: List[Dict[str, np.ndarray]] = []
         self.Y_train: List[Dict[str, np.ndarray]] = []
-        self.max_train_samples = options.get("max_train_samples", 10)  # Increased default for better coverage
-        self.min_train_samples = options.get("min_train_samples", 5)
-        self.min_score_threshold = options.get("min_score_threshold", 0.5)  # Minimum R² to use surrogate
+        self.max_train_samples = options.get("max_train_samples", 10)
+        self.min_score_threshold = options.get("min_score_threshold", 0.5)
+        self.min_sample_distance = options.get("min_sample_distance", 0.01)
         self.trained = False
-        self._X_train_bounds = None  # Will store (n_features, 2) array of [min, max] per feature
-        self.score = 0.
+        self._X_train_bounds = None
+        self.x_scaler = None  # StandardScaler for input standardization
+        self.y_scalers = {}  # Output scalers per output variable
+        self.score = {}  # R² scores per output
+        self.state_features: List[str] = []
+        self.param_features: List[str] = []
+        self.all_features: List[str] = []
+        self._full_state_features = [
+            "aLne", "aLte", "aLti", "vexb_shear",
+            "rhostar", "nustar", "tite", "betae",
+            "q", "shear", "eps", "Zeff",
+        ]
+        self._full_all_features: List[str] = []
+        self._active_stage: Optional[str] = None
 
     def _initialize(self, transport_vars: List[str], target_vars: List[str], roa_eval: np.ndarray, state: Any, X_params: Dict[str, Dict[str, np.ndarray]]):
         """Delayed initialization to receive vars from solver."""
@@ -83,8 +93,15 @@ class SurrogateManager:
         self.output_list = self.transport_vars + self.target_vars
         if self.roa_eval is not None and len(self.roa_eval) > 5:
             self.mode = 'global'
+        self._ensure_param_features(X_params)
+        self._refresh_full_features()
+        self._set_active_features(len(self.X_train))
         self.get_features(state, X_params)
         self.build_models()
+        
+        # Check for warm-start from evaluation log
+        if self.options.get('warm_start', False):
+            self._warm_start_from_log(state, X_params)
 
     def _normalize_input(self, params):
         """Normalize input params to (is_batched, batched_array, input_type) format.
@@ -123,6 +140,53 @@ class SurrogateManager:
         else:
             raise TypeError(f"params must be dict or np.ndarray, got {type(params)}")
 
+    def _ensure_param_features(self, X_params) -> None:
+        if self.param_features:
+            return
+        self.param_features = []
+        if X_params and isinstance(X_params, dict):
+            for prof, prof_params in X_params.items():
+                for pname in prof_params.keys():
+                    if not pname.startswith("aL"):
+                        self.param_features.append(f"{prof}_{pname}")
+
+    def _refresh_full_features(self) -> None:
+        self._full_all_features = self._build_all_features(self._full_state_features)
+
+    def _build_all_features(self, state_features: List[str]) -> List[str]:
+        all_features = list(state_features) + list(self.param_features)
+
+        return all_features
+
+    def _stage_state_features(self, n_samples: int) -> List[str]:
+        stage1 = ["aLne", "aLte", "aLti", "vexb_shear"]
+        stage2 = stage1 + ["rhostar", "nustar", "tite", "betae"]
+        if n_samples < 5:
+            return stage1
+        if n_samples < 10:
+            return stage2
+        if n_samples > 20:
+            return stage2 + ["q", "shear", "eps", "Zeff"]
+        
+        # Later: convert to physics-informed composite features, e.g., trapped fraction, resistive drive, etc.
+        return stage2
+
+    def _set_active_features(self, n_samples: int) -> bool:
+        next_state_features = self._stage_state_features(n_samples)
+        if next_state_features == self.state_features:
+            return False
+        self.state_features = next_state_features
+        self.all_features = self._build_all_features(self.state_features)
+        if n_samples < 5:
+            self._active_stage = "stage1"
+        elif n_samples < 10:
+            self._active_stage = "stage2"
+        elif n_samples > 20:
+            self._active_stage = "stage3"
+        else:
+            self._active_stage = "stage2"
+        return True
+
     # ------------------------------------------------
     # Construction
     # ------------------------------------------------
@@ -142,7 +206,9 @@ class SurrogateManager:
             return SURROGATE_MODELS[kind](config, features=features)
         raise ValueError(f"Unknown surrogate type '{kind}'.")
 
-    def get_features(self, state: Any = None, X_params = None) -> np.ndarray:
+    def get_features(self, state: Any = None, X_params = None,
+                     state_features: Optional[List[str]] = None,
+                     all_features: Optional[List[str]] = None) -> np.ndarray:
         """
         Construct surrogate input feature matrix based on mode (local/global) and plasma state.
 
@@ -153,8 +219,8 @@ class SurrogateManager:
         X_params : dict or np.ndarray, optional
             Design parameters in one of three formats:
             - Dict[str, Dict[str, np.ndarray]]: nested dict for single sample
-            - np.ndarray shape (n_params, n_roa): flattened single sample
-            - np.ndarray shape (n_batch, n_params, n_roa): batched samples
+            - np.ndarray shape (n_params): flattened single sample
+            - np.ndarray shape (n_batch, n_params): batched samples
 
         Returns
         -------
@@ -163,63 +229,14 @@ class SurrogateManager:
             - Single input: shape (n_roa_eval, n_features)
             - Batched input: shape (n_batch, n_roa_eval, n_features)
         """
-        # ------------------------------------------------------------------
-        # 1. Base plasma features
-        # ------------------------------------------------------------------
-        if not hasattr(self, 'state_features'):
-            self.state_features = [
-                "aLne", "aLte", "aLti", "tite", "betae",
-                "nustar", "rhostar", # "gamma_exb", "gamma_par",
-                "q", #"Zeff", "q", "shear", "delta", "kappa", "eps"
-            ]
-
-            self.state_features_scalers = {
-                "aLne": lambda x: x/1.,
-                "aLte": lambda x: x/1.,
-                "aLti": lambda x: x/1.,
-                "tite": lambda x: x/1.,
-                "gamma_exb": lambda x: np.log10(x + 1e-8),
-                "gamma_par": lambda x: np.log10(x + 1e-8),
-                "betae": lambda x: x/0.01,
-                "nustar": lambda x: x/1.,
-                "rhostar": lambda x: x/0.01,
-                "Zeff": lambda x: x/1.,
-                "q": lambda x: x/1.,
-                "shear": lambda x: x/1.,
-                "delta": lambda x: x/1.,
-                "kappa": lambda x: x/1.,
-                "eps": lambda x: x/1.,
-            }
-
-
-        # ------------------------------------------------------------------
-        # 2. Add design parameter feature *names* (only for dict input)
-        # ------------------------------------------------------------------
-        if not hasattr(self, 'param_features'): 
-            self.param_features = []
-            if X_params and isinstance(X_params, dict):
-                for prof, prof_params in X_params.items():
-                    # skip gradient-like entries (they're already in self.features)
-                    for pname in prof_params.keys():
-                        if pname.startswith("aL"):
-                            continue
-                        self.param_features.append(f"{prof}_{pname}")
-            # save indices of state_features that are also design parameters
-            # self.param_features may be empty if design parameters are aLy because
-            # they are already included in state features, so we use aL* features, e.g., aLne, and roa_eval
-            # to map back to param names, e.g., aLne_0, aLne_1, etc., from params_schema
-            # if self.state_features:
-            #     for feat in self.state_features:
-            #         if feat not in self.param_features and feat in self.state_features:
-            #             self.param_features.append(feat)
-
-        # ------------------------------------------------------------------
-        # 3. Merge all feature names
-        # ------------------------------------------------------------------
-        if not hasattr(self, 'all_features'):
-            self.all_features = self.state_features + self.param_features
-            if self.mode == "global" and "roa" not in self.all_features:
-                pass #self.all_features.append("roa")
+        self._ensure_param_features(X_params)
+        if not self._full_all_features:
+            self._refresh_full_features()
+        if state_features is None or all_features is None:
+            if not self.all_features:
+                self._set_active_features(len(self.X_train))
+            state_features = self.state_features
+            all_features = self.all_features
 
         # ------------------------------------------------------------------
         # 4. Handle batched vs single inputs
@@ -232,7 +249,7 @@ class SurrogateManager:
             n_batch = 1
 
         n_eval = len(self.roa_eval)
-        n_feat = len(self.all_features)
+        n_feat = len(all_features)
         
         # Allocate output: (n_batch, n_roa_eval, n_features) or (n_roa_eval, n_features)
         if is_batched:
@@ -251,22 +268,22 @@ class SurrogateManager:
         if is_batched:
             # use individual states for each batch sample
             state_feature_matrix = np.array([
-                [np.interp(roa, state[b].roa, getattr(state[b], name)) for name in self.state_features]
+                [np.interp(roa, state[b].roa, getattr(state[b], name)) for name in state_features]
                 for b in range(n_batch)
                 for roa in self.roa_eval
-            ], dtype=float).reshape(n_batch, n_eval, len(self.state_features))  # (n_batch, n_roa_eval, n_state_features)
+            ], dtype=float).reshape(n_batch, n_eval, len(state_features))  # (n_batch, n_roa_eval, n_state_features)
         else:
             state_feature_matrix = np.array([
-                [np.interp(roa, state.roa, getattr(state, name)) for name in self.state_features]
+                [np.interp(roa, state.roa, getattr(state, name)) for name in state_features]
                 for roa in self.roa_eval
             ], dtype=float)  # (n_roa_eval, n_state_features)
 
         if X_params is None:
             # No params provided, return state features only
             if is_batched:
-                X_samples[:, :, :len(self.state_features)] = state_feature_matrix[np.newaxis, :, :]
+                X_samples[:, :, :len(state_features)] = state_feature_matrix
             else:
-                X_samples[:, :len(self.state_features)] = state_feature_matrix
+                X_samples[:, :len(state_features)] = state_feature_matrix
             return X_samples
 
         # Process params based on input type
@@ -284,10 +301,7 @@ class SurrogateManager:
                 else:
                     param_vals = param_vector
                 
-                if self.mode == "local":
-                    row_vec = np.concatenate([loc_sample_state, param_vals])
-                else:  # global
-                    row_vec = np.concatenate([loc_sample_state, param_vals])
+                row_vec = np.concatenate([loc_sample_state, param_vals])
                 X_samples[i] = row_vec
         
         else:
@@ -298,10 +312,7 @@ class SurrogateManager:
                 for i, roa in enumerate(self.roa_eval):
                     loc_sample_state = state_feature_matrix[b,i]
                     
-                    if self.mode == "local":
-                        row_vec = np.concatenate([loc_sample_state, param_vector])
-                    else:  # global
-                        row_vec = np.concatenate([loc_sample_state, param_vector])
+                    row_vec = np.concatenate([loc_sample_state, param_vector])
                     
                     if is_batched:
                         X_samples[b, i] = row_vec
@@ -321,43 +332,110 @@ class SurrogateManager:
 
         return Y_sample # row for each roa_eval
     
-    def add_sample(self, state, X_params, transport, targets):
-        """Extract new training data from current iteration and append."""
-        X_features_array = self.get_features(state, X_params)
+    def add_sample(self, state, X_params, transport, targets, is_fd_sample: bool = False):
+        """Extract new training data from current iteration and append.
+        
+        Parameters
+        ----------
+        state : PlasmaState
+            Current plasma state
+        X_params : dict
+            Design parameters
+        transport : dict
+            Transport coefficients
+        targets : dict
+            Target values
+        is_fd_sample : bool
+            If True, skip adding (finite-difference perturbations pollute training data)
+        """
+        # Skip finite-difference samples - they cluster around single points
+        # and crowd out diverse trajectory samples with limited max_train_samples
+        if is_fd_sample:
+            return
+        
+        self._ensure_param_features(X_params)
+        self._refresh_full_features()
+        X_features_array = self.get_features(
+            state,
+            X_params,
+            state_features=self._full_state_features,
+            all_features=self._full_all_features,
+        )
         Y_sample_array = self.get_outputs(transport, targets)
 
-        if any(np.array_equal(X_features_array, x_train) for x_train in self.X_train):
-            return  # Skip duplicate samples
+        # Check diversity: skip samples too close to existing training data
+        if self._is_too_similar(X_features_array):
+            return  # Skip near-duplicate samples to maintain diversity
 
-        X_sample_dict = {self.all_features[i]: X_features_array[:, i] for i in range(len(self.all_features))}
+        X_sample_dict = {self._full_all_features[i]: X_features_array[:, i] for i in range(len(self._full_all_features))}
         Y_sample_dict = {self.output_list[i]: Y_sample_array[:, i] for i in range(len(self.output_list))}
 
         self.X_train.append(X_sample_dict)
         self.Y_train.append(Y_sample_dict)
         self.trained = False
 
-        # Limit training set size - remove oldest samples
+        # Limit training set size - remove oldest samples if needed
         if len(self.X_train) > self.max_train_samples:
-            # Remove oldest 10% to avoid thrashing
-            n_remove = max(1, len(self.X_train) // 10)
-            self.X_train = self.X_train[n_remove:]
-            self.Y_train = self.Y_train[n_remove:]
-            self.X_train.pop(0)
-            self.Y_train.pop(0)
+            # Remove oldest samples to stay at max_train_samples
+            n_excess = len(self.X_train) - self.max_train_samples
+            self.X_train = self.X_train[n_excess:]
+            self.Y_train = self.Y_train[n_excess:]
+    
+    def _is_too_similar(self, X_new: np.ndarray) -> bool:
+        """Check if new sample is too close to existing training data.
+        
+        Parameters
+        ----------
+        X_new : np.ndarray
+            New feature array, shape (n_roa, n_features)
+        
+        Returns
+        -------
+        bool
+            True if sample is redundant (too similar to existing data)
+        """
+        if not self.X_train or self.min_sample_distance <= 0:
+            return False  # No filtering if no training data or disabled
+        
+        # Convert to flat feature vector for distance calculation
+        X_new_flat = X_new.flatten()
+        
+        # Compute normalized distance to all existing samples
+        feature_list = self._full_all_features if self._full_all_features else self.all_features
+        for X_dict in self.X_train:
+            X_old_flat = np.array([X_dict.get(feat, np.zeros_like(X_dict[self.state_features[0]])) for feat in feature_list]).flatten()
+            
+            # Normalize by feature ranges to make distance scale-invariant
+            # Use robust scaling based on current sample range
+            diff = X_new_flat - X_old_flat
+            scale = np.maximum(np.abs(X_new_flat), np.abs(X_old_flat), np.ones_like(X_new_flat))
+            normalized_dist = np.linalg.norm(diff / scale) / np.sqrt(len(X_new_flat))
+            
+            if normalized_dist < self.min_sample_distance:
+                return True  # Too similar to existing sample
+        
+        return False  # Sufficiently different
+
     # ------------------------------------------------
     # Training interface
     # ------------------------------------------------
 
     def fit(self):
-        """Train all surrogates to available training data."""
+        """Train all surrogates using input normalization + output standardization."""
         if not self.X_train:
-            return  # No data to train on
+            return
+
+        features_changed = self._set_active_features(len(self.X_train))
+        if features_changed:
+            self.build_models()
+            self.x_scaler = None
+            self.y_scalers = {}
 
         n_samples = len(self.X_train)
         n_roa = len(self.roa_eval)
         n_features = len(self.all_features)
         n_outputs = len(self.output_list)
-        scores = {key: 0 for key in self.output_list}
+        scores = {key: 0.0 for key in self.output_list}
 
         # Reconstruct numpy arrays from lists of dicts
         X_all_samples = np.zeros((n_samples, n_roa, n_features))
@@ -365,73 +443,48 @@ class SurrogateManager:
 
         for s_idx, sample_dict in enumerate(self.X_train):
             for f_idx, feature in enumerate(self.all_features):
-                X_all_samples[s_idx, :, f_idx] = sample_dict[feature]
+                X_all_samples[s_idx, :, f_idx] = sample_dict.get(feature, 0.0)
 
         for s_idx, sample_dict in enumerate(self.Y_train):
             for o_idx, output in enumerate(self.output_list):
                 Y_all_samples[s_idx, :, o_idx] = sample_dict[output]
         
-        # Apply input feature scaling based on configuration
-        if self.scaling == 'physics' and hasattr(self, 'state_features_scalers'):
-            # Physics-based scaling using predefined scalers
-            X_scaled = X_all_samples.copy()
-            for f_idx, feature in enumerate(self.all_features):
-                if feature in self.state_features_scalers:
-                    scaler_fn = self.state_features_scalers[feature]
-                    X_scaled[:, :, f_idx] = scaler_fn(X_all_samples[:, :, f_idx])
-            # Store physics scaler for later use
-            self.x_scaler = None
-            self.physics_scaled = True
-            X_all_samples = X_scaled
-        else:
-            # Standard statistical scaling
-            self.x_scaler = StandardScaler()
-            X_all_samples = self.x_scaler.fit_transform(X_all_samples.reshape(-1, n_features)).reshape(n_samples, n_roa, n_features)
-            self.physics_scaled = False
+        # Stage 1: Apply input standardization (StandardScaler)
+        self.x_scaler = StandardScaler()
+        X_scaled = self.x_scaler.fit_transform(X_all_samples.reshape(-1, n_features)).reshape(n_samples, n_roa, n_features)
         
+        # Stage 2: Standardize outputs per variable (StandardScaler)
         self.y_scalers = {key: StandardScaler() for key in self.output_list}
         
-        # Compute training bounds for extrapolation detection
-        X_flat = X_all_samples.reshape(-1, n_features)
+        # Track training bounds for extrapolation detection
+        X_flat = X_scaled.reshape(-1, n_features)
         self._X_train_bounds = np.column_stack([X_flat.min(axis=0), X_flat.max(axis=0)])
 
+        # Train all models
         for j, key in enumerate(self.models.keys()):
             if self.mode == 'global':
-                # Reshape to (n_samples * n_roa, n_features)
-                X_fit = X_all_samples.reshape(-1, n_features)
-
-                # Option to transform with PCA here if desired
-                # if self.n_pca is not None:
-                    # pca = PCA(n_components=self.n_pca)
-                    # X_fit = pca.fit_transform(X_fit)
-
-                # Reshape to (n_samples * n_roa,)
-                Y_fit = self.y_scalers[key].fit_transform(Y_all_samples[:, :, j].reshape(-1,1))
+                X_fit = X_scaled.reshape(-1, n_features)
+                Y_fit = self.y_scalers[key].fit_transform(Y_all_samples[:, :, j].reshape(-1, 1))
                 self.models[key].fit(X_fit, Y_fit)
                 scores[key] = self.models[key].score(X_fit, Y_fit)
             else:  # local
-                # Local GP fit to per-knot data: risky with few samples
                 for i, model in enumerate(self.models[key]):
-                    # X for i-th roa from all samples: (n_samples, n_features)
-                    i_features = X_all_samples[:, i, :]
-
-                    # Y for i-th roa and j-th output from all samples: (n_samples,)
-                    i_outputs = self.y_scalers[key].fit_transform(Y_all_samples[:, i, j].reshape(-1,1))
+                    i_features = X_scaled[:, i, :]
+                    i_outputs = self.y_scalers[key].fit_transform(Y_all_samples[:, i, j].reshape(-1, 1))
                     
-                    # Warn if too few samples for reliable GP fit
                     if n_samples < 3:
-                        print(f"Warning: Local GP for '{key}' at knot {i} has only {n_samples} sample(s); fit may be unreliable.")
+                        print(f"Warning: Local GP for '{key}' at knot {i} has only {n_samples} sample(s)")
                     
                     try:
                         model.fit(i_features, i_outputs.ravel())
                         score = model.score(i_features, i_outputs.ravel())
-                        scores[key] = max(scores[key], score)  # Use best score among knots
+                        scores[key] = max(scores[key], score)
                     except Exception as e:
                         print(f"Error fitting local GP for '{key}' at knot {i}: {e}")
                         scores[key] = 0.0
 
         self.trained = True
-        self.score = scores  # R^2
+        self.score = scores
         
         # Warn if any surrogate has poor fit
         poor_fits = {k: v for k, v in scores.items() if v < self.min_score_threshold}
@@ -441,46 +494,140 @@ class SurrogateManager:
         self.hyperparameters = {key: model.get_hyperparameters() if self.mode == 'global' else
                         [m.get_hyperparameters() for m in model]
                         for key, model in self.models.items()}
-
-    def is_extrapolating(self, X_features: np.ndarray, margin: float = 0.1) -> bool:
-        """Check if evaluation features are outside training bounds.
+    
+    def _warm_start_from_log(self, state: Any, X_params: Dict[str, Dict[str, np.ndarray]]):
+        """Load training data from transport evaluation log for warm-start.
+        
+        Searches the evaluation log for entries matching the configured transport
+        model and settings, then uses them to pre-train surrogates before any
+        expensive evaluations in the current solver run.
+        
+        Supports flexible settings filtering:
+        - Exact match: warm_start_model_settings={'SAT_RULE': 3}
+        - Multiple values: warm_start_model_settings={'SAT_RULE': [2, 3]}
+        - Partial match: warm_start_model_settings={'SAT_RULE': 3} (ignores other settings)
+        - Any settings: warm_start_model_settings={} or None
         
         Parameters
         ----------
-        X_features : np.ndarray
-            Transformed features, shape (n_roa, n_features) or (n_batch, n_roa, n_features)
-        margin : float
-            Safety margin as fraction of training range (0.1 = 10% margin)
-        
-        Returns
-        -------
-        bool
-            True if any feature exceeds training bounds by margin
+        state : PlasmaState
+            Current plasma state (used to determine model class/settings)
+        X_params : Dict[str, Dict[str, np.ndarray]]
+            Parameter dict (used for feature extraction)
         """
-        if self._X_train_bounds is None:
-            return True  # No training data, assume extrapolation
-        
-        X_flat = X_features.reshape(-1, X_features.shape[-1])
-        bounds = self._X_train_bounds
-        ranges = bounds[:, 1] - bounds[:, 0]
-        margin_vals = ranges * margin
-        
-        # Check if any feature is outside [min - margin, max + margin]
-        is_low = np.any(X_flat < (bounds[:, 0] - margin_vals), axis=1)
-        is_high = np.any(X_flat > (bounds[:, 1] + margin_vals), axis=1)
-        
-        return bool(np.any(is_low | is_high))
-    
-    def get_min_score(self) -> float:
-        """Return minimum R^2 score across all surrogate models."""
-        if not self.score:
-            return 0.0
-        return min(self.score.values())
+        try:
+            from evaluation_log import TransportEvaluationLog, get_default_log_path
+            
+            # Get evaluation log path
+            log_path = self.options.get('evaluation_log_path') or \
+                      get_default_log_path(self.options)
+            
+            eval_log = TransportEvaluationLog(str(log_path))
+            
+            # Determine transport model class and settings from options
+            model_class = self.options.get('warm_start_model_class')
+            model_settings = self.options.get('warm_start_model_settings')
+            
+            if not model_class:
+                print("Warning: warm_start enabled but no warm_start_model_class specified")
+                return
+            
+            # Flexible settings: None or {} means match ANY settings
+            filter_desc = "ANY settings"
+            if model_settings:
+                filter_parts = []
+                for key, value in model_settings.items():
+                    if isinstance(value, list):
+                        filter_parts.append(f"{key} in {value}")
+                    else:
+                        filter_parts.append(f"{key}={value}")
+                filter_desc = ", ".join(filter_parts) if filter_parts else "ANY settings"
+            
+            print(f"\nAttempting surrogate warm-start from evaluation log...")
+            print(f"  Model: {model_class}")
+            print(f"  Settings filter: {filter_desc}")
+            
+            # Query evaluation log
+            X, Y, roa = eval_log.get_for_surrogate(
+                model_class=model_class,
+                model_settings=model_settings,
+                target_roa=self.roa_eval,
+                feature_names=self.state_features,
+                output_names=self.output_list,
+                max_entries=self.options.get('warm_start_max_entries', 5000)
+            )
+            
+            if X.shape[0] == 0:
+                print("  No matching evaluations found in log.")
+                print(f"  Tip: Try broader settings filter or check database contents")
+                return
+            
+            print(f"  Retrieved {X.shape[0]} evaluations")
+            
+            # Convert to format expected by fit()
+            # X shape: (n_samples, n_state_features)
+            # Y shape: (n_samples, n_outputs * n_roa)
+            # Need to reshape to (n_samples, n_roa, n_features) and (n_samples, n_roa, n_outputs)
+            
+            n_samples = X.shape[0]
+            n_roa = len(self.roa_eval)
+            n_outputs = len(self.output_list)
+            
+            # Expand X to include roa dimension (state features are same across roa)
+            X_expanded = np.tile(X[:, np.newaxis, :], (1, n_roa, 1))  # (n_samples, n_roa, n_state_features)
+            
+            # Add parameter features if needed
+            if len(self.param_features) > 0:
+                # For warm-start, we don't have parameter info from log
+                # Use zeros or skip warm-start if parameters are critical
+                print(f"  Warning: Warm-start data lacks parameter features ({len(self.param_features)} missing)")
+                param_zeros = np.zeros((n_samples, n_roa, len(self.param_features)))
+                X_expanded = np.concatenate([X_expanded, param_zeros], axis=2)
+            
+            # Reshape Y back to (n_samples, n_roa, n_outputs)
+            Y_expanded = Y.reshape(n_samples, n_roa, n_outputs)
+            
+            # Convert to training format (list of dicts)
+            if not self._full_all_features:
+                self._refresh_full_features()
+            feature_index = {feat: i for i, feat in enumerate(self.state_features)}
+            for s_idx in range(n_samples):
+                X_dict = {}
+                for feat in self._full_all_features:
+                    if feat in feature_index:
+                        X_dict[feat] = X_expanded[s_idx, :, feature_index[feat]]
+                    elif feat in self.param_features:
+                        X_dict[feat] = np.zeros(n_roa)
+                    elif feat == "roa":
+                        X_dict[feat] = self.roa_eval
+                    else:
+                        X_dict[feat] = np.zeros(n_roa)
+                Y_dict = {out: Y_expanded[s_idx, :, o_idx] 
+                         for o_idx, out in enumerate(self.output_list)}
+                
+                self.X_train.append(X_dict)
+                self.Y_train.append(Y_dict)
+            
+            # Train surrogates on warm-start data
+            print(f"  Pre-training surrogates on {len(self.X_train)} samples...")
+            self.fit()
+            
+            print(f"  Warm-start complete. Surrogate scores: {self.score}")
+            print(f"  Note: Surrogates will continue to update as solver progresses.\n")
+            
+        except ImportError:
+            print("Warning: evaluation_log module not available for warm-start")
+        except Exception as e:
+            print(f"Warning: Warm-start failed: {e}")
+            # Clear any partial training data
+            self.X_train = []
+            self.Y_train = []
+            self.trained = False
 
     # ------------------------------------------------
     # Evaluation
     # ------------------------------------------------
-    def evaluate(self, params, state: Any, train: bool = False):
+    def evaluate(self, params, state: Any):
         """Predict surrogate outputs for current state.
         
         Parameters
@@ -499,8 +646,6 @@ class SurrogateManager:
             - Single input: arrays of shape (n_outputs, n_roa)
             - Batched input: arrays of shape (n_batch, n_outputs, n_roa)
         """
-        if not self.trained and train:
-            self.fit()
 
         # Detect if input is batched
         is_batched = False
@@ -516,35 +661,21 @@ class SurrogateManager:
 
         # Get features (handles batching internally)
         X_features = self.get_features(state, params)
-        
-        # Transform features using appropriate scaler
+
         if is_batched:
             # X_features is (n_batch, n_roa, n_features)
             n_batch, n_roa, n_feat = X_features.shape
-            if getattr(self, 'physics_scaled', False) and hasattr(self, 'state_features_scalers'):
-                X = X_features.copy()
-                for f_idx, feature in enumerate(self.all_features):
-                    if feature in self.state_features_scalers:
-                        scaler_fn = self.state_features_scalers[feature]
-                        X[:, :, f_idx] = scaler_fn(X_features[:, :, f_idx])
-            else:
-                X = self.x_scaler.transform(X_features.reshape(-1, n_feat)).reshape(n_batch, n_roa, n_feat)
+            # Stage 1: Apply input normalization
+            if self.x_scaler is None:
+                raise RuntimeError("Input scaler not initialized; call fit() first")
+            X = self.x_scaler.transform(X_features.reshape(-1, n_feat)).reshape(n_batch, n_roa, n_feat)
         else:
             # X_features is (n_roa, n_features)
-            if getattr(self, 'physics_scaled', False) and hasattr(self, 'state_features_scalers'):
-                X = X_features.copy()
-                for f_idx, feature in enumerate(self.all_features):
-                    if feature in self.state_features_scalers:
-                        scaler_fn = self.state_features_scalers[feature]
-                        X[:, f_idx] = scaler_fn(X_features[:, f_idx])
-            else:
-                X = self.x_scaler.transform(X_features)
+            # Stage 1: Apply input normalization
+            if self.x_scaler is None:
+                raise RuntimeError("Input scaler not initialized; call fit() first")
+            X = self.x_scaler.transform(X_features)
         
-        # Check for extrapolation and warn
-        # if self.is_extrapolating(X, margin=0.05):
-        #     min_score = self.get_min_score()
-        #     print(f"Warning: Surrogate extrapolating beyond training data (min R²={min_score:.3f}). Consider full model evaluation.")
-
         # Initialize storage based on batching
         if is_batched:
             transport = {key: np.zeros((n_batch, len(self.roa_eval))) for key in self.transport_vars}
@@ -618,21 +749,26 @@ class SurrogateManager:
         self.transport_std = transport_std
         self.targets = targets
         self.targets_std = targets_std
-        # covariance matrices are ~diagonal
 
         # Return in format matching input
         if is_batched:
             # Stack as (n_batch, n_outputs, n_roa)
-            values = np.stack([transport[k] for k in self.transport_vars+self.target_vars] + 
-                             [targets[k] for k in self.target_vars], axis=1)
-            stds = np.stack([transport_std[k] for k in self.transport_vars+self.target_vars] + 
-                           [targets_std[k] for k in self.target_vars], axis=1)
+            transport_vals = np.array([transport[k] for k in self.transport_vars])
+            transport_std_vals = np.array([transport_std[k] for k in self.transport_vars])
+            targets_vals = np.array([targets[k] for k in self.target_vars])
+            targets_std_vals = np.array([targets_std[k] for k in self.target_vars])
+            
+            values = np.concatenate([transport_vals, targets_vals], axis=0).transpose(1, 0, 2)
+            stds = np.concatenate([transport_std_vals, targets_std_vals], axis=0).transpose(1, 0, 2)
         else:
             # Stack as (n_outputs, n_roa)
-            values = np.array([transport[k] for k in self.transport_vars+self.target_vars] + 
-                             [targets[k] for k in self.target_vars])
-            stds = np.array([transport_std[k] for k in self.transport_vars+self.target_vars] + 
-                           [targets_std[k] for k in self.target_vars])
+            transport_vals = np.array([transport[k] for k in self.transport_vars])
+            transport_std_vals = np.array([transport_std[k] for k in self.transport_vars])
+            targets_vals = np.array([targets[k] for k in self.target_vars])
+            targets_std_vals = np.array([targets_std[k] for k in self.target_vars])
+            
+            values = np.concatenate([transport_vals, targets_vals], axis=0)
+            stds = np.concatenate([transport_std_vals, targets_std_vals], axis=0)
         
         return values, stds
 
@@ -660,27 +796,18 @@ class SurrogateManager:
             n_batch = params.shape[0]
         
         # Get and transform features using appropriate scaler
+        if not self.trained:
+            raise RuntimeError("Surrogate not trained. Call fit() first.")
+            
         X_features = self.get_features(state, params)
         
         if is_batched:
             n_batch, n_roa, n_feat = X_features.shape
-            if getattr(self, 'physics_scaled', False) and hasattr(self, 'state_features_scalers'):
-                X = X_features.copy()
-                for f_idx, feature in enumerate(self.all_features):
-                    if feature in self.state_features_scalers:
-                        scaler_fn = self.state_features_scalers[feature]
-                        X[:, :, f_idx] = scaler_fn(X_features[:, :, f_idx])
-            else:
-                X = self.x_scaler.transform(X_features.reshape(-1, n_feat)).reshape(n_batch, n_roa, n_feat)
+            # Apply input normalization
+            X = self.x_scaler.transform(X_features.reshape(-1, n_feat)).reshape(n_batch, n_roa, n_feat)
         else:
-            if getattr(self, 'physics_scaled', False) and hasattr(self, 'state_features_scalers'):
-                X = X_features.copy()
-                for f_idx, feature in enumerate(self.all_features):
-                    if feature in self.state_features_scalers:
-                        scaler_fn = self.state_features_scalers[feature]
-                        X[:, f_idx] = scaler_fn(X_features[:, f_idx])
-            else:
-                X = self.x_scaler.transform(X_features)
+            # Apply input normalization
+            X = self.x_scaler.transform(X_features)
         
         transport_grads = {}
         target_grads = {}
@@ -803,38 +930,81 @@ class SurrogateBase:
 
 # -------------------------------------------------------------------
 
-class GaussianProcessSurrogate(SurrogateBase):
-    """Gaussian process regression surrogate."""
+class GaussianProcess(SurrogateBase):
+    """Gaussian process regression with physics-informed priors and bounds.
+    
+    Supports lengthscale constraints following PORTALS approach to prevent
+    overfitting on sparse training data.
+    """
 
     def __init__(self, config: Optional[Dict[str, Any]] = None, features: Optional[List[str]] = None):
         super().__init__(config, features)
-        length_scale = config.get("length_scale", 1.0)
-        variance = config.get("variance", 1.0)
-        noise = config.get("noise", 1e-3)
-        normalize_y = bool(config.get("normalize_y", False))
-        n_restarts = int(config.get("n_restarts", 0))
-        optimizer_maxiter = int(config.get("optimizer_maxiter", 200))
-        ard = bool(config.get("ard", False))
-        kernel = C(variance) * RBF(length_scale = length_scale if not ard else length_scale*np.ones_like(self.features,dtype=float))
-        self._backend: str = "sklearn" if _SKLEARN_AVAILABLE else "simple"
-
-        if _SKLEARN_AVAILABLE:
-            # Allow tuning the L-BFGS-B optimizer to avoid premature convergence warnings
-            def _lbfgs(obj_func, initial_theta, bounds):
-                x_opt, f_opt, _info = fmin_l_bfgs_b(
-                    obj_func, initial_theta, bounds=bounds, maxiter=optimizer_maxiter
-                )
-                return x_opt, f_opt  # sklearn expects (theta_opt, func_min)
-
-            self.model = GaussianProcessRegressor(
-                kernel=kernel,
-                alpha=float(noise),
-                normalize_y=normalize_y,
-                n_restarts_optimizer=n_restarts,
-                optimizer=_lbfgs,
+        
+        if not _SKLEARN_AVAILABLE:
+            # Fallback to SimpleGPSurrogate without sklearn
+            config = config or {}
+            length_scale = float(config.get("length_scale", 1.0))
+            variance = float(config.get("variance", 1.0))
+            noise = float(config.get("noise", 1e-3))
+            normalize_y = bool(config.get("normalize_y", True))
+            
+            self.model = SimpleGPSurrogate(
+                length_scale=length_scale, 
+                variance=variance, 
+                noise=noise, 
+                normalize_y=normalize_y
             )
+            self._backend = "simple"
+            return
+        
+        # Sklearn-based GP with constraints
+        config = config or {}
+        
+        # Hyperparameter configuration
+        length_scale = float(config.get("length_scale", 1.0))
+        variance = float(config.get("variance", 1.0))
+        noise = float(config.get("noise", 1e-3))
+        normalize_y = bool(config.get("normalize_y", True))
+        n_restarts = int(config.get("n_restarts", 5))
+        optimizer_maxiter = int(config.get("optimizer_maxiter", 250))
+        ard = bool(config.get("ard", False))
+        
+        # Lengthscale constraint (minimum value to prevent overfitting)
+        # PORTALS uses 0.05 for normalized [0,1] inputs
+        self.min_lengthscale = float(config.get("min_lengthscale", 0.05))
+        
+        # Build kernel with optional lengthscale bounds
+        if ard and len(self.features) > 0:
+            length_scales = length_scale * np.ones(len(self.features))
         else:
-            self.model = SimpleGPSurrogate(length_scale=length_scale, variance=variance, noise=noise, normalize_y=normalize_y)
+            length_scales = length_scale
+        
+        rbf_kernel = RBF(length_scale=length_scales)
+        kernel = C(variance) * rbf_kernel
+        
+        self._backend = "sklearn"
+
+        def _lbfgs_constrained(obj_func, initial_theta, bounds):
+            """L-BFGS-B with lengthscale constraint enforcement."""
+            # Modify bounds to enforce minimum lengthscale
+            constrained_bounds = []
+            for lower, upper in bounds:
+                # Find lengthscale bounds and enforce minimum
+                new_lower = max(lower, np.log(self.min_lengthscale))
+                constrained_bounds.append((new_lower, upper))
+            
+            x_opt, f_opt, _info = fmin_l_bfgs_b(
+                obj_func, initial_theta, bounds=constrained_bounds, maxiter=optimizer_maxiter
+            )
+            return x_opt, f_opt
+        
+        self.model = GaussianProcessRegressor(
+            kernel=kernel,
+            alpha=float(noise),
+            normalize_y=normalize_y,
+            n_restarts_optimizer=n_restarts,
+            optimizer=_lbfgs_constrained,
+        )
 
     def fit(self, X: np.ndarray, Y: np.ndarray):
         self.model.fit(np.atleast_2d(X), np.atleast_2d(Y))
@@ -963,66 +1133,19 @@ class SimpleGPSurrogate:
         return mu, std
 
 
-class NeuralNetSurrogate(SurrogateBase):
-    """Neural network surrogate model (placeholder)."""
-
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        super().__init__(config)
-        # Placeholder for neural network initialization
-        self.model = None
-
-    def fit(self, X: np.ndarray, Y: np.ndarray, solver_data: Optional[Any] = None) -> None:
-        # Placeholder for neural network training
-        pass
-
-    def predict(self, X: np.ndarray, return_std: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        # Placeholder for neural network prediction
-        Y_pred = np.zeros((X.shape[0], 1))  # Dummy output
-        return Y_pred, None
-
-    def get_hyperparameters(self) -> Dict[str, Any]:
-        return {"model_type": "neural_network"}
-
-
-class PolynomialSurrogate(SurrogateBase):
-    """Polynomial surrogate model."""
-
-    def __init__(self, config: Optional[Dict[str, Any]] = None):
-        super().__init__(config)
-        # Placeholder for polynomial model initialization
-        self.model = None
-
-    def fit(self, X: np.ndarray, Y: np.ndarray, solver_data: Optional[Any] = None) -> None:
-        # Placeholder for polynomial model training
-        pass
-
-    def predict(self, X: np.ndarray, return_std: bool = False) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-        # Placeholder for polynomial model prediction
-        Y_pred = np.zeros((X.shape[0], 1))  # Dummy output
-        return Y_pred, None
-
-    def get_hyperparameters(self) -> Dict[str, Any]:
-        return {"model_type": "polynomial"}
-
 # -------------------------
 # Factory and registry
 # -------------------------
 
-
 SURROGATE_MODELS = {
-    "gaussian_process": GaussianProcessSurrogate,
-    "gp": GaussianProcessSurrogate,
-    "neural_network": NeuralNetSurrogate,
-    "polynomial": PolynomialSurrogate,
+    "gaussian_process": GaussianProcess,
+    "gp": GaussianProcess,
 }
 
 
 def create_surrogate_model(config: Dict[str, Any]) -> SurrogateBase:
+    """Create a surrogate model from config dictionary."""
     kind = (config.get("type", "gaussian_process") or "gaussian_process").lower()
     if kind in ("gaussian_process", "gaussian", "gp"):
-        return GaussianProcessSurrogate(config.get("kwargs", {}))
-    if kind in ("neural_network", "nn"):
-        return NeuralNetSurrogate(config.get("kwargs", {}))
-    if kind in ("polynomial",):
-        return PolynomialSurrogate(config.get("kwargs", {}))
-    return GaussianProcessSurrogate(config.get("kwargs", {}))
+        return GaussianProcess(config.get("kwargs", {}))
+    raise ValueError(f"Unknown surrogate type '{kind}'. Supported: {list(SURROGATE_MODELS.keys())}")

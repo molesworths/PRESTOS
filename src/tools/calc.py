@@ -49,7 +49,13 @@ def produce_log_gradient(r: np.ndarray, p: np.ndarray) -> np.ndarray:
     log_p = np.log(p_safe)
     
     # Use numpy's gradient function for robust derivative calculation
-    grad_log_p = np.gradient(log_p, r, edge_order=2)
+    # switch to fine grid
+    x_fine = np.linspace(r[0], r[-1], num=10*len(r))
+    log_p_fine = np.interp(x_fine, r, log_p)
+    r_fine = x_fine
+    grad_log_p = np.gradient(log_p_fine, r_fine, edge_order=2)
+    # switch back to coarse grid
+    grad_log_p = np.interp(r, r_fine, grad_log_p)
     
     return grad_log_p
 

@@ -20,9 +20,14 @@ PRESTOS is designed for efficient transport analysis and profile optimization in
 
 - **Modular architecture**: Swap boundary conditions, transport models, neutrals, parameterizations, and solvers via configuration
 - **Surrogate acceleration**: Gaussian process surrogates reduce expensive transport evaluations during optimization
-- **Flexible parameterization**: Spline-based profile representation with customizable knot placement and bounds
-- **Multiple solvers**: Relaxation, Bayesian optimization, and time-stepping methods
-- **Built-in analysis**: Automated plotting and reporting tools for convergence, profiles, and surrogate sensitivity
+- **Flexible parameterization**: Spline, Gaussian, and curvature-based profile models with customizable knot placement and bounds
+- **Multiple solvers**: Relaxation, Bayesian optimization, and pseudo-time integration (IvpSolver) methods
+- **Constraint support**: Flexible inequality and equality constraints with automatic enforcement
+- **Uncertainty quantification**: Full parameter and residual covariance tracking through the solver pipeline
+- **Platform extensibility**: Execute modules (transport, targets) on local, remote, or HPC platforms
+- **Evaluation caching**: Shared transport evaluation database for surrogate warm-start and cross-user knowledge sharing
+- **Workflow checkpointing**: Save/restore solver state for seamless restarts with modified configurations
+- **Built-in analysis**: Automated plotting, surrogate sensitivity, and convergence tracking
 
 PRESTOS aims to provide rapid iteration capabilities compared to heavier frameworks like MITIM-fusion/PORTALS, with a focus on extensibility and ease of experimentation.
 
@@ -60,7 +65,7 @@ conda create -n prestos python=3.11
 conda activate prestos
 
 # Install dependencies
-pip install numpy scipy pandas matplotlib seaborn scikit-learn scikit-optimize jax jaxlib pyqt6
+pip install numpy scipy pandas matplotlib seaborn scikit-learn scikit-optimize jax jaxlib pyqt6 paramiko
 ```
 
 ### Verify installation
@@ -227,9 +232,10 @@ parameters:
     # Common options:
     include_zero_grad_on_axis: true  # Force zero gradient at axis
     sigma: 0.1  # Relative uncertainty on parameters (1-sigma)
+    # lcfs_aLti_in_params: false  # Optional: include LCFS a/L_Ti as free parameter
 ```
 
-This converts kinetic profiles into parameter vectors and reconstructs profiles during optimization.
+This converts kinetic profiles into parameter vectors and reconstructs profiles during optimization. Each model returns `(params, params_std)` tuples for full uncertainty propagation.
 
 **Available parameterization models:**
 - `Spline`: Spline-based a/Ly interpolation at user-defined knots
@@ -242,12 +248,14 @@ This converts kinetic profiles into parameter vectors and reconstructs profiles 
 - Width `w` automatically determined from boundary conditions
 - Closed-form profile reconstruction via error function integrals
 - Parameters stored in log-space (`log_A`) for proper uncertainty handling
+- Solves bifurcation issues with `c` parameter near separatrix via bounded optimization
 
 **GaussianDipole model details:**
 - Models curvature: `k(x) = d²y/dx²` using composite Gaussian structures
 - Morphology parameter `S` transitions between single-lobe (0) and dipole (1)
 - Fixed separation `δ = 2.5w` ensures quasi-sinusoidal profiles
 - Double integration with exact boundary condition enforcement
+- Parameters: `log_A` (amplitude), `x_c` (center), `w` (width), `S` (morphology)
 
 #### Transport Model
 
@@ -297,21 +305,24 @@ solver:
     domain: [0.88, 1.0]  # Radial domain for solver
     tol: 1e-4  # Convergence tolerance on objective
     max_iter: 1000  # Maximum iterations
-    model_iter_to_stall: 10  # Iterations without improvement before stall
+    model_iter_to_stall: 10  # Iterations without improvement before stall (increased from 3)
     objective: mse  # 'mse' | 'mae' | 'sse' | 'rmse'
     normalize_residual: true  # Normalize residual by |target|
     scale_objective: true  # Divide objective by number of channels
     step_size: 0.1  # Relaxation step size (RelaxSolver)
     adaptive_step: true  # Adaptive step sizing (RelaxSolver)
-    use_jacobian: true  # Use Jacobian for gradient-based update
-    bounds: [[0,10], [0.0,100.0], [0.9,1.2]]  # Parameter bounds
+    use_jacobian: true  # Use Jacobian for gradient-based update (with Jacobian caching)
+    bounds: [[0,10], [0.0,100.0], [0.9,1.2]]  # Parameter bounds (auto-computed from curve_fit if omitted)
+    use_surrogate: false  # Use surrogate for evaluation speedup
+    surrogate_warmup: 5  # Iterations before first surrogate training
+    surrogate_retrain_every: 5  # Retrain surrogate every N iterations (reduced from 50 max_train_samples)
     
-    # Optional constraints (example):
+    # Optional constraints (flexible expression parsing):
     # constraints:
     #   - location: 0.88  # Radial location (r/a)
-    #     expression: "Ti/Te = Pi/Pe"  # Constraint expression
+    #     expression: "Ti/Te = Pi/Pe"  # Constraint expression (with aliases)
     #     weight: 1.0  # Penalty weight
-    #     norm: log  # Optional: 'log' normalization
+    #     norm: log  # Optional: 'log' normalization for ratios
     #     enforcement: ramp  # 'exact' | 'ramp' (gradual activation)
     #   - location: 0.95
     #     expression: "ne >= 3.0"  # Inequality constraint
@@ -319,21 +330,36 @@ solver:
     #     enforcement: ramp
 ```
 
+**Available solvers:**
+- `RelaxSolver`: Simple relaxation with optional Jacobian-assisted gradient descent
+  - Good for quick iterations and debugging
+  - Supports adaptive step sizing for robustness
+  - New: Jacobian caching and adaptive recomputation for efficiency
+- `BayesianOptSolver`: Bayesian optimization with Monte Carlo acquisition functions
+  - For expensive evaluations or when surrogate model is primary method
+  - Supports expected improvement (EI) and upper confidence bound (UCB)
+- `IvpSolver`: **NEW** - Pseudo-time integration using scipy ODE solvers
+  - Integrates parameter dynamics `dp/dt = -∇Z(p)` using RK45 or other methods
+  - Suitable for smooth convergence paths and systematic parameter evolution
+  - Requires use_jacobian=true for efficiency
+
+**Constraint support (NEW):**
+- Expression parsing with built-in aliases (Ti/Te, Pi/Pe, ne, te, ti, etc.)
+- Equality (`=`) and inequality (`>=`, `<=`) constraints
+- Optional logarithmic normalization for ratio constraints
+- Ramp enforcement for gradual constraint activation during iterations
+- Hinge loss penalty applied to residual vector
+
 **Bounds formats:**
 - Uniform: `[lower, upper]` applied to all parameters
 - Per-profile dict: `{ne: [0,100], te: [0,100], ti: [0,100]}`
 - Per-parameter list: `[[lower, upper], [lower, upper], ...]` (length = n_params_per_profile)
+- Auto-computed from `curve_fit` covariance if not specified
 
-**Available solvers:**
-- `RelaxSolver`: Simple relaxation with optional Jacobian-assisted gradient
-- `BayesianOptSolver`: Bayesian optimization with Monte Carlo acquisition functions
-- `IvpSolver`: Pseudo-time integration using scipy.integrate ODE solvers
-
-**Constraint support:**
-- Expression parsing with aliases (Ti/Te, Pi/Pe, ne, etc.)
-- Equality (`=`) and inequality (`>=`, `<=`) constraints
-- Optional logarithmic normalization for ratio constraints
-- Ramp enforcement for gradual constraint activation during iterations
+**Surrogate improvements:**
+- Reduced default `max_train_samples` from 50 to 10 to prevent overfitting
+- Fixed parameter feature extraction for nested dict keys with underscores
+- Use `log_*` parameters for proper uncertainty propagation in log-space
 
 #### Surrogate
 
@@ -381,6 +407,117 @@ After a successful run:
   - Columns: `iter`, `Z` (objective), `X` (parameters), `R` (residuals), `Y` (model predictions), `Y_target`, `used_surrogate`
 - `solver_checkpoint.pkl`: Checkpoint for restart (optional, currently disabled)
 - Console output: Convergence status and final objective value
+
+---
+
+## Advanced Features
+
+### Workflow Restart & Checkpointing
+
+Restart solver runs from a previous checkpoint, applying changes to the configuration without re-running earlier iterations:
+
+```bash
+python <PRESTOS_ROOT>/src/workflow.py run_config_v2.yaml --restart <previous_dir>
+```
+
+The `--restart` option:
+- Loads the checkpoint from `<previous_dir>/solver_checkpoint.pkl`
+- Restores solver state, transport model, and parameter history
+- Applies new configuration from `run_config_v2.yaml`
+- Continues iterating from the last state
+
+Useful for:
+- Parameter scans (modify `scale_*` factors in targets)
+- Different solver settings (change `max_iter`, `tol`)
+- Transport model adjustments (modify transport settings)
+
+### Platform Infrastructure
+
+Execute PRESTOS modules on local, remote, or HPC platforms without changing code:
+
+```yaml
+transport:
+  class: transport.FingerprintsModel
+  args:
+    modes: all
+  platform:  # Optional: run on specific platform
+    machine: local  # 'local' | hostname
+    scratch: ./work
+    n_cpu: 16
+    scheduler: slurm  # 'none' | 'slurm'
+    slurm_partition: gpu  # for SLURM clusters
+```
+
+**Platform types:**
+- **Local**: Direct execution on your machine
+- **Remote SSH**: Automatic file transfer and execution via SSH
+- **SLURM Cluster**: Automatic job submission and monitoring
+
+**Example: SLURM cluster execution**
+
+```yaml
+transport:
+  class: transport.FingerprintsModel
+  platform:
+    machine: hpc.example.com
+    username: user
+    scratch: /work/user/prestos
+    modules: "module load python/3.9 && module load gcc/11.2.0"
+    ssh_identity: ~/.ssh/cluster_key
+    scheduler: slurm
+    slurm_partition: gpu
+```
+
+See [PLATFORM_README.md](docs/PLATFORM_README.md) and [PLATFORM_SUBMISSION_GUIDE.md](docs/PLATFORM_SUBMISSION_GUIDE.md) for comprehensive documentation.
+
+### Transport Evaluation Caching
+
+Cache transport model evaluations in a shared database for:
+- Surrogate warm-start (pre-training from previous runs)
+- Cross-user knowledge sharing
+- Avoiding duplicate expensive evaluations
+
+**Enable in transport configuration:**
+
+```yaml
+transport:
+  class: transport.FingerprintsModel
+  args:
+    modes: all
+    log_evaluations: true  # Enable evaluation logging
+    evaluation_log:
+      enabled: true
+      path: /shared/prestos/transport_evaluations.db  # Shared database
+      # Alternatives:
+      # path: ./logs/transport_eval.db  # Local database
+      # (uses $PRESTOS_EVAL_LOG env var or default if omitted)
+```
+
+**Use cached evaluations for surrogate training:**
+
+```python
+from src.surrogates import SurrogateManager
+from src.evaluation_log import TransportEvaluationLog
+
+# Query previous evaluations
+log = TransportEvaluationLog("/shared/prestos/transport_evaluations.db")
+X, Y, roa = log.get_for_surrogate(
+    model_class='transport.Fingerprints',
+    model_settings={'modes': 'all'},
+    target_roa=np.array([0.88, 0.91, 0.94, 0.97]),
+    feature_names=['Ti_Te', 'aLTi', 'aLTe', 'aLne'],
+    output_names=['Pe_turb', 'Pi_turb']
+)
+
+# Build surrogate from warm-start data
+surrogate = SurrogateManager('gp')
+surrogate.train(X, Y)  # Pre-trained on historical data
+```
+
+Database schema:
+- `evaluations` table stores: timestamp, model class, settings, roa location, plasma features, model outputs
+- Automatic deduplication via content hashing (SHA-256)
+- Queryable by model class, settings, roa range, timestamp
 
 ---
 

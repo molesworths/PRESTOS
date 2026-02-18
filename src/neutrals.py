@@ -13,14 +13,6 @@ from scipy.integrate import cumulative_trapezoid, odeint
 from scipy.sparse import diags
 from scipy.sparse.linalg import spsolve
 from scipy.constants import k, m_p, e, pi
-try:
-    import aurora
-    AURORA_AVAILABLE = True
-except ImportError:
-    import warnings
-    warnings.warn("Aurora is not available. Atomic rates will be determined via polynomial interpolation.")
-    import tools.atomics as aurora
-    AURORA_AVAILABLE = False
 from tools import plasma, calc, io
 
 
@@ -28,7 +20,9 @@ class NeutralModel:
     """Base class for neutral models."""
     
     def __init__(self, options: dict):
-        self.n0_edge = np.asarray(options.get("n0_edge", [1e-6]),dtype='float')  # [1e19 m^-3]
+        n0_edge = options.get("n0_edge", None)  # [1e19 m^-3]
+        if isinstance(n0_edge, (list, np.ndarray)):
+            self.n0_edge = np.asarray(n0_edge, dtype=float)  # Default to 1e19 m^-3 if not provided
 
     def solve(self, state, **kwargs) -> None:
         """Solve for neutral profiles."""
@@ -36,12 +30,6 @@ class NeutralModel:
         N_species = len(state.species)
         if self.n0_edge.size != N_species:
             self.n0_edge = np.full(N_species, self.n0_edge[0])
-
-        # Get atomic rates
-        rates = get_atomic_rates(state)
-        state.nu_ion = rates['ionization']  # [1/s]
-        state.nu_rec = rates['recombination']  # [1/s]
-        state.nu_cx = rates['charge_exchange']  # [1/s]
         
         # unit conversions
         self.ne_SI = state.ne * 1e19  # m^-3
@@ -69,7 +57,7 @@ class NeutralModel:
             nu_ion = state.nu_ion[:,sidx]  # [1/s]
             nu_cx = state.nu_cx[:,sidx]  # [1/s]
             lambda_mfp = state.vth[:,sidx] / (nu_ion + nu_cx + 1e-30)  # m
-            L_scale = calc.scale_length(ni_SI, state.r)  # m
+            L_scale = state.a / state.aLne  # m
             Kn[:,sidx] = lambda_mfp / (L_scale + 1e-30)
         return Kn
     
@@ -86,7 +74,7 @@ class NeutralModel:
         return Gamma0
 
 
-class KineticNeutralModel(NeutralModel):
+class Kinetic(NeutralModel):
     """
     Ballistic neutral transport model.
     
@@ -321,7 +309,7 @@ class KineticNeutralModel(NeutralModel):
         return
     
 
-class DiffusiveNeutralModel(NeutralModel):
+class Diffusive(NeutralModel):
     """
     Diffusive neutral transport model.
     
@@ -560,57 +548,9 @@ class DiffusiveNeutralModel(NeutralModel):
         overshoot_limit = 0.2 * y_range
         return np.clip(y_new, y_min - overshoot_limit, y_max + overshoot_limit)
 
-def get_atomic_rates(state) -> dict:
-    """
-    Get atomic physics rates from Aurora.
 
-    Parameters
-    ----------
-    state : object
-        The simulation state containing species and their properties.
-
-    Returns
-    -------
-    rates : dict
-        {'ionization': nu_ion, 'recombination': nu_rec, 'charge_exchange': nu_cx}
-        All in [1/s] including ne factor
-    """
-
-    # Conversions
-    te_eV = state.te * 1e3
-    ti_eV = state.ti * 1e3
-    ne_cm3 = state.ne * 1e13  # [cm^-3]
-
-    Rion = np.ones_like(state.ti_full)*1e-6
-    Rrecom = np.ones_like(state.ti_full)*1e-6
-    Rcx = np.ones_like(state.ti_full)*1e-6
-
-    try:
-
-        for sidx, sp in enumerate(state.species):
-
-
-                atom_data = aurora.get_atom_data(sp['name'], ['acd', 'scd', 'ccd'])
-        
-                # Get reaction rates [1/s]
-                _, R_ion, R_recom, R_cx = aurora.atomic.get_cs_balance_terms(
-                atom_data, ne_cm3=ne_cm3, Te_eV=te_eV, Ti_eV=ti_eV, include_cx=True
-                )[:4]
-
-                Rion[:,sidx] = R_ion[:,0]
-                Rrecom[:,sidx] = R_recom[:,0]
-                Rcx[:,sidx] = R_cx[:,0]
-
-    except:
-        pass
-
-    return {
-        'ionization': Rion,  # [1/s]
-        'recombination': Rrecom,  # [1/s]
-        'charge_exchange': Rcx,  # [1/s]
-    }
 
 NEUTRAL_MODELS = {
-    'kinetic': KineticNeutralModel,
-    'diffusive': DiffusiveNeutralModel,
+    'kinetic': Kinetic,
+    'diffusive': Diffusive,
 }

@@ -18,7 +18,7 @@ Surrogate sensitivity (full) builds a simple dataset from iterations (flattened 
 If original SurrogateManager training artifacts are not saved, we approximate using history.
 """
 from __future__ import annotations
-import os, json, yaml, ast, argparse, importlib, pickle
+import os, json, yaml, ast, argparse, importlib, pickle, re
 from dataclasses import dataclass
 from typing import Dict, Any, List, Tuple
 import numpy as np
@@ -197,13 +197,11 @@ def _update_from_params(modules, X: np.ndarray):
     X = _unflatten_params(modules['solver'], X, modules['solver'].schema) if isinstance(X, (np.ndarray, list)) else X
     if not hasattr(modules['parameters'],'spline'):
         pass
-    modules['state'].update(X, modules['parameters'])
-    modules['neutrals'].solve(modules['state'])
+    modules['state'].update(X, modules['parameters'],neutrals=modules['neutrals'])
     _ = modules['targets'].evaluate(modules['state'])
     modules['boundary'].get_boundary_conditions(modules['state'], modules['targets'])
     modules['parameters'].update(X, modules['boundary'].bc_dict, modules['solver'].roa_eval)
     modules['state'].update(X, modules['parameters'])
-    modules['neutrals'].solve(modules['state'])
     _ = modules['targets'].evaluate(modules['state'])
     
 def _flatten_params(self, X_dict: Dict[str, Dict[str, float]]) -> Tuple[np.ndarray, List[Tuple[str, str]]]:
@@ -291,27 +289,80 @@ def plot_objective(hist_df: pd.DataFrame, cfg: Dict[str, Any], outdir: Path):
     ax.set_title('Objective vs Iteration')
     ax.grid(True, alpha=0.3)
     ax.legend()
+    ax.set_yscale('log')
     _save(fig, outdir/'objective')
 
 
 def plot_residual_channels(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], outdir: Path):
-    # Decide number of channels to visualize
-    n_channels = len(modules['solver'].R)
-    x = modules['solver'].roa_eval
-    n_x = len(x)
-    target_vars = modules['solver'].target_vars
+    pattern = re.compile(r"^R_([^_]+(?:_[^_]+)*)_(\d+)$")
+    block_cols = {}
 
-    fig, ax = plt.subplots(1,len(target_vars),figsize=tuple(cfg['style'].get('figsize_medium', (5,7))))
-    if len(target_vars) == 1:
-        ax = [ax]
+    for col in hist_df.columns:
+        if col.startswith('R_std'):
+            continue
+        m = pattern.match(col)
+        if m:
+            block = m.group(1)
+            idx = int(m.group(2))
+            block_cols.setdefault(block, []).append((idx, col))
+
+    # Legacy fallback: unblocked columns R_0, R_1, ... treated as flux block
+    if not block_cols:
+        legacy = [(int(col.split('_')[1]), col) for col in hist_df.columns if re.match(r"^R_\d+$", col)]
+        if legacy:
+            block_cols['flux'] = legacy
+
+    if not block_cols:
+        print('No residual columns found to plot.')
+        return
+
+    # Sort columns within each block
+    block_cols = {b: sorted(cols, key=lambda t: t[0]) for b, cols in block_cols.items()}
+
+    n_blocks = len(block_cols)
+    base_size = cfg['style'].get('figsize_medium', (5, 7))
+    fig_width = base_size[0] * max(1, n_blocks)
+    fig_height = base_size[1]
+    fig, axes = plt.subplots(1, n_blocks, figsize=(fig_width, fig_height))
+    axes = np.atleast_1d(axes)
     _subplots_adjust(fig, cfg['style'])
 
-    for ix,key in enumerate(target_vars):
-        for j in range(len(x)):
-            ax[ix].plot(hist_df['iter'], hist_df[f"R_{j+ix*n_x}"], marker='o', ms=3, label=f'{key}, r/a={round(x[j],2)}')
-        ax[ix].set_xlabel('Iteration')
-        ax[ix].set_title(f'{key} Residuals')
-        ax[ix].legend(fontsize=6)
+    target_vars = modules['solver'].target_vars
+    roa_eval = np.asarray(modules['solver'].roa_eval, float)
+
+    for ax, (block, cols) in zip(axes, sorted(block_cols.items())):
+        n_cols = len(cols)
+        labels_used = []
+
+        if block == 'flux' and target_vars:
+            n_var = len(target_vars)
+            pts_per_var = n_cols // n_var if n_var else n_cols
+            radii = roa_eval
+            if pts_per_var == radii.size - 1:
+                # Drop LCFS point when residual_on_lcfs=False
+                drop_idx = int(np.argmin(np.abs(radii - 1.0))) if radii.size else 0
+                radii = np.delete(radii, drop_idx)
+            elif pts_per_var != radii.size:
+                radii = np.arange(pts_per_var)
+
+            for k, col in cols:
+                var_ix = k // max(1, pts_per_var)
+                x_ix = k % max(1, pts_per_var)
+                var_label = target_vars[var_ix] if var_ix < len(target_vars) else f'var{var_ix}'
+                r_label = radii[x_ix] if x_ix < len(radii) else x_ix
+                lbl = f"{var_label}, r/a={r_label:.2f}" if isinstance(r_label, (float, np.floating)) else f"{var_label}, idx={r_label}"
+                ax.plot(hist_df['iter'], hist_df[col], marker='o', ms=3, label=lbl)
+                labels_used.append(lbl)
+        else:
+            for k, col in cols:
+                lbl = f"{block}[{k}]"
+                ax.plot(hist_df['iter'], hist_df[col], marker='o', ms=3, label=lbl)
+                labels_used.append(lbl)
+
+        ax.set_xlabel('Iteration')
+        ax.set_title(f"{block.replace('_',' ').title()} Residuals")
+        if labels_used:
+            ax.legend(fontsize=6)
 
     _save(fig, outdir/'residual_channels')
 
@@ -372,11 +423,9 @@ def plot_parameter_history(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], 
 
 def plot_profiles(modules, hist_df: pd.DataFrame, cfg: Dict[str, Any], outdir: Path):
 
-    # Extract initial and final profiles from parameters module
-    Xi = hist_df[[i for i in hist_df.columns if i[:2]=='X_' and 'std' not in i]].iloc[0].values
+    # Extract final profiles from parameters module
     Xf = hist_df[[i for i in hist_df.columns if i[:2]=='X_' and 'std' not in i]].iloc[-1].values
     Xf_std = hist_df[[i for i in hist_df.columns if i[:2]=='X_' and 'std' in i]].iloc[-1].values
-    X_ = [Xi,Xf]
 
     pred_prof = modules['solver'].predicted_profiles
     param_names = modules['parameters'].param_names
@@ -386,63 +435,114 @@ def plot_profiles(modules, hist_df: pd.DataFrame, cfg: Dict[str, Any], outdir: P
     plot_x = np.union1d(x, x_eval)
     eval_ix = np.searchsorted(plot_x, x_eval)
 
+    # Get initial profiles dict (stored at initialization)
+    initial_profiles = getattr(modules['state'], 'initial_profiles', None)
+    if initial_profiles is None:
+        print("Warning: state.initial_profiles not found; cannot plot initial profiles.")
+        return
+
     # Plot initial vs final for each predicted profile
     fig, ax = plt.subplots(1,len(pred_prof),figsize=tuple(cfg['style'].get('figsize_wide', (10,5))))
     if len(pred_prof) == 1:
         ax = [ax]
     _subplots_adjust(fig, cfg['style'])
 
-    for ix, X in enumerate(X_):
-        _update_from_params(modules, X)
-        if ix == 0:
-            label = 'initial'
-            style = 'o--'
-            X_std = None
-        else:
-            label = 'final'
-            style = 's-'
-            X_std = Xf_std
-            Xm = X-X_std if X_std is not None else X
-            Xp = X+X_std if X_std is not None else X
-            if 'c' in param_names:
-                # ensure center of Gaussian parameters remain on original side of 1
-                # due to bifurcation
-                c_pos = param_names.index('c')  # 0-indexed position of 'c' in param_names
-                n_params_per_prof = len(param_names)
-                for prof_ix, prof in enumerate(pred_prof):
-                    base_ix = prof_ix * n_params_per_prof + c_pos  # index of c parameter in flattened array
-                    if X[base_ix] < 1.0:
-                        Xm[base_ix] = min(Xm[base_ix], 0.9999)
-                        Xp[base_ix] = min(Xp[base_ix], 0.9999)
-                    if X[base_ix] > 1.0:
-                        Xm[base_ix] = max(Xm[base_ix], 1.0001)
-                        Xp[base_ix] = max(Xp[base_ix], 1.0001)
+    # Initial profiles from stored state
+    for prof, ax_i in zip(pred_prof, ax):
+        profile_vals_init = initial_profiles.get(prof, None)
+        if profile_vals_init is not None:
+            x_init = modules['state'].roa  # Use the original roa from the state
+            plot_vals_init = np.interp(plot_x, x_init, profile_vals_init)
+            ax_i.plot(plot_x, plot_vals_init, 'o--', markevery=eval_ix, label='initial')
 
-        for prof, ax_i in zip(pred_prof, ax):
-            profile_vals = getattr(modules['state'], prof)
-            plot_vals = np.interp(plot_x, x, profile_vals)
-            ax_i.plot(plot_x, plot_vals, style, markevery=eval_ix, label=label)
-            if X_std is not None:
-                _update_from_params(modules, Xm)
-                profile_vals_lb = getattr(modules['state'], prof)
-                _update_from_params(modules, Xp)
-                profile_vals_ub = getattr(modules['state'], prof)
-                ax_i.fill_between(x, profile_vals_lb, profile_vals_ub, color='C1', alpha=0.2, label=f'1 std')
-                _update_from_params(modules,X) # restore state
-            ax_i.set_xlabel('roa')
-            ax_i.set_title(f'{prof}')
-            ax_i.legend(fontsize=8)
-            ax_i.set_xlim(domain[0],domain[1])
+    # Final profiles
+    _update_from_params(modules, Xf)
+    Xm = Xf - Xf_std
+    Xp = Xf + Xf_std
+    if 'x_c' in param_names:
+        # ensure center of Gaussian parameters remain on original side of 1
+        # due to bifurcation
+        c_pos = param_names.index('x_c')  # 0-indexed position of 'x_c' in param_names
+        n_params_per_prof = len(param_names)
+        for prof_ix, prof in enumerate(pred_prof):
+            base_ix = prof_ix * n_params_per_prof + c_pos  # index of c parameter in flattened array
+            if Xf[base_ix] < 1.0:
+                Xm[base_ix] = min(Xm[base_ix], 0.9999)
+                Xp[base_ix] = min(Xp[base_ix], 0.9999)
+            if Xf[base_ix] > 1.0:
+                Xm[base_ix] = max(Xm[base_ix], 1.0001)
+                Xp[base_ix] = max(Xp[base_ix], 1.0001)
+
+    for prof, ax_i in zip(pred_prof, ax):
+        profile_vals = getattr(modules['state'], prof)
+        plot_vals = np.interp(plot_x, x, profile_vals)
+        ax_i.plot(plot_x, plot_vals, 's-', markevery=eval_ix, label='final')
+        
+        # Uncertainty band
+        _update_from_params(modules, Xm)
+        profile_vals_lb = getattr(modules['state'], prof)
+        _update_from_params(modules, Xp)
+        profile_vals_ub = getattr(modules['state'], prof)
+        ax_i.fill_between(x, profile_vals_lb, profile_vals_ub, color='C1', alpha=0.2, label=f'1 std')
+        _update_from_params(modules, Xf)  # restore state
+        
+        ax_i.set_xlabel('roa')
+        ax_i.set_title(f'{prof}')
+        ax_i.legend(fontsize=8)
+        ax_i.set_xlim(domain[0],domain[1])
 
     fig.suptitle('Profile Parameters: Initial vs Final')
     fig.tight_layout()
     _save(fig, outdir/f'profiles')
 
+def plot_scale_lengths(modules, hist_df: pd.DataFrame, cfg: Dict[str, Any], outdir: Path):
+
+    domain = modules['solver'].domain
+    x = modules['state'].roa
+    x_eval = modules['solver'].roa_eval
+    ix_eval = np.searchsorted(x, x_eval)
+    Xf = hist_df[[i for i in hist_df.columns if i[:2]=='X_' and 'std' not in i]].iloc[-1].values
+
+    # Get initial profiles dict (stored at initialization)
+    initial_profiles = getattr(modules['state'], 'initial_profiles', None)
+    if initial_profiles is None:
+        print("Warning: state.initial_profiles not found; cannot plot initial scale lengths.")
+        return
+
+    # Plot initial vs final scale lengths for each predicted profile
+    fig, ax = plt.subplots(1,len(modules['solver'].predicted_profiles),figsize=tuple(cfg['style'].get('figsize_wide', (10,5))))
+    if len(modules['solver'].predicted_profiles) == 1:
+        ax = [ax]
+    _subplots_adjust(fig, cfg['style'])
+
+    # Initial scale lengths from stored state
+    for prof, ax_i in zip(modules['solver'].predicted_profiles, ax):
+        aLy_init = initial_profiles.get(f'aL{prof}', None)
+        if aLy_init is not None:
+            x_init = modules['state'].roa  # Use current state's roa for interpolation
+            aLy_init_interp = np.interp(x, x_init, aLy_init)
+            ax_i.plot(x, aLy_init_interp, 'o--', markevery=ix_eval, label='initial')
+
+    # Final scale lengths
+    _update_from_params(modules, Xf)
+    for prof, ax_i in zip(modules['solver'].predicted_profiles, ax):
+        aLy_vals = getattr(modules['state'], f'aL{prof}', np.zeros_like(x))
+        ax_i.plot(x, aLy_vals, 's-', markevery=ix_eval, label='final')
+        ax_i.set_xlabel('roa')
+        ax_i.set_title(f'a/Ly: {prof}')
+        ax_i.legend(fontsize=8)
+        ax_i.set_xlim(domain[0],domain[1])
+
+    fig.suptitle('Scale Lengths: Initial vs Final')
+    fig.tight_layout()
+    _save(fig, outdir/f'scale_lengths')
+
 
 def plot_power_flows(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], outdir: Path):
 
     domain = modules['solver'].domain
-    x = modules['solver'].roa_eval[:-1]
+    x = modules['state'].roa
+    x_eval = modules['solver'].roa_eval
     Yf = hist_df[[i for i in hist_df.columns if 'model_' in i and 'std' not in i]].iloc[-1]
     Yf_std = hist_df[[i for i in hist_df.columns if 'model_' in i and 'std' in i]].iloc[-1]
     Ytf = hist_df[[i for i in hist_df.columns if 'target_' in i and 'std' not in i]].iloc[-1]
@@ -462,17 +562,17 @@ def plot_power_flows(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], outdir
 
     for ix,key in enumerate(target_vars):
         axi = ax[ix]
-        y = np.asarray([Yf['model_'+key+'_'+str(i)] for i in range(len(x))], dtype=float)
-        y_std = np.asarray([Yf_std['model_'+key+'_std_'+str(i)] for i in range(len(x))], dtype=float)
-        yt = np.asarray([Ytf['target_'+key+'_'+str(i)] for i in range(len(x))], dtype=float)
-        yt_std = np.asarray([Ytf_std['target_'+key+'_std_'+str(i)] for i in range(len(x))], dtype=float)
-        axi.plot(x, yt, '-', label=f"target {key}", marker='o', linewidth=2)
-        axi.plot(x, y, '--', label=f"model {key}", marker='s', linewidth=2)
-        axi.fill_between(x, y-y_std, y+y_std, color='C1', alpha=0.2, label='model 1 std')
+        y = np.asarray([Yf['model_'+key+'_'+str(i)] for i in range(len(x_eval))], dtype=float)
+        y_std = np.asarray([Yf_std['model_'+key+'_std_'+str(i)] for i in range(len(x_eval))], dtype=float)
+        yt = np.asarray([Ytf['target_'+key+'_'+str(i)] for i in range(len(x_eval))], dtype=float)
+        yt_std = np.asarray([Ytf_std['target_'+key+'_std_'+str(i)] for i in range(len(x_eval))], dtype=float)
+        axi.plot(x_eval, yt, '-', label=f"target {key}", marker='o', linewidth=2)
+        axi.plot(x_eval, y, '--', label=f"model {key}", marker='s', linewidth=2)
+        axi.fill_between(x_eval, y-y_std, y+y_std, color='C1', alpha=0.2, label='model 1 std')
 
         for c in transport_components:
-            yc = np.asarray([Yf['model_'+key+'_'+c+'_'+str(i)] for i in range(len(x))], dtype=float)
-            axi.plot(x, yc, ':', label=f"model {c}", color=colors(transport_components.index(c)))
+            yc = np.asarray([Yf['model_'+key+'_'+c+'_'+str(i)] for i in range(len(x_eval))], dtype=float)
+            axi.plot(x_eval, yc, ':', label=f"model {c}", color=colors(transport_components.index(c)))
 
         axi.set_xlim(domain[0],domain[1])
         axi.set_xlabel('r/a')
@@ -483,6 +583,34 @@ def plot_power_flows(hist_df: pd.DataFrame, modules, cfg: Dict[str, Any], outdir
     fig.suptitle('Final Power Flows')
     fig.tight_layout()
     _save(fig, outdir/f'power_flows')
+
+
+def plot_neutral_profiles(modules, cfg: Dict[str, Any], outdir: Path):
+
+    if modules['neutrals'] is None:
+        print('No neutrals module found, skipping neutral profile plot.')
+        return
+    domain = modules['solver'].domain
+    x = modules['state'].roa
+    n0 = getattr(modules['state'], 'n0', None) # (n_roa,n_species)
+
+    # Plot neutral profiles
+    fig, ax = plt.subplots(1,1,figsize=tuple(cfg['style'].get('figsize_wide', (10,5))))
+    _subplots_adjust(fig, cfg['style'])
+
+    for ix in range(n0.shape[1]):
+        var = f'species_{ix}'
+        vals = n0[:,ix]
+        ax.plot(x, vals, '-', label=var)
+    ax.set_xlim(domain[0],domain[1])
+    ax.set_xlabel('r/a')
+    ax.set_title(f'Neutrals: {var}')
+    ax.legend(fontsize=8)
+    ax.grid(alpha=0.3)
+
+    fig.suptitle('Neutral Profiles')
+    fig.tight_layout()
+    _save(fig, outdir/f'neutral_profiles')
 
 # ---------------------------------------------------------------------------
 # Surrogate sensitivity & PCA using history only
@@ -831,7 +959,9 @@ def run_report(config_path: str, work_path: str):
     if enabled('residual_channels'):    plot_residual_channels(hist_df, modules, cfg, outdir)
     if enabled('parameter_history'):    plot_parameter_history(hist_df, modules, cfg, outdir)
     if enabled('profiles'):   plot_profiles(modules, hist_df, cfg, outdir)
+    if enabled('scale_lengths'):   plot_scale_lengths(modules, hist_df, cfg, outdir)
     if enabled('power_flows'):    plot_power_flows(hist_df, modules, cfg, outdir)
+    if enabled('neutral_profiles'):    plot_neutral_profiles(modules, cfg, outdir)
     if enabled('surrogate_heatmap'):
         top_features = surrogate_heatmap(modules, cfg, outdir)
     else:

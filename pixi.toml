@@ -8,7 +8,7 @@ platforms = ["linux-64", "osx-arm64"]
 
 [dependencies]
 python = ">=3.11,<3.13"
-numpy = "*"
+numpy = ">=1.24,<2.0"
 scipy = "*"
 pandas = "*"
 matplotlib = "*"
@@ -17,17 +17,11 @@ scikit-learn = "*"
 scikit-optimize = "*"
 debugpy = ">=1.8.17,<2"
 requests = ">=2.32.5,<3"
+paramiko = ">=4.0.0,<5"
 
 [pypi-dependencies]
 pyqt6 = ">=6.9.1, <7"
-
-# Platform-specific dependencies
-#[target.linux-64.pypi-dependencies]
-#aurorafusion = ">3.0.4"
-
-#[target.osx-64.dependencies]
-#aurorafusion = ">3.0.4"
-
+#aurorafusion = { path = "../Aurora", editable = true }
 
 #[feature.dev.dependencies]
 # Add development dependencies here, e.g. pytest, black, etc.

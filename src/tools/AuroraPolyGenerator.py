@@ -25,22 +25,29 @@ class AuroraPolyFitter:
         These outputs align with usage in targets.AnalyticTargetModel and neutrals.NeutralModel.
         """
     
-        def __init__(self, species_name, max_degree=3, output_dir='atomic_data'):
-                self.species_name = species_name
-                self.max_degree = max_degree
-                self.Z_atom = SPECIES_DICT[species_name]
-                self.coefficients = {}  # {process: {charge_state: {coeffs...}}}
-                self.scalers = {}
-                self.fit_quality = {}
+        def __init__(self, species_name, max_degree=3, output_dir='atomic_data', n0_by_ne_grid=None):
+            self.species_name = species_name
+            self.max_degree = max_degree
+            self.Z_atom = SPECIES_DICT[species_name]
+            self.coefficients = {}
+            self.scalers = {}
+            self.fZ_scalers = {}
+            self.fit_quality = {}
+            if os.path.isabs(output_dir):
                 self.output_dir = output_dir
-                os.makedirs(self.output_dir, exist_ok=True)
-                self.training_data = {}
-                self._raw_data = {}
+            else:
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                self.output_dir = os.path.join(base_dir, output_dir)
+            os.makedirs(self.output_dir, exist_ok=True)
+            self.training_data = {}
+            self._raw_data = {}
+            # n0_by_ne grid for fZ: from 1e-6 to 1e3 (10 points on log scale)
+            self.n0_by_ne_grid = n0_by_ne_grid if n0_by_ne_grid is not None else np.logspace(-6, 3, 10)
         
         def generate_training_data(self, ne_range=(0.1, 10.), Te_range=(0.01, 1.0), 
                                 Ti_range=(0.01, 1.0), n_samples=2000):
             """
-            Generate training data for all atomic processes.
+            Generate training data for all atomic processes, including fZ at multiple n0_by_ne values.
             """
             print(f"Generating atomic rate training data for {self.species_name}...")
             
@@ -69,69 +76,111 @@ class AuroraPolyFitter:
             )
             S_coeff, R_coeff, CX_coeff = out[1], out[2], out[3]
 
-            # Fractional abundances fZ (neutrals.py uses get_frac_abundances)
-            # Provide n0_by_ne to avoid singularities; fraction ~1e-2 is a benign choice
-            n0_by_ne = abs((3+np.random.default_rng().normal(size=ne_cm3.size))*1e-2)
-            _, fZ = aurora.atomic.get_frac_abundances(
-                atom_data, ne_cm3=ne_cm3, Te_eV=Te_eV, Ti_eV=Ti_eV,
-                n0_by_ne=n0_by_ne, plot=False
-            )
-            if fZ.ndim == 1:
-                fZ = fZ[:, None]  # Ensure 2D
-
-            # Build charge state densities from fZ for radiation calculation
-            # Assume uniform ion density across samples for training data generation
-            ni_cm3 = ne_cm3.copy()  # Approximate: total ion density ≈ electron density
-            n0_cm3 = n0_by_ne * ne_cm3
-            # nZ_cm3 shape: (n_samples, n_charge_states) including neutrals
-            nZ_cm3 = fZ * (n0_cm3[:, None] + ni_cm3[:, None])
-
-            # Radiation components (targets.AnalyticTargetModel references compute_rad)
-            # Returns dict with arrays of shape (n_charge_states, n_samples)
-            rad = aurora.radiation.compute_rad(
-                self.species_name,
-                (nZ_cm3.T)[None,:],
-                ne_cm3[None,:],
-                Te_eV[None,:],
-                n0=n0_cm3[None,:],
-                Ti=Ti_eV[None,:],
-                prad_flag=True,
-                thermal_cx_rad_flag=True,
-            ) # radiation has a leading time dimension
+            # Initialize training data and raw data dicts
+            self.training_data = {}
+            self._raw_data = {'rates': {}}
             
-            # Store training data (rates = reactivity coefficients, not multiplied by density)
-            # Radiation arrays have shape (n_charge_states, n_samples)
-            n_charge = fZ.shape[1]
-            self.training_data = {
-                'ne': ne_cm3,      # 1e19/m^-3
+            # Store rates (same for all n0_by_ne values)
+            self.training_data['rates'] = {
+                'ne': ne_cm3,      # cm^-3
                 'Te': Te_eV,      # eV
                 'Ti': Ti_eV,      # eV
                 'S_rates': S_coeff,    # Ionization reactivities [1/s]
                 'R_rates': R_coeff,    # Recombination reactivities [1/s]
                 'CX_rates': CX_coeff,  # Charge exchange reactivities [1/s]
-                'fZ': fZ,              # fractional abundances (N, Zmax+1)
-                'rad': {
-                    'tot': rad.get('tot', np.zeros((1,n_samples)))[0,:],
-                    'line': rad.get('line_rad', np.zeros((1,n_charge, n_samples)))[0,:,:],
-                    'cont': rad.get('cont_rad', np.zeros((1,n_charge, n_samples)))[0,:,:],
-                    'brems': rad.get('brems', np.zeros((1,n_charge, n_samples)))[0,:,:],
-                    'cx': rad.get('thermal_cx_cont_rad', np.zeros((1,n_charge, n_samples)))[0,:,:],
-                }, # Radiation components [W/cm^3]
             }
-
-            # Keep raw data for saving separate CSVs
-            self._raw_data = {
+            self._raw_data['rates'] = {
                 'ne': ne_samples,      # 1e19/m^-3
                 'Te': Te_samples,      # keV
                 'Ti': Ti_samples,      # keV
                 'S_rates': S_coeff,
                 'R_rates': R_coeff,
                 'CX_rates': CX_coeff,
-                'fZ': fZ,
-                'rad': self.training_data['rad'],
             }
             
-            print(f"Generated {n_samples} training points")
+            # Generate fZ and radiation for each n0_by_ne value in the grid
+            self.training_data['fZ'] = {}
+            self._raw_data['fZ'] = {}
+            self.training_data['rad'] = {}
+            self._raw_data['rad'] = {}
+            
+            print(f"  Generating fZ for {len(self.n0_by_ne_grid)} n0_by_ne values: {self.n0_by_ne_grid}")
+            
+            for n0_by_ne_val in self.n0_by_ne_grid:
+                print(f"    Processing n0_by_ne = {n0_by_ne_val:.2e}")
+                
+                # Create constant n0_by_ne array
+                n0_by_ne = np.full(ne_cm3.size, n0_by_ne_val)
+                
+                # Get fractional abundances
+                _, fZ = aurora.atomic.get_frac_abundances(
+                    atom_data, ne_cm3=ne_cm3, Te_eV=Te_eV, Ti_eV=Ti_eV,
+                    n0_by_ne=n0_by_ne, plot=False
+                )
+                if fZ.ndim == 1:
+                    fZ = fZ[:, None]  # Ensure 2D
+                
+                # Verify sum of fZ = 1
+                fZ_sum = fZ.sum(axis=1)
+                if not np.allclose(fZ_sum, 1.0, atol=1e-6):
+                    print(f"      WARNING: fZ does not sum to 1. Min={fZ_sum.min():.6f}, Max={fZ_sum.max():.6f}")
+                    fZ = fZ / (fZ_sum[:, None] + 1e-12)
+                
+                # Store fZ data indexed by n0_by_ne
+                self.training_data['fZ'][n0_by_ne_val] = {
+                    'ne': ne_cm3,
+                    'Te': Te_eV,
+                    'Ti': Ti_eV,
+                    'fZ': fZ,
+                }
+                self._raw_data['fZ'][n0_by_ne_val] = {
+                    'ne': ne_samples,
+                    'Te': Te_samples,
+                    'Ti': Ti_samples,
+                    'fZ': fZ,
+                }
+                
+                # Build charge state densities for radiation calculation
+                ni_cm3 = ne_cm3.copy()
+                n0_cm3 = n0_by_ne * ne_cm3
+                nZ_cm3 = fZ * (n0_cm3[:, None] + ni_cm3[:, None])
+                
+                # Compute radiation
+                rad = aurora.radiation.compute_rad(
+                    self.species_name,
+                    (nZ_cm3.T)[None,:],
+                    ne_cm3[None,:],
+                    Te_eV[None,:],
+                    n0=n0_cm3[None,:],
+                    Ti=Ti_eV[None,:],
+                    prad_flag=True,
+                    thermal_cx_rad_flag=True,
+                )
+                
+                # Store radiation indexed by n0_by_ne
+                n_charge = fZ.shape[1]
+                self.training_data['rad'][n0_by_ne_val] = {
+                    'ne': ne_cm3,
+                    'Te': Te_eV,
+                    'Ti': Ti_eV,
+                    'tot': rad.get('tot', np.zeros((1, n_samples)))[0,:],
+                    'line': rad.get('line_rad', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                    'cont': rad.get('cont_rad', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                    'brems': rad.get('brems', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                    'cx': rad.get('thermal_cx_cont_rad', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                }
+                self._raw_data['rad'][n0_by_ne_val] = {
+                    'ne': ne_samples,
+                    'Te': Te_samples,
+                    'Ti': Ti_samples,
+                    'tot': rad.get('tot', np.zeros((1, n_samples)))[0,:],
+                    'line': rad.get('line_rad', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                    'cont': rad.get('cont_rad', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                    'brems': rad.get('brems', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                    'cx': rad.get('thermal_cx_cont_rad', np.zeros((1, n_charge, n_samples)))[0,:,:],
+                }
+            
+            print(f"Generated {n_samples} training points for rates and {len(self.n0_by_ne_grid)} n0_by_ne regimes for fZ/radiation")
             return self.training_data
         
         def fit_polynomials(self, processes=['ionization', 'recombination', 'charge_exchange'], 
@@ -152,9 +201,14 @@ class AuroraPolyFitter:
             """
             print("Fitting polynomial models...")
             
-            ne = self.training_data['ne']
-            Te = self.training_data['Te']
-            Ti = self.training_data['Ti']
+            rates_data = self.training_data.get('rates', {})
+            if not rates_data:
+                print("Warning: no rate training data found.")
+                return
+            
+            ne = rates_data['ne']
+            Te = rates_data['Te']
+            Ti = rates_data['Ti']
             
             # Transform to normalized coordinates [-1, 1] for Chebyshev
             ne_norm = 2 * (np.log10(ne) - np.log10(ne).min()) / (np.log10(ne).max() - np.log10(ne).min()) - 1
@@ -173,9 +227,9 @@ class AuroraPolyFitter:
             
             # Map process names to data
             process_data_map = {
-                'ionization': self.training_data['S_rates'],
-                'recombination': self.training_data['R_rates'],
-                'charge_exchange': self.training_data['CX_rates']
+                'ionization': rates_data['S_rates'],
+                'recombination': rates_data['R_rates'],
+                'charge_exchange': rates_data['CX_rates']
             }
             
             # For ionization and recombination, we can use 2D features (ne, Te)
@@ -254,74 +308,98 @@ class AuroraPolyFitter:
                                 f"MAE (percent) = {self.fit_quality[process][charge_state]['mae_percent']:.4f}, "
                                 f"degree = {best_degree}")
         
-            # Fit fractional abundances (fZ)
+            # Fit fractional abundances (fZ) per n0_by_ne
             if fit_fZ and 'fZ' in self.training_data:
                 print("\nFitting fractional abundance (fZ) polynomials...")
-                fZ_data = self.training_data['fZ']
+                fZ_data_map = self.training_data['fZ']
                 
                 self.coefficients['fZ'] = {}
                 self.fit_quality['fZ'] = {}
+                self.fZ_scalers = {}
                 
-                # Use 3D features (ne, Te, Ti) for fZ
-                X_3d = np.column_stack([ne_norm, Te_norm, Ti_norm])
-                
-                for charge_state in range(fZ_data.shape[1]):
-                    # Use logit transform for bounded [0,1] data
-                    y_raw = fZ_data[:, charge_state]
-                    # Clip to avoid log(0)
-                    y_clipped = np.clip(y_raw, 1e-10, 1 - 1e-10)
-                    y = np.log(y_clipped / (1 - y_clipped))  # logit transform
+                for n0_by_ne_val, fZ_data in fZ_data_map.items():
+                    ne_fz = fZ_data['ne']
+                    Te_fz = fZ_data['Te']
+                    Ti_fz = fZ_data['Ti']
+                    fZ = fZ_data['fZ']
                     
-                    best_score = -np.inf
-                    best_model = None
-                    best_degree = 1
+                    # Transform to normalized coordinates [-1, 1] for Chebyshev
+                    ne_norm_fz = 2 * (np.log10(ne_fz) - np.log10(ne_fz).min()) / (np.log10(ne_fz).max() - np.log10(ne_fz).min()) - 1
+                    Te_norm_fz = 2 * (np.log10(Te_fz) - np.log10(Te_fz).min()) / (np.log10(Te_fz).max() - np.log10(Te_fz).min()) - 1
+                    Ti_norm_fz = 2 * (np.log10(Ti_fz) - np.log10(Ti_fz).min()) / (np.log10(Ti_fz).max() - np.log10(Ti_fz).min()) - 1
+                    X_3d_fz = np.column_stack([ne_norm_fz, Te_norm_fz, Ti_norm_fz])
                     
-                    for degree in range(1, self.max_degree + 1):
-                        try:
-                            X_poly = self._chebyshev_features(X_3d, degree)
-                            model = Ridge(alpha=alpha)
-                            model.fit(X_poly, y)
+                    self.fZ_scalers[n0_by_ne_val] = {
+                        'ne_min': np.log10(ne_fz).min(),
+                        'ne_max': np.log10(ne_fz).max(),
+                        'Te_min': np.log10(Te_fz).min(),
+                        'Te_max': np.log10(Te_fz).max(),
+                        'Ti_min': np.log10(Ti_fz).min(),
+                        'Ti_max': np.log10(Ti_fz).max()
+                    }
+                    
+                    self.coefficients['fZ'][n0_by_ne_val] = {}
+                    self.fit_quality['fZ'][n0_by_ne_val] = {}
+                    
+                    for charge_state in range(fZ.shape[1]):
+                        # Use logit transform for bounded [0,1] data
+                        y_raw = fZ[:, charge_state]
+                        y_clipped = np.clip(y_raw, 1e-10, 1 - 1e-10)
+                        y = np.log(y_clipped / (1 - y_clipped))
+                        
+                        best_score = -np.inf
+                        best_model = None
+                        best_degree = 1
+                        
+                        for degree in range(1, self.max_degree + 1):
+                            try:
+                                X_poly = self._chebyshev_features(X_3d_fz, degree)
+                                model = Ridge(alpha=alpha)
+                                model.fit(X_poly, y)
+                                
+                                y_pred = model.predict(X_poly)
+                                score = r2_score(y, y_pred)
+                                
+                                if score > best_score:
+                                    best_score = score
+                                    best_model = model
+                                    best_degree = degree
+                            except Exception:
+                                continue
+                        
+                        if best_model is not None:
+                            self.coefficients['fZ'][n0_by_ne_val][charge_state] = {
+                                'degree': best_degree,
+                                'coefficients': best_model.coef_,
+                                'intercept': best_model.intercept_,
+                                'n_features': 3,
+                                'transform': 'logit'
+                            }
                             
-                            y_pred = model.predict(X_poly)
-                            score = r2_score(y, y_pred)
+                            X_poly_best = self._chebyshev_features(X_3d_fz, best_degree)
+                            y_pred_best = best_model.predict(X_poly_best)
+                            y_pred_prob = 1 / (1 + np.exp(-y_pred_best))
+                            y_prob = 1 / (1 + np.exp(-y))
                             
-                            if score > best_score:
-                                best_score = score
-                                best_model = model
-                                best_degree = degree
-                        except Exception as e:
-                            continue
-                    
-                    if best_model is not None:
-                        self.coefficients['fZ'][charge_state] = {
-                            'degree': best_degree,
-                            'coefficients': best_model.coef_,
-                            'intercept': best_model.intercept_,
-                            'n_features': 3,
-                            'transform': 'logit'  # Mark that we used logit transform
-                        }
-                        
-                        X_poly_best = self._chebyshev_features(X_3d, best_degree)
-                        y_pred_best = best_model.predict(X_poly_best)
-                        # Transform back to [0,1]
-                        y_pred_prob = 1 / (1 + np.exp(-y_pred_best))
-                        y_prob = 1 / (1 + np.exp(-y))
-                        
-                        self.fit_quality['fZ'][charge_state] = {
-                            'r2_score': best_score,
-                            'mae': np.mean(np.abs(y_prob - y_pred_prob)),
-                            'max_error': np.max(np.abs(y_prob - y_pred_prob)),
-                            'degree_used': best_degree
-                        }
-                        
-                        print(f"  fZ charge {charge_state}: R² = {best_score:.4f}, "
-                            f"MAE = {self.fit_quality['fZ'][charge_state]['mae']:.4e}, "
-                            f"degree = {best_degree}")
+                            self.fit_quality['fZ'][n0_by_ne_val][charge_state] = {
+                                'r2_score': best_score,
+                                'mae': np.mean(np.abs(y_prob - y_pred_prob)),
+                                'max_error': np.max(np.abs(y_prob - y_pred_prob)),
+                                'degree_used': best_degree
+                            }
+                            
+                            print(
+                                f"  fZ n0_by_ne={n0_by_ne_val:.2e} charge {charge_state}: "
+                                f"R² = {best_score:.4f}, degree = {best_degree}"
+                            )
             
             # Fit radiation components
             if fit_radiation and 'rad' in self.training_data:
                 print("\nFitting radiation component polynomials...")
                 rad_data = self.training_data['rad']
+                if isinstance(rad_data, dict):
+                    first_key = sorted(rad_data.keys())[0]
+                    rad_data = rad_data[first_key]
                 
                 self.coefficients['radiation'] = {}
                 self.fit_quality['radiation'] = {}
@@ -465,8 +543,18 @@ class AuroraPolyFitter:
             """Save ionization/recombination/CX reactivities to CSV per species."""
             path = os.path.join(self.output_dir, f"{self.species_name}_rates.csv")
             rows = []
-            ne = self._raw_data['ne']; Te = self._raw_data['Te']; Ti = self._raw_data['Ti']
-            S = self._raw_data['S_rates']; R = self._raw_data['R_rates']; CX = self._raw_data['CX_rates']
+            
+            rates_data = self._raw_data.get('rates', {})
+            if not rates_data:
+                return path
+            
+            ne = rates_data['ne']
+            Te = rates_data['Te']
+            Ti = rates_data['Ti']
+            S = rates_data['S_rates']
+            R = rates_data['R_rates']
+            CX = rates_data['CX_rates']
+            
             for i in range(ne.size):
                 row = {'ne_1e19_m3': ne[i], 'Te_keV': Te[i], 'Ti_keV': Ti[i]}
                 for z in range(S.shape[1]):
@@ -474,56 +562,104 @@ class AuroraPolyFitter:
                     row[f'R_z{z}'] = R[i, z]
                     row[f'CX_z{z}'] = CX[i, z]
                 rows.append(row)
+            
             pd.DataFrame(rows).to_csv(path, index=False)
             return path
 
         def save_raw_fZ(self) -> str:
-            """Save fractional abundances fZ to CSV per species."""
+            """Save fractional abundances fZ to CSV per species, organized by n0_by_ne."""
             path = os.path.join(self.output_dir, f"{self.species_name}_fZ.csv")
             rows = []
-            ne = self._raw_data['ne']; Te = self._raw_data['Te']; Ti = self._raw_data['Ti']
-            fZ = self._raw_data['fZ']
-            for i in range(ne.size):
-                row = {'ne_1e19_m3': ne[i], 'Te_keV': Te[i], 'Ti_keV': Ti[i]}
-                for z in range(fZ.shape[1]):
-                    row[f'fZ_z{z}'] = fZ[i, z]
-                rows.append(row)
-            pd.DataFrame(rows).to_csv(path, index=False)
+            fZ_data = self._raw_data.get('fZ', {})
+            
+            # Handle both old flat structure and new nested structure
+            if isinstance(fZ_data, dict) and len(fZ_data) > 0:
+                # New nested structure: dict keyed by n0_by_ne
+                if isinstance(list(fZ_data.values())[0], dict):
+                    # Nested: iterate over n0_by_ne values
+                    for n0_by_ne_val, data_dict in fZ_data.items():
+                        ne = data_dict['ne']
+                        Te = data_dict['Te']
+                        Ti = data_dict['Ti']
+                        fZ = data_dict['fZ']
+                        
+                        for i in range(ne.size):
+                            row = {
+                                'ne_1e19_m3': ne[i],
+                                'Te_keV': Te[i],
+                                'Ti_keV': Ti[i],
+                                'n0_by_ne': n0_by_ne_val
+                            }
+                            for z in range(fZ.shape[1]):
+                                row[f'fZ_z{z}'] = fZ[i, z]
+                            rows.append(row)
+                else:
+                    # Flat structure (shouldn't happen with new code)
+                    ne = self._raw_data['ne']
+                    Te = self._raw_data['Te']
+                    Ti = self._raw_data['Ti']
+                    fZ = fZ_data
+                    for i in range(ne.size):
+                        row = {'ne_1e19_m3': ne[i], 'Te_keV': Te[i], 'Ti_keV': Ti[i]}
+                        for z in range(fZ.shape[1]):
+                            row[f'fZ_z{z}'] = fZ[i, z]
+                        rows.append(row)
+            
+            if rows:
+                pd.DataFrame(rows).to_csv(path, index=False)
             return path
 
         def save_raw_radiation(self) -> str:
-            """Save radiation components to CSV per species.
-            Each charge state gets its own columns: rad_tot_z0, rad_tot_z1, etc.
-            """
+            """Save radiation components to CSV per species, organized by n0_by_ne."""
             path = os.path.join(self.output_dir, f"{self.species_name}_radiation.csv")
-            rad = self._raw_data['rad']
             rows = []
-            ne = self._raw_data['ne']; Te = self._raw_data['Te']; Ti = self._raw_data['Ti']
+            rad_data = self._raw_data.get('rad', {})
             
-            # Get number of charge states from radiation data shape
-            rad_tot = rad.get('tot', rad.get('line', None))
-            rad_line = rad.get('line', None)
-            if rad_tot is None:
-                return path  # No radiation data to save
+            if not rad_data:
+                return path
             
-            n_charge = rad_line.shape[0]  # (n_charge, n_samples)
-            n_samples = rad_tot.shape[0]
+            # Handle nested structure: dict keyed by n0_by_ne
+            if isinstance(list(rad_data.values())[0], dict):
+                for n0_by_ne_val, data_dict in rad_data.items():
+                    ne = data_dict['ne']
+                    Te = data_dict['Te']
+                    Ti = data_dict['Ti']
+                    rad = data_dict
+                    
+                    rad_tot = rad.get('tot', None)
+                    rad_line = rad.get('line', None)
+                    if rad_tot is None:
+                        continue
+                    
+                    n_charge = rad_line.shape[0] if rad_line is not None else 1
+                    n_samples = rad_tot.shape[0]
+                    
+                    for i in range(n_samples):
+                        row = {
+                            'ne_1e19_m3': ne[i],
+                            'Te_keV': Te[i],
+                            'Ti_keV': Ti[i],
+                            'n0_by_ne': n0_by_ne_val,
+                            'rad_tot': rad_tot[i]
+                        }
+                        for z in range(n_charge):
+                            row[f'rad_line_z{z}'] = rad.get('line', np.zeros((n_charge, n_samples)))[z, i]
+                            row[f'rad_cont_z{z}'] = rad.get('cont', np.zeros((n_charge, n_samples)))[z, i]
+                            row[f'rad_brems_z{z}'] = rad.get('brems', np.zeros((n_charge, n_samples)))[z, i]
+                            row[f'rad_cx_z{z}'] = rad.get('cx', np.zeros((n_charge, n_samples)))[z, i]
+                        rows.append(row)
             
-            for i in range(n_samples):
-                row = {'ne_1e19_m3': ne[i], 'Te_keV': Te[i], 'Ti_keV': Ti[i]}
-                row[f'rad_tot'] = rad.get('tot', np.zeros((n_samples)))[i]
-                for z in range(n_charge):
-                    row[f'rad_line_z{z}'] = rad.get('line', np.zeros((n_charge, n_samples)))[z, i]
-                    row[f'rad_cont_z{z}'] = rad.get('cont', np.zeros((n_charge, n_samples)))[z, i]
-                    row[f'rad_brems_z{z}'] = rad.get('brems', np.zeros((n_charge, n_samples)))[z, i]
-                    row[f'rad_cx_z{z}'] = rad.get('cx', np.zeros((n_charge, n_samples)))[z, i]
-                rows.append(row)
-            
-            pd.DataFrame(rows).to_csv(path, index=False)
+            if rows:
+                pd.DataFrame(rows).to_csv(path, index=False)
             return path
         
-        def save_coefficients(self, output_dir='atomic_data', master_file='atomic_rate_polynomials.csv'):
+        def save_coefficients(self, output_dir=None, master_file='atomic_rate_polynomials.csv'):
             """Save all polynomial coefficients to a single master CSV file with scalers included."""
+            if output_dir is None:
+                output_dir = self.output_dir
+            elif not os.path.isabs(output_dir):
+                base_dir = os.path.dirname(os.path.abspath(__file__))
+                output_dir = os.path.join(base_dir, output_dir)
             os.makedirs(output_dir, exist_ok=True)
             
             master_filepath = os.path.join(output_dir, master_file)
@@ -550,6 +686,13 @@ class AuroraPolyFitter:
                                 if not isinstance(coeff_info, dict) or 'coefficients' not in coeff_info:
                                     continue
                                 max_coeffs = max(max_coeffs, len(coeff_info['coefficients']))
+                    continue
+                if process == 'fZ':
+                    for _, n0_coeffs in process_coeffs.items():
+                        for _, coeff_info in n0_coeffs.items():
+                            if not isinstance(coeff_info, dict) or 'coefficients' not in coeff_info:
+                                continue
+                            max_coeffs = max(max_coeffs, len(coeff_info['coefficients']))
                     continue
                 else:
                     for charge_state, coeff_info in process_coeffs.items():
@@ -589,6 +732,7 @@ class AuroraPolyFitter:
                                 'Te_max': self.scalers['Te_max'],
                                 'Ti_min': self.scalers['Ti_min'],
                                 'Ti_max': self.scalers['Ti_max'],
+                                'n0_by_ne': np.nan,
                                 'intercept': coeff_info['intercept']
                             }
                             for i in range(max_coeffs):
@@ -627,6 +771,7 @@ class AuroraPolyFitter:
                                     'Te_max': self.scalers['Te_max'],
                                     'Ti_min': self.scalers['Ti_min'],
                                     'Ti_max': self.scalers['Ti_max'],
+                                    'n0_by_ne': np.nan,
                                     'intercept': coeff_info['intercept']
                                 }
                                 for i in range(max_coeffs):
@@ -648,42 +793,40 @@ class AuroraPolyFitter:
                                 new_data.append(row)
                     continue
                 
-                # Handle fZ with special transform flag
+                # Handle fZ with n0_by_ne grid
                 if process == 'fZ':
-                    for charge_state, coeff_info in process_coeffs.items():
-                        row = {
-                            'species': self.species_name,
-                            'process': 'fZ',
-                            'initial_charge': charge_state,
-                            'final_charge': charge_state,
-                            'charge_state': charge_state,
-                            'degree': coeff_info['degree'],
-                            'n_features': coeff_info['n_features'],
-                            'ne_min': self.scalers['ne_min'],
-                            'ne_max': self.scalers['ne_max'],
-                            'Te_min': self.scalers['Te_min'],
-                            'Te_max': self.scalers['Te_max'],
-                            'Ti_min': self.scalers['Ti_min'],
-                            'Ti_max': self.scalers['Ti_max'],
-                            'intercept': coeff_info['intercept']
-                        }
-                        for i in range(max_coeffs):
-                            if i < len(coeff_info['coefficients']):
-                                row[f'coeff_{i}'] = coeff_info['coefficients'][i]
-                            else:
-                                row[f'coeff_{i}'] = np.nan
-                        
-                        if charge_state in self.fit_quality.get('fZ', {}):
-                            quality = self.fit_quality['fZ'][charge_state]
+                    for n0_by_ne_val, n0_coeffs in process_coeffs.items():
+                        scalers = self.fZ_scalers.get(n0_by_ne_val, self.scalers)
+                        for charge_state, coeff_info in n0_coeffs.items():
+                            row = {
+                                'species': self.species_name,
+                                'process': 'fZ',
+                                'initial_charge': charge_state,
+                                'final_charge': charge_state,
+                                'charge_state': charge_state,
+                                'degree': coeff_info['degree'],
+                                'n_features': coeff_info['n_features'],
+                                'ne_min': scalers['ne_min'],
+                                'ne_max': scalers['ne_max'],
+                                'Te_min': scalers['Te_min'],
+                                'Te_max': scalers['Te_max'],
+                                'Ti_min': scalers['Ti_min'],
+                                'Ti_max': scalers['Ti_max'],
+                                'n0_by_ne': np.nan if n0_by_ne_val is None else n0_by_ne_val,
+                                'intercept': coeff_info['intercept']
+                            }
+                            for i in range(max_coeffs):
+                                if i < len(coeff_info['coefficients']):
+                                    row[f'coeff_{i}'] = coeff_info['coefficients'][i]
+                                else:
+                                    row[f'coeff_{i}'] = np.nan
+                            
+                            quality = self.fit_quality.get('fZ', {}).get(n0_by_ne_val, {}).get(charge_state, {})
                             row['r2_score'] = quality.get('r2_score', np.nan)
-                            row['mae_percent'] = quality.get('mae', np.nan) * 100  # Convert to percent
+                            row['mae_percent'] = quality.get('mae', np.nan) * 100
                             row['max_error_percent'] = quality.get('max_error', np.nan) * 100
-                        else:
-                            row['r2_score'] = np.nan
-                            row['mae_percent'] = np.nan
-                            row['max_error_percent'] = np.nan
-                        
-                        new_data.append(row)
+                            
+                            new_data.append(row)
                     continue
                 
                 # Handle regular atomic rates
@@ -716,6 +859,7 @@ class AuroraPolyFitter:
                         'Te_max': self.scalers['Te_max'],
                         'Ti_min': self.scalers['Ti_min'],
                         'Ti_max': self.scalers['Ti_max'],
+                        'n0_by_ne': np.nan,
                         
                         'intercept': coeff_info['intercept']
                     }
@@ -745,7 +889,7 @@ class AuroraPolyFitter:
             # Define the desired column order
             metadata_cols = ['species', 'process', 'initial_charge', 'final_charge', 'charge_state', 
                             'degree', 'n_features']
-            scaler_cols = ['ne_min', 'ne_max', 'Te_min', 'Te_max', 'Ti_min', 'Ti_max']
+            scaler_cols = ['ne_min', 'ne_max', 'Te_min', 'Te_max', 'Ti_min', 'Ti_max', 'n0_by_ne']
             other_metadata_cols = ['intercept']
             coeff_cols = [f'coeff_{i}' for i in range(max_coeffs)]
             quality_cols = ['r2_score', 'mae_percent', 'max_error_percent']

@@ -171,26 +171,26 @@ def loglam(Te_keV: float, ne_19: float) -> float:
     Te_eV = Te_keV * 1e3
     return 24.0 - np.log(np.sqrt(ne_cm3) / Te_eV)
 
-def nue(Te_keV: float, ne_19: float) -> float:
-    """
-    Calculate the electron collision frequency.
+# def nue(Te_keV: float, ne_19: float) -> float:
+#     """
+#     Calculate the electron collision frequency.
 
-    Parameters
-    ----------
-    Te_keV : float
-        Electron temperature in keV.
-    ne_19 : float
-        Electron density in 1e19 m^-3.
+#     Parameters
+#     ----------
+#     Te_keV : float
+#         Electron temperature in keV.
+#     ne_19 : float
+#         Electron density in 1e19 m^-3.
 
-    Returns
-    -------
-    float
-        Electron collision frequency in s^-1.
-    """
-    loglambda = loglam(Te_keV, ne_19)
-    return (
-        2.91e-6 * (ne_19 * 1e13) * loglambda * (Te_keV * 1e3) ** (-1.5)
-    ) / 1e6  # Convert from cm3 to m3
+#     Returns
+#     -------
+#     float
+#         Electron collision frequency in s^-1.
+#     """
+#     loglambda = loglam(Te_keV, ne_19)
+#     return (
+#         2.91e-6 * (ne_19 * 1e13) * loglambda * (Te_keV * 1e3) ** (-1.5)
+#     ) / 1e6  # Convert from cm3 to m3
 
 def vthermal(T_keV: float, m_u: float, particle_type: str = 'ion') -> float:
     """
@@ -284,7 +284,7 @@ def p_prime(te, ne, aLte, aLne, ti, ni, aLti, aLni, a, B_unit, q, r):
     # pressure gradient
     dpdr = ne*te*(aLte + aLne)
     for i in range(ni.shape[-1]):
-        dpdr += ni[...,i]*ti*(aLti + aLni[i][:])
+        dpdr += ni[...,i]*ti*(aLti + aLni)
 
     dpdr = -1/a * 1e3 * E_J * 1e20 * dpdr
 
@@ -377,14 +377,14 @@ def gyrobohm_units(Te_keV, ne_20, mref_u, Bunit, a):
 # --------------------------------------------------------------------------------------------------------------------------------
 
 
-# def nue(Te_keV, ne_20):
-#     # From tgyro_profile_functions.f90
+def nue(Te_keV, ne_20):
+    # From tgyro_profile_functions.f90
 
-#     precomputed_factor = 12216.801897044845  # (4*pi*e**4 / (2*2**0.5*me_g**0.5)) / k**1.5 / (1E3)**1.5  * 1E20*1E-6
+    precomputed_factor = 12216.801897044845  # (4*pi*e**4 / (2*2**0.5*me_g**0.5)) / k**1.5 / (1E3)**1.5  * 1E20*1E-6
 
-#     nu = precomputed_factor * loglam(Te_keV, ne_20) * ne_20 / Te_keV**1.5
+    nu = precomputed_factor * loglam(Te_keV, ne_20) * ne_20 / Te_keV**1.5
 
-#     return nu  # in 1/s
+    return nu  # in 1/s
 
 
 def xnue(Te_keV, ne_20, a_m, mref_u):

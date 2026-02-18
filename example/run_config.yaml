@@ -1,48 +1,86 @@
 # Where to store files
 work_dir: ~/git/PRESTOS/example/
 
+# Platform configuration (environment + execution)
+platform:
+  name: local
+  gacode_root: /home/smolesworth/git/gacode
+
 # Initial plasma state: point to a GACODE profiles file
 state:
   args:
     from_gacode: ~/git/PRESTOS/example/input.gacode
 
 boundary:
-  class: boundary.TwoFluidTwoPoint_PeretSSF
-  args: {}
+  class: boundary.FixedInitial
+  args:
+    sigma: 0.1
     
 
 # Parameter model (optional in current solver flow)
 parameters:
-  class: parameterizations.Gaussian
+  class: parameterizations.Spline
   args:
-    # knots: [0.88, 0.91, 0.94, 0.97, 1.0] # alt: n_params_per_prof: []
-    # spline_type: pchip
-    # defined_on: aLy
+    knots:  [0.88, 0.91, 0.94, 0.97] # alt: n_params_per_prof: []
+    spline_type: akima #pchip for defined on y, akima for defined on aLy
+    defined_on: aLy
     include_zero_grad_on_axis: True
     sigma: 0.1 # relative uncertainty on parameters, 1 sigma
     # lcfs_aLti_in_params: False
 
 neutrals:
-  class: neutrals.DiffusiveNeutralModel
+  class: neutrals.Diffusive
   args:
-    n0_edge: [1e-4,1e-7] # 1e19/m^3
+    n0_edge: None #[1e-2,1e-8] # 1e19/m^3
 
 transport:
-  class: transport.FingerprintsModel
+  class: transport.Fingerprints
   args:
     modes: all
+    n_parallel: 4
+    n_threads: 4 # per parallel task
     sigma: 0.1 # relative uncertainty on transport model, 1 sigma
     ExB_source: state
+    neoclassical_model: analytic
+    # Evaluation logging for surrogate warm-start and cross-user sharing
+    log_evaluations: False  # Enable automatic logging of all evaluations
+    evaluation_log:
+      enabled: False
+      # path: ./logs/transport_evaluations.db  # Local database (default)
+      # path: /shared/prestos/transport_eval.db  # Shared network database
+      # If not specified, uses environment variable PRESTOS_EVAL_LOG or default
+    
+    NEO_options:
+      keep_files: minimal
+      settings: {}
+      multipliers: {}
+    TGLF_options:
+      keep_files: minimal
+      settings: {
+        SAT_RULE: 3,
+        USE_BPER: True,
+        }
+      multipliers: {}
+    QLGYRO_options: 
+      keep_files: minimal
+      settings: {
+        }
+      multipliers: {}
+    CGYRO_options:
+      keep_files: minimal
+      settings: {
+        NONLINEAR_FLAG: 0
+        }
+      multipliers: {}
 
 targets:
-  class: targets.AnalyticTargetModel
+  class: targets.Analytic
   args:
     scale_Pe_beam: 1.0
     scale_Pi_beam: 1.0
     scale_Qpar_wall: 1.0
     scale_Qpar_beam: 1.0
     sigma: 0.1 # relative uncertainty on targets, 1 sigma
-    # example arguments for later on
 
 solver:
   class: solvers.IvpSolver
@@ -50,10 +88,10 @@ solver:
     # map your predicted profiles to target variables from transport/targets
     predicted_profiles: [ne, te, ti]
     target_vars: [Ce, Pe, Pi]
-    roa_eval: [0.88, 0.91, 0.94, 0.97, 1.0]
+    roa_eval: [0.88, 0.91, 0.94, 0.97]
     domain: [0.88, 1.0]
     tol: 1e-4
-    model_iter_to_stall: 10
+    model_iter_to_stall: 100
     max_iter: 1000
     use_surrogate: False
     surrogate_warmup: 5
@@ -61,10 +99,14 @@ solver:
     use_jacobian: True
     objective: mse
     normalize_residual: True # normalizes ith component by abs(target[i])
+    residual_weights:
+      flux: 1.0
+      boundary_conditions: 0.0
+      constraints: 0.0
     scale_objective: True # divides total by N_channels
-    step_size: 0.1
+    step_size: 0.01
     adaptive_step: True
-    bounds:  [[0,10], [0.0,100.0], [0.9,1.2]]
+    bounds:  [0.01,100] # [[0,200],[0,5],[0.9,1.0],[0.01,1.0]] # [[1.01,2], [0,10], [0.9,1.1]] # 
     # [[0,10],[0,15],[0,25],[0,50],[0,100]]  # [0,100] #
 
         # two element list applied to all parameters or list of n_parameters tuples
@@ -79,21 +121,36 @@ solver:
     #     weight: 1.0
     #     norm: log        # optional
     #     enforcement: ramp # or exact
+    #     sigma: 0.05
     #   - location: 0.88
     #     expression: "ne >= 3.0" # assume 1e19 m^-3
     #     weight: 0.5
     #     norm: None
     #     enforcement: ramp # or exact
+    #     sigma: 0.05
 
 # Optional single-output surrogate (currently unused by default)
+# Optional: Surrogate configuration with warm-start
 surrogate:
   class: surrogates.SurrogateManager
   args:
+    warm_start: false  # Enable to pre-train surrogates from evaluation log
     type: gp
     mode: global
     kwargs:
-      length_scale: 1.0
-      variance: 1.0
-      noise: 1e-3
       ard: False
-      scaling: standard
+      #scaling: standard
+
+    
+    # Warm-start configuration (if enabled):
+    # warm_start_model_class: transport.Tglf  # Required: which model to query
+    
+    # warm_start_model_settings: {}  # Optional: filter on specific settings
+    # Examples of flexible settings filtering:
+    #   {}                           # Match ANY settings (most data)
+    #   {SAT_RULE: 3}               # Only SAT_RULE=3 (other settings any)
+    #   {SAT_RULE: [2, 3]}          # SAT_RULE is 2 OR 3
+    #   {SAT_RULE: 3, USE_BPER: True}  # Both must match
+    
+    # warm_start_max_entries: 5000  # Max evaluations to load from log
+    # evaluation_log_path: ./logs/transport_evaluations.db  # Override default

@@ -29,6 +29,7 @@ from scipy.optimize import curve_fit
 import scipy as sp  
 from scipy.optimize import least_squares, minimize
 from scipy.special import gamma as Gamma
+from scipy.integrate import cumulative_trapezoid
 
 # -------------------------
 # Base parameter model
@@ -63,7 +64,7 @@ class ParameterBase:
     def __init__(self, options: Dict[str, Any]):
         self.predicted_profiles = options.get('predicted_profiles', [])
         self.coord = options.get('coord', 'roa').lower()
-        self.include_zero_grad_at_axis = options.get('include_zero_grad_at_axis', True)
+        self.include_zero_grad_on_axis = options.get('include_zero_grad_on_axis', True)
         self.bc_dict: Dict[str, List[BCEntry]] = {}
         self.params: Dict[str, np.ndarray] = {}
         self.a = 1.0  # default minor radius, updated in parameterize()
@@ -103,7 +104,7 @@ class ParameterBase:
                 self.add_bc(key, _normalize_single_bc(val))
 
         # Optionally ensure aL<prof> has an axis BC at 0.0 (append only if no exact axis entry)
-        if self.include_zero_grad_at_axis:
+        if self.include_zero_grad_on_axis:
             for prof in self.predicted_profiles:
                 key = f"aL{prof}"
                 entries = self.bc_dict.get(key, [])
@@ -141,6 +142,7 @@ class ParameterBase:
 
     def update(self, params: Dict[str, np.ndarray], bc_dict: Dict[str, Any], x_eval: np.ndarray):
         """Convenience method returning y, aLy, and curvature."""
+        self.build_bcs(bc_dict)
         y = self.get_y(params, x_eval)
         aLy = self.get_aLy(params, x_eval)
         curvature = self.get_curvature(params, x_eval)
@@ -165,7 +167,7 @@ class Spline(ParameterBase):
         'akima' (default) or 'pchip'. Determines the interpolator.
     coord : str
         'rho' (default) to treat x as r/a, or 'r' to treat x as meters.
-    include_zero_grad_at_axis : bool
+    include_zero_grad_on_axis : bool
         If True (default) and knots do not include x=0, a virtual control point with a/Ly=0 at x=0
         is prepended for smooth behavior at the magnetic axis.
     bc_field : Optional[str]
@@ -183,7 +185,7 @@ class Spline(ParameterBase):
         self.param_names = [self.defined_on+str(i) for i in range(len(self.knots))]
         if self.lcfs_aLti_in_params:
             #raise NotImplementedError("lcfs_aLti_in_params=True not implemented for SplineParameterModel.")
-            self.param_names ['aLti_lcfs']
+            self.param_names.append('aLti_lcfs')
         self.n_params_per_profile = len(self.knots)
         self.splines: Dict[str, Any] = {}
         self.a = 1.0  # Default value, will be updated in parameterize()
@@ -195,12 +197,12 @@ class Spline(ParameterBase):
     def _make_spline(self, x: np.ndarray, y: np.ndarray, prof: str):
         """Return a spline object of chosen type.
         
-        If include_zero_grad_at_axis=True and x doesn't start at 0, prepend axis BC.
+        If include_zero_grad_on_axis=True and x doesn't start at 0, prepend axis BC.
         """
         x_spline = np.asarray(x)
         y_spline = np.asarray(y)
 
-        if self.include_zero_grad_at_axis and not np.isclose(x_spline[0], 0.0) and self.defined_on == 'aLy':
+        if self.include_zero_grad_on_axis and not np.isclose(x_spline[0], 0.0) and self.defined_on == 'aLy':
             x_spline = np.insert(x_spline, 0, 0.0)
             y_spline = np.insert(y_spline, 0, 0.0)
         
@@ -293,21 +295,21 @@ class Spline(ParameterBase):
             bc_entries = self.bc_dict.get(prof_name, [])
             
             # Add/replace BC points in the data
-            for bc in bc_entries:
-                bc_loc = bc['loc']
-                bc_val = bc['val']
+            #for bc in bc_entries:
+                #bc_loc = bc['loc']
+                #bc_val = bc['val']
                 
                 # Find if this location already exists in data (within tolerance)
-                existing_idx = np.where(np.isclose(x_data, bc_loc, atol=1e-6))[0]
+                #existing_idx = np.where(np.isclose(x_data, bc_loc, atol=1e-6))[0]
                 
-                if len(existing_idx) > 0:
-                    # Replace existing point
-                    y_data[existing_idx[0]] = bc_val
-                else:
-                    # Insert new point in sorted order
-                    insert_idx = np.searchsorted(x_data, bc_loc)
-                    x_data = np.insert(x_data, insert_idx, bc_loc)
-                    y_data = np.insert(y_data, insert_idx, bc_val)
+                # if len(existing_idx) > 0:
+                #     # Replace existing point
+                #     y_data[existing_idx[0]] = bc_val
+                # else:
+                #     # Insert new point in sorted order
+                #     insert_idx = np.searchsorted(x_data, bc_loc)
+                #     x_data = np.insert(x_data, insert_idx, bc_loc)
+                #     y_data = np.insert(y_data, insert_idx, bc_val)
             
             # Build spline with BC-augmented data
             spline = self._make_spline(x_data, y_data, prof)
@@ -323,22 +325,38 @@ class Spline(ParameterBase):
         """Compute profiles y(x) on x_eval."""
         out = {}
         for prof, prof_params in params.items():
+            
             if isinstance(prof_params, dict):
                 vals = np.array([prof_params[n] for n in self.param_names])
             else:
                 vals = np.asarray(prof_params)
-            spline = self._make_spline(self.knots, vals, prof)
+
+            bc_name = f'aL{prof}' if self.defined_on == 'aLy' else prof
+            bc = self.get_nearest_bc(bc_name, 1.0)
+            if bc is not None:
+                # add bc point to vals and knots for spline construction
+                if not np.any(np.isclose(self.knots, 1.0)):
+                    knots = np.append(self.knots, bc['loc'])
+                    vals = np.append(vals, bc['val'])
+                else:
+                    # find nearest knot to bc location
+                    knot_diffs = np.abs(self.knots - bc['loc'])
+                    nearest_knot_idx = int(np.argmin(knot_diffs))
+                    vals[nearest_knot_idx] = bc['val']
+                    knots = self.knots
+            else:
+                raise ValueError(f"No boundary condition found for profile '{bc_name}' at x=1.0")
             
+            spline = self._make_spline(knots, vals, prof)
+
             if self.defined_on == "y":
                 y = spline(x_eval)
             elif self.defined_on == "aLy":
-                # Need boundary condition to integrate aLy → y
-                bc = self.get_nearest_bc(prof, x_eval[-1])
-                if bc is None:
-                    raise ValueError(f"No boundary condition found for profile '{prof}' at x={x_eval[-1]}")
-                y = self._integrate_aLy(prof, x_eval, spline, bc['val'], bc['loc'])
+                bc_y = self.get_nearest_bc(prof, 1.0)
+                y = self._integrate_aLy(prof, x_eval, spline, bc_y['val'], bc_y['loc'])
             else:
                 raise ValueError(f"Invalid defined_on: {self.defined_on}")
+            
             out[prof] = np.clip(y, a_min=0, a_max=None)
         self.y = out
         return out
@@ -354,7 +372,26 @@ class Spline(ParameterBase):
                 vals = np.array([prof_params[n] for n in self.param_names])
             else:
                 vals = np.asarray(prof_params)
-            spline = self._make_spline(self.knots, vals, prof)
+        
+            # get aLy boundary condition to update vals if needed
+            bc_name = f'aL{prof}' if self.defined_on == 'aLy' else prof
+            bc = self.get_nearest_bc(bc_name, 1.0)
+            if bc is not None:
+                # add bc point to vals and knots for spline construction
+                if not np.any(np.isclose(self.knots, 1.0)):
+                    knots = np.append(self.knots, bc['loc'])
+                    vals = np.append(vals, bc['val'])
+                else:
+                    # find nearest knot to bc location
+                    knot_diffs = np.abs(self.knots - bc['loc'])
+                    nearest_knot_idx = int(np.argmin(knot_diffs))
+                    vals[nearest_knot_idx] = bc['val']
+                    knots = self.knots
+            else:
+                raise ValueError(f"No boundary condition found for profile '{bc_name}' at x=1.0")
+
+            spline = self._make_spline(knots, vals, prof)
+
             if self.defined_on == "aLy":
                 aLy = spline(x_eval)
             elif self.defined_on == "y":
@@ -384,21 +421,38 @@ class Spline(ParameterBase):
                 vals = np.array([prof_params[n] for n in self.param_names])
             else:
                 vals = np.asarray(prof_params)
-            spline = self._make_spline(self.knots, vals, prof)
+
+            bc_name = f'aL{prof}' if self.defined_on == 'aLy' else prof
+            bc = self.get_nearest_bc(bc_name, 1.0)
+            if bc is not None:
+                # add bc point to vals and knots for spline construction
+                if not np.any(np.isclose(self.knots, 1.0)):
+                    knots = np.append(self.knots, bc['loc'])
+                    vals = np.append(vals, bc['val'])
+                else:
+                    # find nearest knot to bc location
+                    knot_diffs = np.abs(self.knots - bc['loc'])
+                    nearest_knot_idx = int(np.argmin(knot_diffs))
+                    vals[nearest_knot_idx] = bc['val']
+                    knots = self.knots
+            else:
+                raise ValueError(f"No boundary condition found for profile '{bc_name}' at x=1.0")
+            
+            spline = self._make_spline(knots, vals, prof)
             
             if self.defined_on == "y":
                 curv = spline.derivative(2)(x_eval)
             elif self.defined_on == "aLy":
                 # Get boundary condition to integrate aLy → y
-                bc = self.get_nearest_bc(prof, x_eval[-1])
-                if bc is None:
+                bc_y = self.get_nearest_bc(prof, 1.0)
+                if bc_y is None:
                     raise ValueError(f"No boundary condition found for profile '{prof}' to compute curvature")
                 
                 # Get aLy, aLy', and y on x_eval
                 aLy_spl = spline
                 aLy = aLy_spl(x_eval)
                 aLy_prime = aLy_spl.derivative(1)(x_eval)
-                y = self._integrate_aLy(prof, x_eval, spline, bc['val'], bc['loc'])
+                y = self._integrate_aLy(prof, x_eval, aLy_spl, bc_y['val'], bc_y['loc'])
                 
                 # Avoid division issues and NaN propagation
                 y_safe = np.where(np.abs(y) < 1e-12, 1e-12, y)
@@ -413,24 +467,6 @@ class Spline(ParameterBase):
             out[prof] = curv
         self.curv = out
         return out
-    
-    def enforce_bc(self, X, bc_dict: Dict[str, Any]):
-        """Enforce boundary conditions from provided dict.
-        X: Dict[str, np.ndarray] of profiles to modify in place.
-        bc_dict: Dict[str, Any] of BC specifications.
-        """
-        self.build_bcs(bc_dict)
-        for key, entries in self.bc_dict.items():
-            for bc in entries:
-                loc = bc['loc']
-                val = bc['val']
-                if key in X:
-                    # Find nearest index to location
-                    x_array = np.asarray(X[key])
-                    idx = int(np.argmin(np.abs(x_array - loc)))
-                    X[key][idx] = val  # enforce BC
-
-        return X
 
 class Gaussian(ParameterBase):
     """
@@ -1090,7 +1126,7 @@ class GaussianDipole(ParameterBase):
             # Add axis BC if needed
             x_spline = self.x_fine
             y_spline = curv_fine
-            if self.include_zero_grad_at_axis and not np.isclose(self.x_fine[0], 0.0):
+            if self.include_zero_grad_on_axis and not np.isclose(self.x_fine[0], 0.0):
                 x_spline = np.insert(self.x_fine, 0, 0.0)
                 y_spline = np.insert(curv_fine, 0, 0.0)
             
@@ -1135,7 +1171,7 @@ class GaussianDipole(ParameterBase):
             # Add axis BC if needed
             x_spline = self.x_fine
             y_spline = aLy
-            if self.include_zero_grad_at_axis and not np.isclose(self.x_fine[0], 0.0):
+            if self.include_zero_grad_on_axis and not np.isclose(self.x_fine[0], 0.0):
                 x_spline = np.insert(self.x_fine, 0, 0.0)
                 y_spline = np.insert(aLy, 0, 0.0)
             
@@ -1217,6 +1253,558 @@ class GaussianDipole(ParameterBase):
 
 
 # -------------------------
+# Polynomial parameter model
+# -------------------------
+
+
+class Polynomial(ParameterBase):
+    """Polynomial-based parameterization using weighted orthogonal polynomial expansions.
+    
+    Represents a/Ly as a sum of weighted polynomials:
+        a/Ly(x) = Σ(a_i * P_i(x))
+    where a_i are coefficients and P_i are orthogonal polynomials.
+    
+    Supports Legendre, Chebyshev (1st and 2nd kind), and Hermite polynomials
+    via numpy.polynomial.
+    
+    Parameters
+    ----------
+    polynomial_class : str
+        Type of polynomial basis: 'legendre', 'chebyshev', 'hermite'
+    order : int
+        Number of polynomial terms (and parameters per profile)
+    domain : List[float]
+        Domain [x_min, x_max] for polynomial evaluation (default: [0, 1])
+    """
+    
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+        
+        self.polynomial_class = options.get('polynomial_class', 'legendre').lower()
+        self.degree = int(options.get('degree', 3))  # Degree of polynomial
+        self.defined_on = 'aLy'
+        
+        # Generate parameter names: a_0, a_1, ..., a_{degree}
+        self.param_names = [f"a_{i}" for i in range(self.degree + 1)]
+        self.n_params_per_profile = self.degree + 1
+        
+        # Domain for polynomial evaluation (can be overridden in options)
+        if 'domain' in options:
+            self.domain = options['domain']
+        
+        # Map polynomial class name to numpy.polynomial module
+        self.poly_module = self._get_polynomial_module()
+        
+        # Store polynomial representations for each profile
+        self.poly_aLy: Dict[str, Any] = {}  # aLy polynomial objects
+        self.poly_y: Dict[str, Any] = {}    # y polynomial objects (integrated)
+        
+    def _get_polynomial_module(self):
+        """Get the appropriate numpy.polynomial submodule."""
+        poly_map = {
+            'legendre': np.polynomial.legendre,
+            'chebyshev': np.polynomial.chebyshev,
+            'hermite': np.polynomial.hermite,
+        }
+        
+        if self.polynomial_class not in poly_map:
+            raise ValueError(
+                f"Unknown polynomial_class '{self.polynomial_class}'. "
+                f"Choose from: {list(poly_map.keys())}"
+            )
+        
+        return poly_map[self.polynomial_class]
+    
+    def _rescale_to_canonical(self, x: np.ndarray) -> np.ndarray:
+        """Rescale x from user domain [x_min, x_max] to canonical [-1, 1].
+        
+        Linear transformation: x_canonical = 2*(x - x_min)/(x_max - x_min) - 1
+        Maps domain[0] -> -1 and domain[1] -> 1.
+        """
+        x = np.asarray(x, dtype=float)
+        x_min, x_max = self.domain[0], self.domain[1]
+        
+        # Avoid division by zero
+        denom = x_max - x_min
+        if np.isclose(denom, 0.0):
+            return np.zeros_like(x)
+        
+        return 2.0 * (x - x_min) / denom - 1.0
+    
+    def _rescale_from_canonical(self, x_canonical: np.ndarray) -> np.ndarray:
+        """Rescale x from canonical [-1, 1] to user domain [x_min, x_max].
+        
+        Inverse transformation: x = x_min + (x_canonical + 1) * (x_max - x_min) / 2
+        Maps -1 -> domain[0] and 1 -> domain[1].
+        """
+        x_canonical = np.asarray(x_canonical, dtype=float)
+        x_min, x_max = self.domain[0], self.domain[1]
+        
+        return x_min + (x_canonical + 1.0) * (x_max - x_min) / 2.0
+    
+
+    def _create_polynomial(self, coeffs: np.ndarray):
+        """Create a polynomial object from coefficients.
+        
+        Polynomials are created on the canonical [-1, 1] domain for numerical stability.
+        User domain rescaling is handled in get_aLy, get_y, and get_curvature.
+        
+        Parameters
+        ----------
+        coeffs : np.ndarray
+            Polynomial coefficients [a_0, a_1, ..., a_n]
+        domain : List[float], optional
+            Domain [x_min, x_max] - ignored, uses canonical [-1, 1]
+            
+        Returns
+        -------
+        poly : Polynomial object from numpy.polynomial (on domain [-1, 1])
+        """
+        
+        # Create the appropriate polynomial class
+        # Always use canonical [-1, 1] domain for numerical stability
+        canonical_domain = [-1.0, 1.0]
+        
+        if self.polynomial_class == 'legendre':
+            return np.polynomial.Legendre(coeffs, domain=canonical_domain)
+        elif self.polynomial_class == 'chebyshev':
+            return np.polynomial.Chebyshev(coeffs, domain=canonical_domain)
+        elif self.polynomial_class == 'hermite':
+            return np.polynomial.Hermite(coeffs, domain=canonical_domain)
+    
+    def parameterize(self, state, bc_dict: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+        """Fit polynomial coefficients to state data.
+        
+        Uses least-squares fitting to match a/Ly data from the state.
+        """
+        self.build_bcs(bc_dict)
+        self.a = getattr(state, 'a', 1.0)
+        
+        params = {}
+        params_std = {}
+        
+        x_data = np.asarray(getattr(state, self.coord))
+        
+        # Trim to domain if specified
+        if hasattr(self, 'domain') and self.domain is not None:
+            mask = (x_data >= self.domain[0]) & (x_data <= self.domain[1])
+        else:
+            mask = np.ones(len(x_data), dtype=bool)
+        
+        x_fit = x_data[mask]
+        
+        # Rescale fit data to canonical [-1, 1] domain
+        x_fit_canonical = self._rescale_to_canonical(x_fit)
+        
+        for prof in self.predicted_profiles:
+            # Get a/Ly data from state
+            aLy_key = f"aL{prof}"
+            
+            if hasattr(state, aLy_key):
+                aLy_data = np.asarray(getattr(state, aLy_key))[mask]
+            else:
+                # Compute a/Ly from profile data if not available
+                y_data = np.asarray(getattr(state, prof))[mask]
+                dy_dx = np.gradient(y_data, x_fit)
+                aLy_data = -self.a * dy_dx / (y_data + 1e-12)
+            
+            # Fit polynomial coefficients using least squares
+            # numpy polynomial fit returns coefficients in increasing degree order
+            try:
+                if self.polynomial_class == 'legendre':
+                    coeffs = np.polynomial.legendre.legfit(x_fit_canonical, aLy_data, deg=self.degree, 
+                                                          full=False)
+                elif self.polynomial_class == 'chebyshev':
+                    coeffs = np.polynomial.chebyshev.chebfit(x_fit_canonical, aLy_data, deg=self.degree, 
+                                                            full=False)
+                elif self.polynomial_class == 'hermite':
+                    coeffs = np.polynomial.hermite.hermfit(x_fit_canonical, aLy_data, deg=self.degree, 
+                                                          full=False)
+                
+                # Store coefficients as parameters
+                params[prof] = {f"a_{i}": float(coeffs[i]) for i in range(len(coeffs))}
+                
+                # Estimate uncertainties (simplified - use residual-based estimate)
+                poly_eval = self._create_polynomial(coeffs)(x_fit_canonical)
+                residual_std = np.std(aLy_data - poly_eval)
+                params_std[prof] = {f"a_{i}": residual_std * self.sigma for i in range(len(coeffs))}
+                
+            except Exception as e:
+                print(f"[Polynomial.parameterize] Warning: fitting failed for {prof}: {e}")
+                # Fallback to zero coefficients
+                params[prof] = {f"a_{i}": 0.0 for i in range(self.degree + 1)}
+                params_std[prof] = {f"a_{i}": self.sigma for i in range(self.degree + 1)}
+        
+        self.params = params
+        self.params_std = params_std
+        return params, params_std
+    
+    def get_aLy(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute a/Ly(x) = Σ(a_i * P_i(x)) using polynomial evaluation.
+        
+        Rescales x from user domain to canonical [-1, 1] before evaluation.
+        """
+        out = {}
+        x_eval = np.asarray(x_eval)
+        
+        # Rescale to canonical domain
+        x_canonical = self._rescale_to_canonical(x_eval)
+        
+        for prof, prof_params in params.items():
+            # Extract coefficients in order
+            coeffs = np.array([prof_params.get(f"a_{i}", 0.0) for i in range(self.degree + 1)])
+            
+            # Create and evaluate polynomial (on canonical domain)
+            poly = self._create_polynomial(coeffs)
+            aLy_eval = poly(x_canonical)
+            
+            # Store polynomial for later use
+            self.poly_aLy[prof] = poly
+            
+            out[prof] = aLy_eval
+        
+        self.aLy = out
+        return out
+    
+    def get_y(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute y(x) by integrating a/Ly.
+        
+        Uses the relation: y(x) = y_bc * exp(-(1/a) ∫ aLy dx)
+        where integration is performed using the antiderivative of the polynomial.
+        
+        Rescales x from user domain to canonical [-1, 1] before integration.
+        """
+        out = {}
+        x_eval = np.asarray(x_eval)
+        
+        # Rescale to canonical domain for integration
+        x_canonical = self._rescale_to_canonical(x_eval)
+        
+        # First get aLy polynomials
+        aLy_dict = self.get_aLy(params, x_eval)
+        
+        for prof in params:
+            bc_y = self.get_nearest_bc(prof, 1.0)
+            if bc_y is None:
+                raise ValueError(f"No boundary condition for profile '{prof}' at x=1.0")
+            
+            # Get the aLy polynomial
+            poly_aLy = self.poly_aLy.get(prof)
+            if poly_aLy is None:
+                # Fallback to numerical integration on original coordinates
+                aLy_eval = aLy_dict[prof]
+                x_sorted = x_eval
+                aLy_sorted = aLy_eval
+                sort_idx = np.argsort(x_eval)
+                x_sorted = x_eval[sort_idx]
+                aLy_sorted = aLy_eval[sort_idx]
+                
+                integral = cumulative_trapezoid(aLy_sorted, x_sorted, initial=0.0)
+                integral_bc = np.interp(bc_y['loc'], x_sorted, integral)
+                phase = -(1.0 / self.a) * (integral - integral_bc)
+                y_sorted = bc_y['val'] * np.exp(phase)
+                
+                # Unsort
+                y_eval = np.empty_like(y_sorted)
+                y_eval[sort_idx] = y_sorted
+            else:
+                # Use polynomial integration (antiderivative) on canonical domain
+                poly_integral = poly_aLy.integ()
+                
+                # Rescale bc_y['loc'] to canonical domain
+                bc_loc_canonical = self._rescale_to_canonical(np.array([bc_y['loc']]))[0]
+                
+                # Evaluate integral at x and at boundary (on canonical domain)
+                integral_x = poly_integral(x_canonical)
+                integral_bc = poly_integral(bc_loc_canonical)
+
+                # Convert canonical integral d(x_canonical) to physical-x integral dx
+                # x_canonical = 2*(x - x_min)/(x_max - x_min) - 1  =>  dx = (x_range/2) d(x_canonical)
+                x_range = (self.domain[1] - self.domain[0])
+                integral_scale = x_range / 2.0
+                
+                # Compute phase: ∫[bc_loc to x] aLy dx' = F(x) - F(bc_loc)
+                phase = -(1.0 / self.a) * (integral_scale * (integral_x - integral_bc))
+
+                # Clip phase to prevent overflow
+                phase = np.clip(phase, -50, 50)
+                
+                y_eval = bc_y['val'] * np.exp(phase)
+            
+            out[prof] = y_eval
+        
+        self.y = out
+        return out
+    
+    def get_curvature(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Compute d²y/dx² using polynomial derivatives.
+        
+        Given y' = -(aLy/a) * y, we have:
+            y'' = -(1/a) * (aLy' * y + aLy * y')
+            y'' = -(y/a) * (aLy' - (aLy²/a))
+        
+        For polynomials, aLy' is computed using .deriv() method.
+        Rescales x from user domain to canonical [-1, 1] before differentiation.
+        """
+        out = {}
+        x_eval = np.asarray(x_eval)
+        
+        # Rescale to canonical domain for differentiation
+        x_canonical = self._rescale_to_canonical(x_eval)
+        
+        # Get y and aLy
+        y_dict = self.get_y(params, x_eval)
+        aLy_dict = self.get_aLy(params, x_eval)
+        
+        for prof in params:
+            y_eval = y_dict[prof]
+            aLy_eval = aLy_dict[prof]
+            
+            # Get derivative of aLy using polynomial (on canonical domain)
+            poly_aLy = self.poly_aLy.get(prof)
+            if poly_aLy is not None:
+                poly_deriv = poly_aLy.deriv()
+                # Note: poly_deriv.deriv() is d/d(x_canonical), not d/dx
+                # For physical curvature, we need d/dx, so chain rule applies
+                # dx_canonical/dx = 2/(x_max - x_min)
+                dx_canonical_dx = 2.0 / (self.domain[1] - self.domain[0])
+                aLy_prime = poly_deriv(x_canonical) * dx_canonical_dx
+            else:
+                # Fallback to numerical derivative
+                aLy_prime = np.gradient(aLy_eval, x_eval)
+            
+            # Compute curvature: y'' = -(y/a) * (aLy' - aLy²/a)
+            curvature = -(y_eval / self.a) * (aLy_prime - (aLy_eval**2 / self.a))
+            
+            out[prof] = curvature
+        
+        self.curv = out
+        return out
+
+
+# -------------------------
+# Basis function model
+# -------------------------
+
+
+class BasisFunction(ParameterBase):
+    """Basis-function parameterization using numpy.polynomial.<family>.<family>.basis.
+
+    Supports Hermite, Legendre, Chebyshev, and Laguerre polynomial families.
+    The parameter vector is the coefficient set for the basis expansion of a/Ly.
+
+    Parameters
+    ----------
+    family : str
+        Polynomial family: 'hermite', 'legendre', 'chebyshev', 'laguerre'
+    degree : int
+        Maximum polynomial degree included in the basis expansion
+    domain : List[float]
+        Domain [x_min, x_max] for evaluating the basis
+    """
+
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+
+        self.family = options.get('family', 'legendre').lower()
+        self.degree = int(options.get('degree', 3))
+        self.defined_on = 'aLy'
+
+        self.param_names = [f"a_{i}" for i in range(self.degree + 1)]
+        self.n_params_per_profile = self.degree + 1
+
+        if 'domain' in options:
+            self.domain = options['domain']
+
+        self.poly_module = self._get_polynomial_module()
+        self.basis_cache: Dict[int, Any] = {}
+
+    def _get_polynomial_module(self):
+        poly_map = {
+            'legendre': np.polynomial.legendre.Legendre,
+            'chebyshev': np.polynomial.chebyshev.Chebyshev,
+            'hermite': np.polynomial.hermite.Hermite,
+            'laguerre': np.polynomial.laguerre.Laguerre,
+        }
+
+        if self.family not in poly_map:
+            raise ValueError(
+                f"Unknown basis family '{self.family}'. "
+                f"Choose from: {list(poly_map.keys())}"
+            )
+
+        return poly_map[self.family]
+
+    def _get_basis(self, i: int):
+        """Return cached basis polynomial of degree i."""
+        basis = self.basis_cache.get(i)
+        if basis is None:
+            basis = self.poly_module.basis(i)
+            self.basis_cache[i] = basis
+        return basis
+
+    def _rescale_to_basis_domain(self, x: np.ndarray) -> np.ndarray:
+        """Rescale x to the canonical domain for the selected family."""
+        x = np.asarray(x, dtype=float)
+        x_min, x_max = self.domain[0], self.domain[1]
+
+        denom = x_max - x_min
+        if np.isclose(denom, 0.0):
+            return np.zeros_like(x)
+
+        if self.family == 'laguerre':
+            # Laguerre basis is defined on [0, ∞); map user domain to [0, 1]
+            return (x - x_min) / denom
+
+        # Hermite/Legendre/Chebyshev use canonical [-1, 1]
+        return 2.0 * (x - x_min) / denom - 1.0
+
+    def _basis_eval(self, coeffs: np.ndarray, x_eval: np.ndarray) -> np.ndarray:
+        """Evaluate Σ a_i * basis_i(x) at x_eval (in basis domain)."""
+        y = np.zeros_like(x_eval, dtype=float)
+        for i, a_i in enumerate(coeffs):
+            if a_i == 0.0:
+                continue
+            y += a_i * self._get_basis(i)(x_eval)
+        return y
+
+    def parameterize(self, state, bc_dict: Dict[str, Any]) -> Dict[str, Dict[str, float]]:
+        """Fit basis coefficients to state a/Ly data using least squares."""
+        self.build_bcs(bc_dict)
+        self.a = getattr(state, 'a', 1.0)
+
+        params = {}
+        params_std = {}
+
+        x_data = np.asarray(getattr(state, self.coord))
+        if hasattr(self, 'domain') and self.domain is not None:
+            mask = (x_data >= self.domain[0]) & (x_data <= self.domain[1])
+        else:
+            mask = np.ones(len(x_data), dtype=bool)
+
+        x_fit = x_data[mask]
+        x_fit_basis = self._rescale_to_basis_domain(x_fit)
+
+        for prof in self.predicted_profiles:
+            aLy_key = f"aL{prof}"
+
+            if hasattr(state, aLy_key):
+                aLy_data = np.asarray(getattr(state, aLy_key))[mask]
+            else:
+                y_data = np.asarray(getattr(state, prof))[mask]
+                dy_dx = np.gradient(y_data, x_fit)
+                aLy_data = -self.a * dy_dx / (y_data + 1e-12)
+
+            # Build design matrix using basis functions
+            Phi = np.column_stack([
+                self._get_basis(i)(x_fit_basis) for i in range(self.degree + 1)
+            ])
+
+            try:
+                coeffs, residuals, _, _ = np.linalg.lstsq(Phi, aLy_data, rcond=None)
+                params[prof] = {f"a_{i}": float(coeffs[i]) for i in range(len(coeffs))}
+
+                if residuals.size > 0:
+                    residual_std = np.sqrt(residuals[0] / max(len(aLy_data) - len(coeffs), 1))
+                else:
+                    residual_std = np.std(aLy_data - Phi @ coeffs)
+
+                params_std[prof] = {f"a_{i}": residual_std * self.sigma for i in range(len(coeffs))}
+            except Exception as e:
+                print(f"[BasisFunction.parameterize] Warning: fitting failed for {prof}: {e}")
+                params[prof] = {f"a_{i}": 0.0 for i in range(self.degree + 1)}
+                params_std[prof] = {f"a_{i}": self.sigma for i in range(self.degree + 1)}
+
+        self.params = params
+        self.params_std = params_std
+        return params, params_std
+
+    def get_aLy(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        out = {}
+        x_eval = np.asarray(x_eval)
+        x_basis = self._rescale_to_basis_domain(x_eval)
+
+        for prof, prof_params in params.items():
+            coeffs = np.array([prof_params.get(f"a_{i}", 0.0) for i in range(self.degree + 1)])
+            aLy_eval = self._basis_eval(coeffs, x_basis)
+            if self.defined_on == "aLy":
+                shift = -min(0.0, float(np.min(aLy_eval)))
+                if shift:
+                    aLy_eval = aLy_eval + shift
+            out[prof] = aLy_eval
+
+        self.aLy = out
+        return out
+
+    def get_y(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        out = {}
+        x_eval = np.asarray(x_eval)
+
+        aLy_dict = self.get_aLy(params, x_eval)
+
+        for prof in params:
+            bc_y = self.get_nearest_bc(prof, 1.0)
+            if bc_y is None:
+                raise ValueError(f"No boundary condition for profile '{prof}' at x=1.0")
+
+            aLy_eval = aLy_dict[prof]
+            sort_idx = np.argsort(x_eval)
+            x_sorted = x_eval[sort_idx]
+            aLy_sorted = aLy_eval[sort_idx]
+
+            integral = cumulative_trapezoid(aLy_sorted, x_sorted, initial=0.0)
+            integral_bc = np.interp(bc_y['loc'], x_sorted, integral)
+            phase = -(1.0 / self.a) * (integral - integral_bc)
+            phase = np.clip(phase, -50, 50)
+            y_sorted = bc_y['val'] * np.exp(phase)
+
+            y_eval = np.empty_like(y_sorted)
+            y_eval[sort_idx] = y_sorted
+            if self.defined_on == "y":
+                shift = -min(0.0, float(np.min(y_eval)))
+                if shift:
+                    y_eval = y_eval + shift
+            out[prof] = y_eval
+
+        self.y = out
+        return out
+
+    def get_curvature(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        out = {}
+        x_eval = np.asarray(x_eval)
+
+        y_dict = self.get_y(params, x_eval)
+        aLy_dict = self.get_aLy(params, x_eval)
+
+        x_basis = self._rescale_to_basis_domain(x_eval)
+        x_min, x_max = self.domain[0], self.domain[1]
+        denom = x_max - x_min
+        if np.isclose(denom, 0.0):
+            dx_basis_dx = 0.0
+        else:
+            dx_basis_dx = 1.0 / denom if self.family == 'laguerre' else 2.0 / denom
+
+        for prof, prof_params in params.items():
+            coeffs = np.array([prof_params.get(f"a_{i}", 0.0) for i in range(self.degree + 1)])
+
+            aLy_prime = np.zeros_like(x_basis, dtype=float)
+            for i, a_i in enumerate(coeffs):
+                if a_i == 0.0:
+                    continue
+                aLy_prime += a_i * self._get_basis(i).deriv()(x_basis)
+
+            aLy_prime *= dx_basis_dx
+
+            y_eval = y_dict[prof]
+            aLy_eval = aLy_dict[prof]
+            curvature = -(y_eval / self.a) * (aLy_prime - (aLy_eval**2 / self.a))
+            out[prof] = curvature
+
+        self.curv = out
+        return out
+
+
+# -------------------------
 # Other model stubs
 # -------------------------
 
@@ -1227,7 +1815,7 @@ class Mtanh(ParameterBase):
     def __init__(self, options: Dict[str, Any]):
         self.options = options or {}
         self.defined_on = "y"
-        
+
 
     def get_aLy(self,params: np.ndarray, x_eval) -> np.ndarray:
         raise NotImplementedError("MTanhParameterModel.aLy not yet implemented")
@@ -1263,6 +1851,8 @@ PARAMETER_MODELS = {
     'spline': Spline,
     'mtanh': Mtanh,
     'gaussian': Gaussian,
+    'polynomial': Polynomial,
+    'basis': BasisFunction,
 }
 
 

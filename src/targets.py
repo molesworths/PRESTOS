@@ -21,6 +21,7 @@ except ImportError:
     warnings.warn("Aurora is not available. Atomic rates will be determined via polynomial interpolation.")
     import tools.atomics as aurora
     AURORA_AVAILABLE = False
+
 class TargetModel:
     """
     Base class for target models.
@@ -98,7 +99,7 @@ class TargetModel:
         raise NotImplementedError
     
 
-class AnalyticTargetModel(TargetModel):
+class Analytic(TargetModel):
     """
     Calculates targets based on analytical models for heating and radiation,
     inspired by `MINTtargets.py`.
@@ -123,28 +124,30 @@ class AnalyticTargetModel(TargetModel):
         self._evaluate_radiation(state)
 
         # Electron and ion heat density to powers
-        self.Paux_e = state.Paux_e
-        self.Paux_i = state.Paux_i
-        self.Pfus_e = calc.volume_integrate(state.r, state.qfuse, state.dVdr)
-        self.Pfus_i = calc.volume_integrate(state.r, state.qfusi, state.dVdr)
-        self.Prad_e = calc.volume_integrate(state.r, state.qrade, state.dVdr)
-        self.Prad_i = calc.volume_integrate(state.r, state.qradi, state.dVdr)
-        self.P_ie = calc.volume_integrate(state.r, state.qie, state.dVdr)*0.01
+        state.Pfus_e = calc.volume_integrate(state.r, state.qfuse, state.dVdr)
+        state.Pfus_i = calc.volume_integrate(state.r, state.qfusi, state.dVdr)
+        state.Prad_e = calc.volume_integrate(state.r, state.qrade, state.dVdr)
+        state.Prad_i = calc.volume_integrate(state.r, state.qradi, state.dVdr)
+        state.P_ie = calc.volume_integrate(state.r, state.qie, state.dVdr)*0.01
+        state.Paux_e = state.Paux_e if hasattr(state, 'Paux_e') else np.zeros_like(state.r)
+        state.Paux_i = state.Paux_i if hasattr(state, 'Paux_i') else np.zeros_like(state.r)
 
         # Store to state for power-balance matching (total powers) [MW]
-        self.Pe = self.Paux_e - self.Prad_e + self.Pfus_e - self.P_ie
-        self.Pi = self.Paux_i - self.Prad_i + self.Pfus_i + self.P_ie
-        self.Ge = -state.Gamma0*state.Zeff + state.Gbeam_e # 1e19/m^2/s
-        self.Gi = self.Ge / state.Zeff # 1e19/m^2/s
-        self.Ce = self.Ge * 1.5 * state.te * state.Qnorm_to_P  # MW
-        self.Ci = self.Gi * 1.5 * state.ti * state.Qnorm_to_P  # MW
+        state.Pe = state.Paux_e - state.Prad_e + state.Pfus_e - state.P_ie
+        state.Pi = state.Paux_i - state.Prad_i + state.Pfus_i + state.P_ie
+        state.Ge = -state.Gamma0*state.Zeff + state.Gbeam_e if hasattr(state,'Gamma0') \
+            else state.Gwall_e + state.Gbeam_e
+        state.Gi = state.Ge / state.Zeff # 1e19/m^2/s
+        state.Ce = state.Ge * 1.5 * state.te * state.Qnorm_to_P  # MW
+        state.Ci = state.Gi * 1.5 * state.ti * state.Qnorm_to_P  # MW
+
 
         # Provide dict for requested outputs
         output_dict = {
             key: [
-            getattr(self, key)[np.where(np.isclose(state.roa, roa, atol=1e-3))[0][0]]
+            getattr(state, key)[np.where(np.isclose(state.roa, roa, atol=1e-3))[0][0]]
             if np.any(np.isclose(state.roa, roa, atol=1e-3))
-            else np.interp(roa, state.roa, getattr(self, key))
+            else np.interp(roa, state.roa, getattr(state, key))
             for roa in self.roa_eval
             ]
             for key in self.output_vars
@@ -157,6 +160,9 @@ class AnalyticTargetModel(TargetModel):
             ]
             for key in self.output_vars
         }
+
+        self.Y_target = output_dict
+        self.Y_std = std_dict
 
         return output_dict, std_dict
 
@@ -344,7 +350,7 @@ def create_target_model(config: Dict) -> TargetModel:
     """
     model_type = config.get('type', 'analytical')
     if model_type == 'analytical':
-        return AnalyticTargetModel(config.get('kwargs', {}))
+        return Analytic(config.get('kwargs', {}))
     else:
         raise ValueError(f"Unknown target model type: {model_type}")
 
@@ -421,5 +427,5 @@ def sivukhin(x, n=12):
     return sivukhin
 
 TARGET_MODELS = {
-    'analytic': AnalyticTargetModel,
+    'analytic': Analytic,
 }
