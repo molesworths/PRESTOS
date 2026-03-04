@@ -7,15 +7,88 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Added
-- **Platform infrastructure for distributed execution**:
-  - `PlatformSpec`, `PlatformManager`, `CommandExecutor`, `FileManager`, `SLURMJobSubmitter` in `src/tools/io.py`
-  - Run transport models locally, on remote SSH machines, or on SLURM HPC clusters
-  - Automatic file staging and job submission with configurable scratch directories
-  - Support for SSH tunneling (jump hosts) for firewall-behind clusters
-  - Comprehensive platform documentation: `PLATFORM_README.md` and `PLATFORM_SUBMISSION_GUIDE.md`
-  - Example configurations and working examples in `example/platform_*.py`
+### Changed
+- **Major refactoring: Package restructuring**:
+  - Split monolithic solver module into `src/solvers/` package
+    - `solver_base.py`: Base classes and interfaces
+    - `relax.py`: Relaxation solver implementation
+    - `bayesian_opt.py`: Bayesian optimization solver
+    - `ivp.py`: IvpSolver (pseudo-time integration)
+    - `objectives.py`: Objective function implementations
+    - `jacobian.py`: Jacobian computation utilities
+    - `uncertainty.py`: Uncertainty quantification methods
+    - `solver_data.py`: Data container for solver output
+    - `factory.py`: Solver creation factory
   
+  - Split transport module into `src/transport/` package
+    - `TransportBase.py`: Base transport model interface
+    - `Fingerprints.py`: Critical-gradient transport model
+    - `Cgyro.py`: CGYRO gyrokinetic solver interface
+    - `Tglf.py`: TGLF turbulent transport interface
+    - `Qlgyro.py`: QLGYRO quasi-linear interface
+    - `Fixed.py`: Fixed diffusivity transport model
+    - `Analytic.py`: Analytic transport model for testing
+    - `utils.py`: Shared transport utilities
+    - `__init__.py`: Factory and import coordination
+  
+  - Split surrogates module into `src/surrogates/` package
+    - `base.py`: Base surrogate interface
+    - `gaussian_process.py`: Gaussian process implementation
+    - `manager.py`: Surrogate lifecycle management
+    - `registry.py`: Surrogate model registry
+    - `__init__.py`: Factory and imports
+  
+- **Removed platform infrastructure**:
+  - Deleted `PLATFORM_README.md`, `PLATFORM_SUBMISSION_GUIDE.md`, `RUN_CONFIG_REFERENCE.md`
+  - Removed platform execution examples and configuration
+  - Simplified `src/tools/io.py` (removed platform classes)
+  - Focusing on core transport solver functionality
+  
+- **Updated API naming**:
+  - Simplified class names for clarity
+  - Reduced redundancy in export names (e.g., `FingersprintsModel` → `Fingerprints`)
+  - Standardized naming conventions across packages
+
+- **Refactored parameterizations.py**:
+  - Renamed `SplineParameterModel` → `Spline`, `MTanhParameterModel` → `Mtanh`
+  - Renamed `RbfParameterModel` → `GaussianDipole` with complete rewrite
+  - All models now return `(params, params_std)` tuple from `parameterize()`
+  - Unified boundary condition format: `{'val': float, 'loc': float}`
+  - Added `sigma` attribute to base class for relative uncertainty (default 0.1)
+  - Parameter uncertainty automatically propagated through solver pipeline
+  
+- **Solver improvements**:
+  - Increased default `model_iter_to_stall` from 3 to 10 for better convergence robustness
+  - Best model restoration now occurs after convergence/stall check rather than during
+  - Removed automatic bounds refresh with BC (caused numerical issues)
+  - Jacobian caching and adaptive recomputation for efficiency
+  - Proper bounds projection in finite-difference Jacobian computation
+  - Fixed `curve_fit` bounds handling for proper uncertainty estimation
+  
+- **State processing**:
+  - Fixed rotation decomposition in `_update_w0_by_decompose()` to match GACODE theory
+  - Radial electric field: `Er = -dpi/dr/(Z·e·ni) - R·Bp·w0`
+  - ExB shear: `γ_E = r·d/dr(v_E/r)` where `v_E = Er/B`
+  - Parallel flow: `vpar = (BT/B)·R·w0`
+  - Removed broken poloidal/toroidal decomposition
+  
+- **Transport model updates**:
+  - Simplified ExB source handling: `ExB_source='state'` uses `gamma_exb_norm` directly
+  - Removed separate 'state-pol' and 'state-both' options
+  - Added platform support via TransportBase.run_on_platform()
+  
+- **Surrogate changes**:
+  - Reduced default `max_train_samples` from 50 to 10 to prevent overfitting
+  - Fixed parameter feature extraction for nested dict keys with underscores
+  - Support for warm-starting from evaluation_log database
+  
+- **Analysis plotting**:
+  - Disabled automatic figure closing (commented `plt.close(fig)`) for interactive use
+  - Added `plt.show()` call in main() to display all figures
+  - Fixed power flow indexing bug (removed `[:-1]` slice on data series)
+  - Corrected `base_ix` calculation for Gaussian parameter bifurcation handling
+
+### Added
 - **Transport model evaluation caching system** (`src/evaluation_log.py`):
   - SQLite database for storing transport evaluations across runs and users
   - Automatic deduplication via SHA-256 content hashing
@@ -82,48 +155,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Bifurcation handling for Gaussian `c` parameter in uncertainty bands
   - Feature importance heatmaps for surrogate models
   - Surrogate sensitivity scatter plots with hierarchical importance ranking
-  - Fixed power flow indexing bug (removed `[:-1]` slice on data series)
-  - Corrected `base_ix` calculation for Gaussian parameter bifurcation handling
+  
+- **Dependencies**:
+  - Added `paramiko` for SSH/SFTP support (required for platform infrastructure)
+  - Updated numpy requirement to `>=1.24,<2.0`
 
-### Changed
-- **Refactored parameterizations.py**:
-  - Renamed `SplineParameterModel` → `Spline`, `MTanhParameterModel` → `Mtanh`
-  - Renamed `RbfParameterModel` → `GaussianDipole` with complete rewrite
-  - All models now return `(params, params_std)` tuple from `parameterize()`
-  - Unified boundary condition format: `{'val': float, 'loc': float}`
-  - Added `sigma` attribute to base class for relative uncertainty (default 0.1)
-  - Parameter uncertainty automatically propagated through solver pipeline
-  
-- **Solver improvements**:
-  - Increased default `model_iter_to_stall` from 3 to 10 for better convergence robustness
-  - Best model restoration now occurs after convergence/stall check rather than during
-  - Removed automatic bounds refresh with BC (caused numerical issues)
-  - Jacobian caching and adaptive recomputation for efficiency
-  - Proper bounds projection in finite-difference Jacobian computation
-  - Fixed `curve_fit` bounds handling for proper uncertainty estimation
-  
-- **State processing**:
-  - Fixed rotation decomposition in `_update_w0_by_decompose()` to match GACODE theory
-  - Radial electric field: `Er = -dpi/dr/(Z·e·ni) - R·Bp·w0`
-  - ExB shear: `γ_E = r·d/dr(v_E/r)` where `v_E = Er/B`
-  - Parallel flow: `vpar = (BT/B)·R·w0`
-  - Removed broken poloidal/toroidal decomposition
-  
-- **Transport model updates**:
-  - Simplified ExB source handling: `ExB_source='state'` uses `gamma_exb_norm` directly
-  - Removed separate 'state-pol' and 'state-both' options
-  - Added platform support via TransportBase.run_on_platform()
-  
-- **Surrogate changes**:
-  - Reduced default `max_train_samples` from 50 to 10 to prevent overfitting
-  - Fixed parameter feature extraction for nested dict keys with underscores
-  - Support for warm-starting from evaluation_log database
-  
-- **Analysis plotting**:
-  - Disabled automatic figure closing (commented `plt.close(fig)`) for interactive use
-  - Added `plt.show()` call in main() to display all figures
-  - Fixed power flow indexing bug (removed `[:-1]` slice on data series)
-  - Corrected `base_ix` calculation for Gaussian parameter bifurcation handling
+### Fixed
+- **Boundary condition handling**: Removed broken `_apply_boundary_condition_bounds()` that caused parameter locking
+- **Parameter flattening**: Changed from sorted() to list() to preserve insertion order for dict keys
+- **Log-space uncertainties**: Fixed `X_new_std` calculation in RelaxSolver for `log_*` parameters
+- **Bifurcation constraints**: Proper handling of Gaussian `c` parameter near x=1 in uncertainty bands
+- **Evaluation logging deduplication**: Robust hash computation avoiding floating-point issues
+- **SFTP file transfer**: Proper error handling for remote path creation and cleanup
+- **Module import paths**: Consistent handling of nested module references in platform infrastructure
+- **Surrogate feature splitting**: Fixed string split to handle parameter names with underscores (changed `split('_')` to `split('_', 1)`)
+
+### Documentation
+- Updated README with Gaussian and GaussianDipole parameterization options
+- Added mathematical formulation documentation in docstrings for new models
+- Updated example `run_config.yaml` to use Gaussian parameterization and IvpSolver
+- Clarified log-space parameter handling in code comments
+- Updated API reference with new package structure
   
 - **Dependencies**:
   - Added `paramiko` for SSH/SFTP support (required for platform infrastructure)

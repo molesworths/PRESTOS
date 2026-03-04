@@ -125,7 +125,7 @@ def nu_star(Te_keV: float, ne_19: float, a_m: float, mi_u: float) -> float:
     float
         Normalized electron collision frequency (dimensionless).
     """
-    nu_e = nue(Te_keV, ne_19)
+    nu_e = nue(Te_keV, ne_19/10)
     cs = c_s(Te_keV, mi_u)
     return nu_e / (cs / a_m)
 
@@ -220,6 +220,34 @@ def vthermal(T_keV: float, m_u: float, particle_type: str = 'ion') -> float:
         raise ValueError("particle_type must be 'ion' or 'electron'")
     
     return np.sqrt(2 * T_J / m_kg)
+
+def drift_frequencies(Te_keV: float, mi_u: float, B_T: float) -> tuple:
+    """
+    Calculate the ion and electron diamagnetic drift frequencies.
+
+    omega_De = grad(pe)...
+
+    Parameters 
+    ----------
+    Te_keV : float
+        Electron temperature in keV.
+    mi_u : float
+        Ion mass in atomic mass units.
+    B_T : float
+        Toroidal magnetic field in Tesla.
+
+    Returns
+    -------
+    tuple
+        (omega_star_i, omega_star_e) in rad/s.
+        
+    """
+    cs = c_s(Te_keV, mi_u)
+    rho_s_m = rho_s(Te_keV, mi_u, B_T)
+    omega_star_i = cs / rho_s_m
+    omega_star_e = (mp_over_me) * omega_star_i
+    return omega_star_i, omega_star_e
+
 
 def magnetic_shear(q: np.ndarray, r: np.ndarray) -> np.ndarray:
     """

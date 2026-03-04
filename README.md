@@ -21,10 +21,9 @@ PRESTOS is designed for efficient transport analysis and profile optimization in
 - **Modular architecture**: Swap boundary conditions, transport models, neutrals, parameterizations, and solvers via configuration
 - **Surrogate acceleration**: Gaussian process surrogates reduce expensive transport evaluations during optimization
 - **Flexible parameterization**: Spline, Gaussian, and curvature-based profile models with customizable knot placement and bounds
-- **Multiple solvers**: Relaxation, Bayesian optimization, and pseudo-time integration (IvpSolver) methods
+- **Multiple solvers**: Relaxation, Bayesian optimization, and pseudo-time integration (IvpSolver) methods with Jacobian assistance
 - **Constraint support**: Flexible inequality and equality constraints with automatic enforcement
 - **Uncertainty quantification**: Full parameter and residual covariance tracking through the solver pipeline
-- **Platform extensibility**: Execute modules (transport, targets) on local, remote, or HPC platforms
 - **Evaluation caching**: Shared transport evaluation database for surrogate warm-start and cross-user knowledge sharing
 - **Workflow checkpointing**: Save/restore solver state for seamless restarts with modified configurations
 - **Built-in analysis**: Automated plotting, surrogate sensitivity, and convergence tracking
@@ -92,9 +91,9 @@ state:
 ### 2. Configure your run
 
 Edit `run_config.yaml` to specify:
-- Transport model (Fingerprints, TGLF, Fixed)
-- Solver type (RelaxSolver, BayesianOptSolver, TimeStepperSolver)
-- Parameterization scheme (SplineParameterModel)
+- Transport model (Fingerprints, TGLF, Cgyro, Fixed, Analytic)
+- Solver type (RelaxSolver, BayesianOptSolver, IvpSolver)
+- Parameterization scheme (Spline, Gaussian, GaussianDipole)
 - Target variables and evaluation domain
 - Surrogate settings
 
@@ -261,7 +260,7 @@ This converts kinetic profiles into parameter vectors and reconstructs profiles 
 
 ```yaml
 transport:
-  class: transport.FingerprintsModel
+  class: transport.Fingerprints
   args:
     modes: all  # 'all' | 'ITG' | 'ETG' | 'KBM' | 'neo'
     ExBon: true  # Include ExB shear suppression
@@ -273,15 +272,18 @@ transport:
 ```
 
 Available models:
-- `FingerprintsModel`: Simplified critical-gradient transport model (ITG/ETG/KBM + neoclassical)
-- `TGLFModel`: Direct TGLF interface (not yet implemented)
-- `FixedTransport`: Fixed diffusivities for testing
+- `Fingerprints`: Simplified critical-gradient transport model (ITG/ETG/KBM + neoclassical)
+- `Cgyro`: CGYRO gyrokinetic solver interface
+- `Tglf`: TGLF turbulent transport interface
+- `Qlgyro`: QLGYRO quasi-linear interface
+- `Fixed`: Fixed diffusivity transport model for testing
+- `Analytic`: Analytic transport model (demonstration)
 
 #### Targets
 
 ```yaml
 targets:
-  class: targets.AnalyticTargetModel
+  class: targets.Analytic
   args:
     scale_Pe_beam: 1.0  # Scaling for electron beam power
     scale_Pi_beam: 1.0  # Scaling for ion beam power
@@ -291,7 +293,7 @@ targets:
 ```
 
 Available models:
-- `AnalyticTargetModel`: Construct targets from auxiliary heating, fusion, radiation, etc.
+- `Analytic`: Construct targets from auxiliary heating, fusion, radiation, etc.
 
 #### Solver
 
@@ -431,45 +433,6 @@ Useful for:
 - Different solver settings (change `max_iter`, `tol`)
 - Transport model adjustments (modify transport settings)
 
-### Platform Infrastructure
-
-Execute PRESTOS modules on local, remote, or HPC platforms without changing code:
-
-```yaml
-transport:
-  class: transport.FingerprintsModel
-  args:
-    modes: all
-  platform:  # Optional: run on specific platform
-    machine: local  # 'local' | hostname
-    scratch: ./work
-    n_cpu: 16
-    scheduler: slurm  # 'none' | 'slurm'
-    slurm_partition: gpu  # for SLURM clusters
-```
-
-**Platform types:**
-- **Local**: Direct execution on your machine
-- **Remote SSH**: Automatic file transfer and execution via SSH
-- **SLURM Cluster**: Automatic job submission and monitoring
-
-**Example: SLURM cluster execution**
-
-```yaml
-transport:
-  class: transport.FingerprintsModel
-  platform:
-    machine: hpc.example.com
-    username: user
-    scratch: /work/user/prestos
-    modules: "module load python/3.9 && module load gcc/11.2.0"
-    ssh_identity: ~/.ssh/cluster_key
-    scheduler: slurm
-    slurm_partition: gpu
-```
-
-See [PLATFORM_README.md](docs/PLATFORM_README.md) and [PLATFORM_SUBMISSION_GUIDE.md](docs/PLATFORM_SUBMISSION_GUIDE.md) for comprehensive documentation.
-
 ### Transport Evaluation Caching
 
 Cache transport model evaluations in a shared database for:
@@ -518,6 +481,212 @@ Database schema:
 - `evaluations` table stores: timestamp, model class, settings, roa location, plasma features, model outputs
 - Automatic deduplication via content hashing (SHA-256)
 - Queryable by model class, settings, roa range, timestamp
+
+### Platform Setup and Execution
+
+PRESTOS supports execution across different platforms: local machines, remote SSH servers, and SLURM HPC clusters. Configure transport models, targets, or other expensive operations to run on alternative platforms without changing code.
+
+#### Platform Configuration
+
+Platforms are defined in `src/tools/platforms.yaml` with reusable named configurations:
+
+```yaml
+local:
+  machine: local              # 'local' or hostname for remote
+  mpi_tasks: 4               # MPI parallelism
+  threads_per_task: 4        # OpenMP threads per task
+  n_gpus: 0                  # GPU count
+  n_ram_gb: 8                # Available RAM
+  scratch: ~/scratch         # Working directory
+
+omega:                        # Example remote site
+  machine: omega.gat.com
+  username: myusername
+  ssh_identity: ~/.ssh/id_rsa
+  ssh_tunnel: cybele.gat.com # Jump host (if behind firewall)
+  ssh_tunnel_port: 2039
+  ssh_port: 22               # SSH port on target machine
+  scratch: /cscratch/myuser/
+  mpi_tasks: 8
+  threads_per_task: 4
+  n_gpus: 2
+  n_ram_gb: 64
+  scheduler: slurm
+  slurm:
+    partition: gpu           # SLURM partition name
+    account: myaccount       # SLURM account/project
+    qos: long                # Quality of service
+    constraint: A100         # Node constraints
+```
+
+#### Configure modules to run on a platform
+
+Specify platform in any module configuration under `run_config.yaml`:
+
+**Example 1: Local execution (default)**
+
+```yaml
+transport:
+  class: transport.Fingerprints
+  args:
+    modes: all
+    ExBon: true
+  platform: local  # Use local platform definition
+```
+
+**Example 2: Remote SSH machine**
+
+```yaml
+transport:
+  class: transport.Cgyro
+  args:
+    n_radial: 64
+  platform:
+    name: omega  # Reference platform from platforms.yaml
+    # Or inline override:
+    # machine: omega.gat.com
+    # username: myuser
+    # scratch: /scratch/myuser/cgyro_runs
+    # ssh_identity: ~/.ssh/custom_key
+```
+
+**Example 3: SLURM cluster with tunneling**
+
+```yaml
+targets:
+  class: targets.Analytic
+  platform:
+    machine: compute.hpc.example.com
+    username: hpcuser
+    ssh_tunnel: login.hpc.example.com  # Firewall-behind cluster
+    ssh_tunnel_port: 2039
+    scratch: /work/hpcuser/prestos
+    scheduler: slurm
+    slurm:
+      partition: gpu
+      account: fusion_project
+      nodes: 2
+      ntasks_per_node: 4
+```
+
+#### Platform types
+
+**Local execution** (`scheduler: none`)
+- Direct execution on your machine
+- No SSH overhead
+- Useful for development, small jobs, or pre-configured environments
+- Configuration:
+  ```yaml
+  machine: local
+  # Direct file access via filesystem
+  ```
+
+**Remote SSH execution** (`scheduler: none`)
+- Execute on remote machine via SSH
+- Automatic file staging before/after execution
+- Environment modules can be loaded via `modules` field
+- Useful for remote workstations or login nodes
+- Configuration:
+  ```yaml
+  machine: hostname.example.com
+  username: myuser
+  ssh_identity: ~/.ssh/id_rsa
+  ssh_port: 22                # Default port (optional)
+  modules: "module load gcc/11 && module load mpi/openmpi-4.0"
+  scratch: /tmp/prestos_work
+  ```
+
+**SLURM cluster execution** (`scheduler: slurm`)
+- Submit jobs to SLURM queue
+- Automatic job submission and monitoring
+- Full resource specification
+- Useful for large simulations on HPC systems
+- Configuration:
+  ```yaml
+  machine: hpc.example.com
+  username: hpcuser
+  ssh_tunnel: login.hpc.example.com  # If behind firewall
+  scheduler: slurm
+  slurm:
+    partition: gpu              # Partition name
+    account: my_project         # Billing account
+    qos: normal                 # Quality of service
+    nodes: 1                    # Number of nodes
+    ntasks_per_node: 4
+    time: "02:00:00"           # Walltime
+    constraint: "A100"          # Node constraints
+    mem_per_cpu: 4000          # Memory in MB
+  ```
+
+#### File transfer and staging
+
+When running on remote platforms, files are automatically handled:
+
+1. **Before execution**: Input files staged to remote `scratch` directory
+2. **Execution**: Command runs on remote machine (direct SSH or batch job)
+3. **After execution**: Output files downloaded back to local machine
+4. **Cleanup**: Temporary files removed from remote `scratch` (optional)
+
+For SSH tunneling (firewall-behind clusters):
+- SSH connection routes through jump host
+- Transparent to user - same API regardless of firewall
+- Requires SSH access to outbound jump/tunnel host
+
+#### Environment setup
+
+Control remote environment via:
+
+```yaml
+platform:
+  machine: hpc.cluster.com
+  modules: |                        # Shell commands (multiline)
+    module purge
+    module load gcc/11.2.0
+    module load openmpi/4.1.0
+    module load python/3.9
+  scratch: /work/user/prestos
+```
+
+#### Monitoring and debugging
+
+Monitor platform execution:
+
+```python
+from src.tools.io import PlatformManager
+
+# Create manager
+manager = PlatformManager({
+    'machine': 'hpc.example.com',
+    'username': 'user',
+    'scheduler': 'slurm'
+})
+
+# Check connection
+manager.check_remote_connection()
+
+# Monitor job
+job_id = manager.submit_job(command, ...)
+status = manager.get_job_status(job_id)
+output = manager.get_job_output(job_id)
+
+# List files
+files = manager.file_manager.list_remote_files("/path")
+
+# Clean up
+manager.cleanup(scratch_dir)
+```
+
+#### Platform-aware code
+
+Modules automatically detect and adapt to platform:
+
+```python
+def evaluate(self, state):
+    # Module code detects whether running locally or remote
+    # File I/O, temporary files, module loading all handled transparently
+    # by PlatformManager
+    ...
+```
 
 ---
 
@@ -593,34 +762,110 @@ Outputs saved to configured output directory (default: `analysis_outputs/`):
 
 PRESTOS is designed for easy extension. Add new models by subclassing base classes and registering them.
 
+### Project Structure
+
+PRESTOS uses a modular package-based architecture:
+
+```
+src/
+├── __init__.py              # Main module exports and factory functions
+├── analysis.py              # Plotting and analysis tools
+├── boundary.py              # Boundary condition models
+├── evaluation_log.py         # Transport evaluation caching (SQLite database)
+├── interfaces.py            # Interfaces to external codes (GACODE, etc.)
+├── neutrals.py              # Neutral transport models
+├── parameterizations.py     # Profile parameterization models (Spline, Gaussian, etc.)
+├── state.py                 # PlasmaState: container for plasma quantities
+├── targets.py               # Target models (Analytic, etc.)
+├── workflow.py              # Main execution script
+│
+├── solvers/                 # Optimization solvers package
+│   ├── __init__.py          # Solver factory and exports
+│   ├── solver_base.py       # Base class: SolverBase
+│   ├── relax.py             # RelaxSolver: relaxation-based optimization
+│   ├── bayesian_opt.py      # BayesianOptSolver: Bayesian optimization
+│   ├── ivp.py               # IvpSolver: pseudo-time integration via ODE
+│   ├── objectives.py        # Objective function definitions
+│   ├── jacobian.py          # Jacobian computation utilities
+│   ├── uncertainty.py       # Uncertainty quantification methods
+│   ├── solver_data.py       # SolverData: output container
+│   └── factory.py           # Solver creation factory
+│
+├── surrogates/              # Surrogate modeling package
+│   ├── __init__.py          # Surrogate factory and exports
+│   ├── base.py              # Base class: SurrogateBase
+│   ├── gaussian_process.py  # GaussianProcess: Gaussian process surrogate
+│   ├── manager.py           # SurrogateManager: lifecycle management
+│   └── registry.py          # Model registry
+│
+├── transport/               # Transport models package (modular, extensible)
+│   ├── __init__.py          # Transport factory and exports
+│   ├── TransportBase.py     # Base class: TransportBase
+│   ├── Fingerprints.py      # Fingerprints: critical-gradient model
+│   ├── Cgyro.py             # CGYRO: gyrokinetic solver interface
+│   ├── Tglf.py              # TGLF: turbulent transport interface
+│   ├── Qlgyro.py            # QLGYRO: quasi-linear interface
+│   ├── Fixed.py             # Fixed: constant diffusivity for testing
+│   ├── Analytic.py          # Analytic: simple analytical model
+│   └── utils.py             # Shared utilities
+│
+└── tools/                   # Utility modules
+    ├── __init__.py
+    ├── io.py                # File I/O and profile utilities
+    ├── plasma.py            # Plasma physics utilities
+    └── gacode_controls/     # GACODE control file templates
+```
+
+**Key design patterns:**
+
+- **Factory pattern**: `create_*()` functions in module `__init__.py` load classes dynamically from `run_config.yaml`
+- **Base classes**: All models inherit from `TransportBase`, `SolverBase`, `SurrogateBase`, etc.
+- **Registration**: Models registered in module dictionaries (e.g., `TRANSPORT_MODELS`, `SOLVER_MODELS`)
+- **Configuration-driven**: All module options passed through `args` dict in `run_config.yaml`
+
 ### Adding a new transport model
 
-1. Create a new class in `transport.py` inheriting from `TransportBase`:
+1. Create a new file in `src/transport/` (e.g., `MyModel.py`) with a class inheriting from `TransportBase`:
 
 ```python
-class MyTransportModel(TransportBase):
+# File: src/transport/MyModel.py
+from .TransportBase import TransportBase
+import numpy as np
+from typing import Tuple, Dict
+
+class MyModel(TransportBase):
     def __init__(self, options: dict):
         super().__init__(options)
         self.my_param = options.get('my_param', 1.0)
     
     def evaluate(self, state) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+        """Compute transport fluxes from plasma state.
+        
+        Returns:
+            output_dict: Dict of predicted fluxes (Qe, Qi, Ge, etc.)
+            std_dict: Dict of uncertainties (same keys as output_dict)
+        """
         # Compute fluxes from state
         Qe = ...  # electron heat flux
         Qi = ...  # ion heat flux
         Ge = ...  # particle flux
         
         # Return predictions and uncertainties
-        output_dict = {'Qe': Qe, 'Qi': Qi, 'Ge': Ge, ...}
+        output_dict = {'Qe': Qe, 'Qi': Qi, 'Ge': Ge}
         std_dict = {k: self.sigma * np.abs(v) for k, v in output_dict.items()}
         return output_dict, std_dict
 ```
 
-2. Register in `TRANSPORT_MODELS` dict:
+2. Register in `src/transport/__init__.py`:
 
 ```python
+from .MyModel import MyModel
+
 TRANSPORT_MODELS = {
-    'fingerprints': FingerprintsModel,
-    'my_model': MyTransportModel,
+    'fingerprints': Fingerprints,
+    'my_model': MyModel,  # Add here
+    'cgyro': Cgyro,
+    # ... other models
 }
 ```
 
@@ -628,34 +873,47 @@ TRANSPORT_MODELS = {
 
 ```yaml
 transport:
-  class: transport.MyTransportModel
+  class: transport.MyModel
   args:
     my_param: 2.0
 ```
 
 ### Adding a new solver
 
-1. Create a new class in `solvers.py` inheriting from `SolverBase`:
+1. Create a new file in `src/solvers/` (e.g., `my_solver.py`) with a class inheriting from `SolverBase`:
 
 ```python
+# File: src/solvers/my_solver.py
+from .solver_base import SolverBase
+from .solver_data import SolverData
+import numpy as np
+
 class MySolver(SolverBase):
     def __init__(self, options=None):
         super().__init__(options)
         self.my_option = self.options.get('my_option', 'default')
     
-    def propose_parameters(self, state, surrogate=None) -> Dict[str, Dict[str, float]]:
-        # Implement parameter update logic
+    def propose_parameters(self, state, surrogate=None) -> dict:
+        """Propose new parameter values based on current residuals.
+        
+        Returns:
+            Dict of updated parameters with same structure as self.X
+        """
         X_new = self.X.copy()  # Start from current parameters
         # ... modify X_new based on residuals, Jacobian, etc.
         return self._project_bounds(X_new)
 ```
 
-2. Register in `SOLVER_MODELS` dict:
+2. Register in `src/solvers/__init__.py`:
 
 ```python
+from .my_solver import MySolver
+
 SOLVER_MODELS = {
     'relax': RelaxSolver,
-    'my_solver': MySolver,
+    'bayesian_opt': BayesianOptSolver,
+    'ivp': IvpSolver,
+    'my_solver': MySolver,  # Add here
 }
 ```
 

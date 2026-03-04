@@ -16,31 +16,35 @@ from .interfaces import gacode
 from .state import PlasmaState
 from .parameterizations import (
     create_parameter_model,
-    ParameterModel,
-    SplineParameterModel,
-    MTanhParameterModel,
-    GaussianRBFParameterModel,
+    ParameterBase,
+    Spline,
+    Mtanh,
+    Gaussian,
 )
 
 # Transport and targets
 from .transport import (
     create_transport_model,
     TransportBase,
-    TransportModel,
-    FingerprintsModel,
-    FixedTransport,
+    Fingerprints,
+    CH_fingerprints,
+    Cgyro,
+    Tglf,
+    Qlgyro,
+    Fixed,
+    Analytic,
 )
 from .targets import (
     TargetModel,
-    AnalyticTargetModel,
+    Analytic,
     create_target_model,
 )
 
 # Neutrals
 from .neutrals import (
     NeutralModel,
-    KineticNeutralModel,
-    DiffusiveNeutralModel,
+    Kinetic,
+    Diffusive,
 )
 
 # Solvers and surrogates
@@ -48,16 +52,16 @@ from .solvers import (
     create_solver,
     SolverBase,
     RelaxSolver,
-    FiniteDifferenceSolver,
     BayesianOptSolver,
-    IVPSolver,
+    IvpSolver,
     ObjectiveFunction,
 )
 from .surrogates import (
     SurrogateManager,
+    SurrogateBase,
     create_surrogate_model,
+    GaussianProcess,
     GaussianProcessSurrogate,
-    NeuralNetSurrogate,
 )
 
 from .analysis import *
@@ -72,16 +76,16 @@ __all__ = [
     'gacode',
     # state & params
     'PlasmaState',
-    'create_parameter_model', 'ParameterModel', 'SplineParameterModel', 'MTanhParameterModel', 'GaussianRBFParameterModel',
+    'create_parameter_model', 'ParameterBase', 'Spline', 'Mtanh', 'Gaussian',
     # transport & targets
-    'create_transport_model', 'TransportBase', 'TransportModel', 'FingerprintsModel', 'FixedTransport',
-    'TargetModel', 'AnalyticTargetModel', 'create_target_model',
+    'create_transport_model', 'TransportBase', 'Fingerprints', 'CH_fingerprints', 'Cgyro', 'Tglf', 'Qlgyro', 'Fixed', 'Analytic',
+    'TargetModel', 'Analytic', 'create_target_model',
     # neutrals
-    'NeutralModel', 'KineticNeutralModel', 'DiffusiveNeutralModel',
+    'NeutralModel', 'Kinetic', 'Diffusive',
     # solvers
-    'create_solver', 'SolverBase', 'RelaxSolver', 'FiniteDifferenceSolver', 'BayesianOptSolver', 'IVPSolver', 'ObjectiveFunction',
+    'create_solver', 'SolverBase', 'RelaxSolver', 'BayesianOptSolver', 'IvpSolver', 'ObjectiveFunction',
     # surrogates
-    'SurrogateManager', 'create_surrogate_model', 'GaussianProcessSurrogate', 'NeuralNetSurrogate',
+    'SurrogateManager', 'SurrogateBase', 'create_surrogate_model', 'GaussianProcess', 'GaussianProcessSurrogate',
     # tools package
     'tools',
 ]

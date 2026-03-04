@@ -26,7 +26,7 @@ FIELD_PRINT_FLAG=1
 #VELOCITY_ORDER=2
 
 #Toroidal modes per processor
-#TOROIDALS_PER_PROC=1
+TOROIDALS_PER_PROC=1
 
 #===================================
 #Numerical Resolutions and Box Setup
@@ -92,6 +92,9 @@ MAX_TIME=100 #900
 
 #Frequency Tolerance
 FREQ_TOL=0.001
+
+#ERROR_TOLERANCE
+ERROR_TOL=1e-4
 
 #Number of data outputs before saving a cold_start (DELTA_T*PRINT_STEP is one data output)
 RESTART_STEP=10

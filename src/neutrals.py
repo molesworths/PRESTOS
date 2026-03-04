@@ -20,6 +20,7 @@ class NeutralModel:
     """Base class for neutral models."""
     
     def __init__(self, options: dict):
+        self.verbose = options.get("verbose", False)
         n0_edge = options.get("n0_edge", None)  # [1e19 m^-3]
         if isinstance(n0_edge, (list, np.ndarray)):
             self.n0_edge = np.asarray(n0_edge, dtype=float)  # Default to 1e19 m^-3 if not provided

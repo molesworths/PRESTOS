@@ -16,6 +16,7 @@ class BoundaryConditions:
 
     def __init__(self, options, **kwargs):
         self.sigma = options.get('sigma_bc', 0.0)
+        self.verbose = options.get('verbose', False)
 
 
     def get_boundary_conditions(self,state,targets):
@@ -348,13 +349,19 @@ class Tftp_SepOS(BoundaryConditions):
         R0 = self.R0
         Lpar = self.Lpar
         a = self.a
+        rho_s_pol = rho_s * (self.BT/self.Bp) # poloidal Larmor radius
 
         # Eich-Manz SepOS scaling
-        # TODO Double check these and the alpha_t definition in PlasmaState
         aLne = a*max(0.0, 1.0 / (2.9 * (1 + 10.4 * self.alpha_t**2.5) *
-                                   self.rhostar * self.BT / self.Bp))
+                                   rho_s_pol))
         aLte = a*max(0.0, 1.0 / (2.1 * (1 + 2.1 * self.alpha_t**1.7) *
-                                   self.rhostar * self.BT / self.Bp))
+                                   rho_s_pol))
+        
+        # Try later
+        # aLne = a*max(0.0, 1.0 / ((1 + 10 * self.alpha_t**2) *
+        #                     rho_s_pol))
+        # aLte = a*max(0.0, 1.0 / ((1 + self.alpha_t**2) *
+        #                            rho_s_pol))
         
         lambda_q = (2/7)*self.te*1e-3*gamma**0.5/(gamma**0.5-1)*aLte*self.a
 
@@ -474,12 +481,13 @@ class Tftp_SepOS(BoundaryConditions):
         # Final calculation of scale lengths (note: solve_peret_SSF reads from state)
         _, self.aLne, self.aLTe, _, _, _ = self.solve_peret_SSF()
         self.aLTi = (self.te/self.ti)*self.aLTe  # TODO: implement proper ion scale length
+        self.aLni = (self.ne/self.ni)*self.aLne
 
         # Store results. (value, location in roa or rho)
         self.bc_dict = {y: [val, 1] for y, val in zip(
             ['ne', 'te', 'ti', 'ni'], [self.ne*1e-19, self.te*1e-3, self.ti*1e-3, self.ni*1e-19])}
         self.bc_dict.update({aLy: [aLy_val, 1] for aLy, aLy_val in zip(
-            ['aLne', 'aLte', 'aLti', 'aLni'], [self.aLne, self.aLTe, self.aLTi, self.aLne])})
+            ['aLne', 'aLte', 'aLti', 'aLni'], [self.aLne, self.aLTe, self.aLTi, self.aLni])})
         self.converged = converged
 
 

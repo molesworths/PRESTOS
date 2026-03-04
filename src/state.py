@@ -14,7 +14,7 @@ from dataclasses import dataclass, field, asdict
 from typing import Dict, Any, Union, Optional
 import copy
 from tools import plasma, calc, geometry, io
-from interfaces import gacode 
+from interfaces import gacode
 from scipy.constants import m_p, m_e, e, k, c, mu_0, u, pi, epsilon_0
 from scipy.interpolate import Akima1DInterpolator as akima
 try:
@@ -129,9 +129,9 @@ class PlasmaState:
             self.metadata['gacode_mapping']['ni(10^19/m^3)'] = 'ni_full'
 
             # Charge-state distributions (from Aurora atomic physics)
-            self.nZ = None   # (n_radial, n_species, max(n_charge)+1) densities [1e19/m^3]
-            self.fZ = None  # (n_radial, n_species, n_charge+1) fractional abundances
-            self.Kn = None  # (n_radial, n_species) Knudsen numbers [dimensionless]
+            #self.nZ = None   # (n_radial, n_species, max(n_charge)+1) densities [1e19/m^3]
+            #self.fZ = None  # (n_radial, n_species, n_charge+1) fractional abundances
+            #self.Kn = None  # (n_radial, n_species) Knudsen numbers [dimensionless]
 
             self.r = self.rmin
             self.a = self.r[-1]
@@ -148,7 +148,7 @@ class PlasmaState:
             self.B_p = self.R**(-1)*np.gradient(self.polflux,self.r) #(self.r * self.B_T) / (self.q * self.R) # T
             self.B = np.sqrt(self.B_T**2 + self.B_p**2) # T
             self.kappa_hat = np.sqrt((1 + self.kappa**2)/2)
-            self.q_cyl = self.kappa_hat*self.B_T/np.maximum(self.aspect_ratio*np.maximum(self.B_p, 1e-30), 1e-30)
+            self.q_cyl = self.kappa_hat*self.B_T/np.maximum(self.aspect_ratio*np.abs(self.B_p), 1e-30)
 
             # --- Compute species and shaping info ---
             self._read_species(gacode_obj=gacode_obj)
@@ -208,12 +208,14 @@ class PlasmaState:
         if neutrals_active:
             neutrals.solve(self)
 
+        self.f_imp = 1.0 - self.ni / np.maximum(self.ne, 1e-30)
         self.Zeff = plasma.get_Zeff(self.ne, self.ni_full, self.species)
 
         # --- Basic physical constants and derived scalings ---
         self.c_s = plasma.c_s(self.te, self.mi_ref)
         self.rho_s = plasma.rho_s(self.te, getattr(self, "mi_ref", 2.0), self.B)
         self.vth = plasma.vthermal(self.ti, self.mi_ref)
+        self.vthe = plasma.vthermal(self.te,self.mi_ref,'electron')
         self.q_gb, self.g_gb, *_ = plasma.gyrobohm_units(
             self.te,
             self.ne * 1e-1,  # convert 10^19/m^3 -> 10^20/m^3
@@ -237,10 +239,12 @@ class PlasmaState:
         self.kappa95 = np.interp(0.95, self.rho, self.kappa) if self.kappa is not None else np.nan
         self.delta95 = np.interp(0.95, self.rho, self.delta) if self.delta is not None else np.nan
         self.alphat = (1. + self.ti / self.te) * self.alphat_norm * self.ne / self.te**2
+        #self.omega_star_i,self.omega_star_e = plasma.drift_frequencies
         # Collision frequencies, nuee ~ nuei >> nuii >> nuie
         self.nuii = 4.8e-8 * self.Zeff**4 * self.ni*1e13 * self.LogLam / (np.sqrt(self.mi_over_mp) * (self.ti*1e3)**1.5)
         self.nuei = 2.91e-6 * self.ne*(self.n_norm*1e-6) * self.LogLam / ( (self.te*1e3)**1.5 ) # ~ nu_ee
         self.nuexch = (self.Z_ref/self.mi_over_me)*self.nuei # ~nu_ie
+        self.nu_eff = self.nuei * self.R / self.vthe / self.eps**1.5
         # Trapping fraction
         self.f_trap = 1.45 * np.sqrt(self.eps)
 
@@ -269,7 +273,7 @@ class PlasmaState:
         self.xnue = plasma.xnue(self.te, self.ne*0.1, self.a, mref_u=self.mi_ref)
         self.debye = plasma.debye(self.te, self.ne*0.1,self.mi_ref,self.B)
         
-        self.alpha = -self.R * self.q**2 * np.gradient(self.betae,self.r)   
+        self.alpha = (-2*self.R*self.q**2/self.B**2)*np.gradient(self.pe,self.r) #-self.R * self.q**2 * np.gradient(self.betae,self.r)   
         self.pprime = plasma.p_prime(self.te, self.ne, self.aLte, self.aLne, 
                                      self.ti, self.ni_full, self.aLti, self.aLni, self.a, self.B_unit, self.q, self.r)
         self.drmindr = np.gradient(self.r,self.r)

@@ -26,6 +26,7 @@ solver_checkpoint.pkl
 solver_history.csv
 analysis_outputs/
 *.gacode.backup
+misc/*
 
 # Testing
 .pytest_cache/

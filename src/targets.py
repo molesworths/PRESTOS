@@ -31,6 +31,7 @@ class TargetModel:
     - Returns results for single state or list of results for batched states
     """
     def __init__(self, **kwargs):
+        self.verbose = kwargs.get('verbose', False)
 
         class TargetsObj:
             pass

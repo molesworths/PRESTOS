@@ -1,22 +1,30 @@
 # Where to store files
 work_dir: ~/git/PRESTOS/example/
 
+# Full print outs or not
+verbose: False
+
+# Restart from checkpoint (path to directory containing solver_checkpoint.pkl)
+restart: None
+
 # Platform configuration (environment + execution)
-platform:
+platform: 
   name: local
-  gacode_root: /home/smolesworth/git/gacode
+  args: {
+    mpi_tasks: 1,
+    threads_per_task: 2
+  }
 
 # Initial plasma state: point to a GACODE profiles file
 state:
   args:
-    from_gacode: ~/git/PRESTOS/example/input.gacode
+    from_gacode: ~/git/PRESTOS/example/input.gacode # _H_HighColl_179449_1500
 
 boundary:
   class: boundary.FixedInitial
   args:
     sigma: 0.1
     
-
 # Parameter model (optional in current solver flow)
 parameters:
   class: parameterizations.Spline
@@ -34,18 +42,18 @@ neutrals:
     n0_edge: None #[1e-2,1e-8] # 1e19/m^3
 
 transport:
-  class: transport.Fingerprints
+  class: transport.CH_fingerprints
   args:
     modes: all
-    n_parallel: 4
-    n_threads: 4 # per parallel task
     sigma: 0.1 # relative uncertainty on transport model, 1 sigma
-    ExB_source: state
+    exb_on: True
+    exb_source: state
+    exb_scale: 1
     neoclassical_model: analytic
     # Evaluation logging for surrogate warm-start and cross-user sharing
-    log_evaluations: False  # Enable automatic logging of all evaluations
+    log_evaluations: True  # Enable automatic logging of all evaluations
     evaluation_log:
-      enabled: False
+      enabled: True
       # path: ./logs/transport_evaluations.db  # Local database (default)
       # path: /shared/prestos/transport_eval.db  # Shared network database
       # If not specified, uses environment variable PRESTOS_EVAL_LOG or default
@@ -57,8 +65,24 @@ transport:
     TGLF_options:
       keep_files: minimal
       settings: {
-        SAT_RULE: 3,
+        SAT_RULE: 2,
+        UNITS: CGYRO,
         USE_BPER: True,
+        # RLNP_CUTOFF: 100, # try at 10 too
+        # NBASIS_MIN: 4,
+        # NBASIS_MAX: 8,         
+        # NWIDTH: 40,
+        # WIDTH: 3.,
+        # WIDTH_MIN: 0.2,
+        # NXGRID: 24,
+        # NKY: 40,
+        # KY: 0.05,
+        # KYGRID_MODEL: 1, # try with 4
+        # FILTER: 1.0,
+        # USE_INBOARD_DETRAPPED: True,
+        # WD_ZERO: 0.01,
+        # DAMP_PSI: 0.1,
+        # DAMP_SIG: 0.1,
         }
       multipliers: {}
     QLGYRO_options: 
@@ -69,9 +93,26 @@ transport:
     CGYRO_options:
       keep_files: minimal
       settings: {
-        NONLINEAR_FLAG: 0
+        NONLINEAR_FLAG: 1,
+        UP_THETA: 1.25,
+        UP_RADIAL: 1.25,
+        UP_ALPHA: 1.25,
+        ERROR_TOL: 5E-4,
+        FREQ_TOL: 5E-2,
+        DELTA_T_METHOD: 1,
+        #DELTA_T: 0.01,
+        KY: 0.05,
+        N_TOROIDAL: 24,
+        BOX_SIZE: 4,
+        TOROIDALS_PER_PROC: 6,
         }
+      linear_ky_scan: {
+        min: 0.1,
+        max: 2.0,
+        n: 20
+      }
       multipliers: {}
+
 
 targets:
   class: targets.Analytic
@@ -83,12 +124,12 @@ targets:
     sigma: 0.1 # relative uncertainty on targets, 1 sigma
 
 solver:
-  class: solvers.IvpSolver
+  class: solvers.RelaxSolver
   args:
     # map your predicted profiles to target variables from transport/targets
     predicted_profiles: [ne, te, ti]
     target_vars: [Ce, Pe, Pi]
-    roa_eval: [0.88, 0.91, 0.94, 0.97]
+    roa_eval:  [0.88, 0.91, 0.94, 0.97]
     domain: [0.88, 1.0]
     tol: 1e-4
     model_iter_to_stall: 100
@@ -96,7 +137,7 @@ solver:
     use_surrogate: False
     surrogate_warmup: 5
     surrogate_retrain_every: 5
-    use_jacobian: True
+    use_jacobian: False
     objective: mse
     normalize_residual: True # normalizes ith component by abs(target[i])
     residual_weights:
@@ -104,9 +145,9 @@ solver:
       boundary_conditions: 0.0
       constraints: 0.0
     scale_objective: True # divides total by N_channels
-    step_size: 0.01
+    step_size: 0.1
     adaptive_step: True
-    bounds:  [0.01,100] # [[0,200],[0,5],[0.9,1.0],[0.01,1.0]] # [[1.01,2], [0,10], [0.9,1.1]] # 
+    bounds:  [0.0,1000] # [[0,200],[0,5],[0.9,1.0],[0.01,1.0]] # [[1.01,2], [0,10], [0.9,1.1]] # 
     # [[0,10],[0,15],[0,25],[0,50],[0,100]]  # [0,100] #
 
         # two element list applied to all parameters or list of n_parameters tuples
@@ -139,18 +180,17 @@ surrogate:
     mode: global
     kwargs:
       ard: False
-      #scaling: standard
 
     
     # Warm-start configuration (if enabled):
-    # warm_start_model_class: transport.Tglf  # Required: which model to query
-    
-    # warm_start_model_settings: {}  # Optional: filter on specific settings
+    #warm_start_model_class: transport.Tglf  # Required: which model to query
+    #warm_start_model_settings: {
+    #  SAT_RULE: 0}  # Optional: filter on specific settings
     # Examples of flexible settings filtering:
     #   {}                           # Match ANY settings (most data)
     #   {SAT_RULE: 3}               # Only SAT_RULE=3 (other settings any)
     #   {SAT_RULE: [2, 3]}          # SAT_RULE is 2 OR 3
     #   {SAT_RULE: 3, USE_BPER: True}  # Both must match
     
-    # warm_start_max_entries: 5000  # Max evaluations to load from log
-    # evaluation_log_path: ./logs/transport_evaluations.db  # Override default
+    #warm_start_max_entries: 5000  # Max evaluations to load from log
+    #evaluation_log_path: ./logs/transport_evaluations.db  # Override default

@@ -11,7 +11,7 @@ NN_MAX_ERROR            = -1.0       # Threshold for TGLF-NN execution versus fu
 
 # ~~~ Saturation model
 SAT_RULE                = 0
-UNITS                   = GYRO 
+UNITS                   = CGYRO 
 ETG_FACTOR              = 1.25
 
 # ~~~ Physics included

@@ -9,10 +9,17 @@ from pathlib import Path
 
 # Local imports for state construction
 from interfaces import gacode
+from tools.platforms import resolve_platform_config
 from state import PlasmaState
 
 def load_class(path: str):
     """Dynamically import class given 'Module.ClassName' string."""
+    legacy_map = {
+        "surrogates.GaussianProcessModel": "surrogates.GaussianProcess",
+        "surrogates.GaussianProcessSurrogate": "surrogates.GaussianProcess",
+    }
+    if path in legacy_map:
+        path = legacy_map[path]
     module_name, class_name = path.rsplit('.', 1)
     module = importlib.import_module(module_name)
     return getattr(module, class_name)
@@ -30,6 +37,22 @@ def build_module(config_entry: Dict[str, Any]):
     cls = load_class(class_path)
     args = config_entry.get("args", {})
     return cls(args)
+
+
+def _inject_verbose(config_entry: Optional[Dict[str, Any]], verbose: bool) -> Optional[Dict[str, Any]]:
+    """Inject verbose flag into module config args."""
+    if not config_entry:
+        return config_entry
+    if not isinstance(config_entry, dict):
+        return config_entry
+    
+    # Make a shallow copy to avoid modifying the original
+    cfg = dict(config_entry)
+    if "args" not in cfg:
+        cfg["args"] = {}
+    cfg["args"]["verbose"] = verbose
+    return cfg
+
 
 
 def build_state(config_entry: Dict[str, Any]):
@@ -91,7 +114,7 @@ def load_checkpoint(checkpoint_path: str) -> Dict[str, Any]:
     return module_specs
 
 
-def restore_module_from_checkpoint(module_name: str, module_specs: Dict[str, Any], 
+def restore_module_from_checkpoint(module_name: str, module_specs: Dict[str, Any],
                                    new_config: Optional[Dict[str, Any]] = None) -> Any:
     """Restore a module from checkpoint specifications.
     
@@ -116,6 +139,12 @@ def restore_module_from_checkpoint(module_name: str, module_specs: Dict[str, Any
     class_path = spec.get("class_path")
     if not class_path:
         return None
+
+    # If a new config explicitly overrides the class, honor it.
+    if new_config is not None:
+        override_class = new_config.get("class")
+        if override_class:
+            class_path = override_class
     
     # Reconstruct the module by instantiating its class
     cls = load_class(class_path)
@@ -145,28 +174,30 @@ def restore_module_from_checkpoint(module_name: str, module_specs: Dict[str, Any
     return module
 
 
-def run_workflow(setup_file="setup.yaml", restart_dir: Optional[str] = None):
+def run_workflow(setup_file="setup.yaml"):
     """Run the solver workflow with optional restart from checkpoint.
     
     Parameters
     ----------
     setup_file : str
         Path to run configuration YAML file
-    restart_dir : str, optional
-        Path to directory containing solver_checkpoint.pkl for restart.
-        If provided, modules will be loaded from checkpoint and updated
-        with new run_config parameters.
+    Restart configuration is read from the run_config file:
+        restart: null
+        restart: /path/to/restart_dir
+    If provided, modules will be loaded from checkpoint and updated
+    with new run_config parameters.
     """
+    print(f"Using setup file: {setup_file}")
     with open(setup_file) as f:
         config = yaml.safe_load(f)
 
+    # Extract verbose flag from top-level config
+    verbose = config.get("verbose", False)
+
     # Apply platform environment (e.g., GACODE_ROOT)
-    platform_cfg = config.get("platform", {}) if isinstance(config, dict) else {}
-    if isinstance(platform_cfg, dict):
-        platform_gacode_root = platform_cfg.get("gacode_root")
-        if platform_gacode_root:
-            platform_gacode_root = os.path.expanduser(os.path.expandvars(str(platform_gacode_root)))
-            os.environ["GACODE_ROOT"] = platform_gacode_root
+    platform_cfg = resolve_platform_config(config.get("platform", {})) if isinstance(config, dict) else {}
+    if platform_cfg:
+        config["platform"] = platform_cfg
 
     # Set working directory if specified
     work_dir = config.get("work_dir")
@@ -178,6 +209,7 @@ def run_workflow(setup_file="setup.yaml", restart_dir: Optional[str] = None):
 
     # Handle restart from checkpoint
     module_specs = None
+    restart_dir = config.get("restart")
     if restart_dir:
         restart_path = os.path.expanduser(os.path.expandvars(str(restart_dir)))
         checkpoint_file = os.path.join(restart_path, "solver_checkpoint.pkl")
@@ -204,34 +236,42 @@ def run_workflow(setup_file="setup.yaml", restart_dir: Optional[str] = None):
         
         # Restore other modules with new configurations from run_config
         params_cfg = config.get("parameters") or config.get("parameterization")
-        parameters = restore_module_from_checkpoint("parameters", module_specs, params_cfg)
+        parameters = restore_module_from_checkpoint("parameters", module_specs, _inject_verbose(params_cfg, verbose))
         if parameters is None and params_cfg:
-            parameters = build_module(params_cfg)
+            parameters = build_module(_inject_verbose(params_cfg, verbose))
         
-        neutrals = restore_module_from_checkpoint("neutrals", module_specs, config.get("neutrals", {}))
+        neutrals = restore_module_from_checkpoint("neutrals", module_specs, _inject_verbose(config.get("neutrals", {}), verbose))
         if neutrals is None:
-            neutrals = build_module(config.get("neutrals", {}))
+            neutrals = build_module(_inject_verbose(config.get("neutrals", {}), verbose))
         
         transport_cfg = config.get("transport", {})
         if transport_cfg and "args" in transport_cfg:
             transport_cfg["args"]["work_dir"] = work_dir or config.get("work_dir", ".")
-        transport = restore_module_from_checkpoint("transport", module_specs, transport_cfg)
+            # Pass platform config to transport so model execution can run on remote platform
+            if "platform" in config:
+                transport_cfg["args"]["platform"] = config["platform"]
+        transport = restore_module_from_checkpoint("transport", module_specs, _inject_verbose(transport_cfg, verbose))
         if transport is None:
-            transport = build_module(transport_cfg)
+            transport = build_module(_inject_verbose(transport_cfg, verbose))
+        if transport is not None:
+            print(
+                "Transport model initialized: "
+                f"{transport.__class__.__module__}.{transport.__class__.__name__}"
+            )
         
         targets_cfg = config.get("targets", {})
-        targets = restore_module_from_checkpoint("targets", module_specs, targets_cfg)
+        targets = restore_module_from_checkpoint("targets", module_specs, _inject_verbose(targets_cfg, verbose))
         if targets is None:
-            targets = build_module(targets_cfg)
+            targets = build_module(_inject_verbose(targets_cfg, verbose))
         
         # Apply scaling factors to state for parameter scans
         # This must happen at initialization and be held constant
         if targets and hasattr(targets, 'targets') and hasattr(targets.targets, 'options'):
             _apply_target_scaling_to_state(state, targets.targets.options)
         
-        surrogate = restore_module_from_checkpoint("surrogate", module_specs, config.get("surrogate", {}))
+        surrogate = restore_module_from_checkpoint("surrogate", module_specs, _inject_verbose(config.get("surrogate", {}), verbose))
         if surrogate is None:
-            surrogate = build_module(config.get("surrogate", {}))
+            surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose))
     else:
         # Fresh run: build all modules from config
         # Build state first (supports from_gacode path)
@@ -239,26 +279,34 @@ def run_workflow(setup_file="setup.yaml", restart_dir: Optional[str] = None):
 
         # Parameters: accept either 'parameters' or legacy 'parameterization'
         params_cfg = config.get("parameters") or config.get("parameterization")
-        parameters = build_module(params_cfg) if params_cfg else None
+        parameters = build_module(_inject_verbose(params_cfg, verbose)) if params_cfg else None
         
         # Other components
-        neutrals = build_module(config.get("neutrals", {}))
+        neutrals = build_module(_inject_verbose(config.get("neutrals", {}), verbose))
         
-        # Inject work_dir into transport module
+        # Inject work_dir and platform config into transport module
         transport_cfg = config.get("transport", {})
         if transport_cfg and "args" in transport_cfg:
             transport_cfg["args"]["work_dir"] = work_dir or config.get("work_dir", ".")
-        transport = build_module(transport_cfg)
+            # Pass platform config to transport so model execution can run on remote platform
+            if "platform" in config:
+                transport_cfg["args"]["platform"] = config["platform"]
+        transport = build_module(_inject_verbose(transport_cfg, verbose))
+        if transport is not None:
+            print(
+                "Transport model initialized: "
+                f"{transport.__class__.__module__}.{transport.__class__.__name__}"
+            )
         
         targets_cfg = config.get("targets", {})
-        targets = build_module(targets_cfg)
+        targets = build_module(_inject_verbose(targets_cfg, verbose))
         
         # Apply scaling factors to state for parameter scans
         # This must happen at initialization and be held constant
         if targets and hasattr(targets, 'targets') and hasattr(targets.targets, 'options'):
             _apply_target_scaling_to_state(state, targets.targets.options)
         
-        surrogate = build_module(config.get("surrogate", {}))
+        surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose))
     
     # Update solver config with parameter count
     if parameters:
@@ -267,8 +315,8 @@ def run_workflow(setup_file="setup.yaml", restart_dir: Optional[str] = None):
     if parameters:
         config["solver"]["args"]["n_params_per_profile"] = parameters.n_params_per_profile
     
-    solver = build_module(config.get("solver", {}))
-    boundary = build_module(config.get("boundary", {}))
+    solver = build_module(_inject_verbose(config.get("solver", {}), verbose))
+    boundary = build_module(_inject_verbose(config.get("boundary", {}), verbose))
 
     # Now execute workflow logic
     solver.run(state, boundary, parameters, neutrals, transport, targets, surrogate=surrogate)
@@ -362,8 +410,6 @@ def main(argv: list[str] | None = None):
     parser = argparse.ArgumentParser(description="Run MinT workflow")
     parser.add_argument("setup", nargs="?", default="setup.yaml", help="Path to setup YAML file")
     parser.add_argument("--setup", "-s", dest="setup_opt", help="Path to setup YAML file (alias)")
-    parser.add_argument("--restart", "-r", dest="restart_dir", 
-                       help="Path to restart directory containing solver_checkpoint.pkl")
     args = parser.parse_args(argv)
 
     setup_path = args.setup_opt or args.setup
@@ -375,7 +421,7 @@ def main(argv: list[str] | None = None):
         print(f"Error: setup file not found: {setup_path}")
         sys.exit(2)
 
-    run_workflow(setup_path, restart_dir=args.restart_dir)
+    run_workflow(setup_path)
     # try:
     #     run_workflow(setup_path)
     # except Exception as e:

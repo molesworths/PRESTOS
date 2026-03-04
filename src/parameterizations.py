@@ -62,6 +62,7 @@ class ParameterBase:
     """
 
     def __init__(self, options: Dict[str, Any]):
+        self.verbose = options.get('verbose', False)
         self.predicted_profiles = options.get('predicted_profiles', [])
         self.coord = options.get('coord', 'roa').lower()
         self.include_zero_grad_on_axis = options.get('include_zero_grad_on_axis', True)

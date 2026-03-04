@@ -1,0 +1,26 @@
+local:
+  machine: local
+  mpi_tasks: 4
+  threads_per_task: 4 # OpenMP threads per MPI task
+  n_gpus: 0
+  n_ram_gb: 8 
+  scratch: ~/scratch
+
+omega:
+  machine: omega.gat.com
+  username: molesworths
+  # ssh_identity: ~/.ssh/id_rsa
+  ssh_tunnel: cybele.gat.com
+  ssh_tunnel_port: 2039  # Jump host port
+  # ssh_port: 22           # Target SSH port
+  scratch: /cscratch/molesworths/
+  mpi_tasks: 4
+  threads_per_task: 4 # OpenMP threads per MPI task
+  n_gpus: 0
+  n_ram_gb: 16  
+  # modules: [] # list form
+  scheduler: slurm
+  slurm: {
+     account: ,
+     partition: short,
+  }
