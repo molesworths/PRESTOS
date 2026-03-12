@@ -36,7 +36,11 @@ class Fingerprints(TransportBase):
         gamma_ExB = np.maximum(np.absolute(gamma_ExB), 0.0)
 
         if self.modes == "neo" or self.modes == "all":
-            Gamma_neo, Qi_neo, Qe_neo = self._compute_neoclassical(state)
+            Ge_neo_gB, Qi_neo_gB, Qe_neo_gB = self._compute_neoclassical(state)
+        else:
+            Ge_neo_gB = np.zeros_like(self.x)
+            Qi_neo_gB = np.zeros_like(self.x)
+            Qe_neo_gB = np.zeros_like(self.x)
 
         RLTi_crit = np.maximum(
             (4.0 / 3.0) * (1.0 + self.Ti / self.Te),
@@ -57,13 +61,13 @@ class Fingerprints(TransportBase):
 
         gamma_eff = np.maximum(gamma_ITG - abs(gamma_ExB), 0.0)
         I_ITG = (gamma_eff / ky_ITG**2) ** 2
-        chi_ITG = I_ITG * (self.Ti**1.5)
+        chi_ITG = I_ITG
         Gamma_ITG = 0.1 * self.f_trap * chi_ITG * (-self.dne_dx - 0.25 * self.ne * self.aLTe / self.a)
         Qi_ITG = -self.ne * chi_ITG * self.dTi_dx + 1.5 * self.Ti * Gamma_ITG
         Qe_ITG = -self.ne * self.f_trap * chi_ITG * self.dTe_dx + 1.5 * self.Te * Gamma_ITG
 
         z_ETG = np.maximum(self.aLTe - RLTe_crit / self.aspect_ratio, 0.0) / np.maximum(self.aLne, 1e-12)
-        chi_ETG = (1.0 / 60.0) * 1.5 * (self.Te**1.5) * self.aLTe * z_ETG
+        chi_ETG = (1.0 / 60.0) * self.aLTe * z_ETG #  * 1.5 * (self.Te**1.5)
         Qe_ETG = -self.ne * chi_ETG * self.dTe_dx
 
         ky_KBM = 0.1
@@ -77,39 +81,39 @@ class Fingerprints(TransportBase):
             gamma_KBM = ky_KBM * np.maximum(self.aLpe - RLp_crit / self.aspect_ratio, 0.0) ** 0.5
 
         I_KBM = (gamma_KBM / ky_KBM**2) ** 2
-        chi_KBM = I_KBM * (self.Ti**1.5)
+        chi_KBM = I_KBM
         Gamma_KBM = 0.1 * -chi_KBM * self.dne_dx
         Qi_KBM = -self.ne * chi_KBM * self.dTi_dx + 1.5 * self.Ti * Gamma_KBM
         Qe_KBM = -self.ne * chi_KBM * self.dTe_dx + 1.5 * self.Te * Gamma_KBM
 
         if self.modes == "all":
-            Gamma_turb = Gamma_ITG + Gamma_KBM
-            Qi_turb = Qi_ITG + Qi_KBM
-            Qe_turb = Qe_ITG + Qe_ETG + Qe_KBM
+            Ge_turb_gB = Gamma_ITG + Gamma_KBM
+            Qi_turb_gB = Qi_ITG + Qi_KBM
+            Qe_turb_gB = Qe_ITG + Qe_ETG + Qe_KBM
         if self.modes == "ITG":
-            Gamma_turb = Gamma_ITG
-            Qi_turb = Qi_ITG
-            Qe_turb = Qe_ITG
+            Ge_turb_gB = Gamma_ITG
+            Qi_turb_gB = Qi_ITG
+            Qe_turb_gB = Qe_ITG
         if self.modes == "ETG":
-            Gamma_turb = 0 * self.x
-            Qi_turb = 0 * self.x
-            Qe_turb = Qe_ETG
+            Ge_turb_gB = 0 * self.x
+            Qi_turb_gB = 0 * self.x
+            Qe_turb_gB = Qe_ETG
         if self.modes == "KBM":
-            Gamma_turb = Gamma_KBM
-            Qi_turb = Qi_KBM
-            Qe_turb = Qe_KBM
+            Ge_turb_gB = Gamma_KBM
+            Qi_turb_gB = Qi_KBM
+            Qe_turb_gB = Qe_KBM
         if self.modes == "neo":
-            Gamma_turb = 0 * self.x
-            Qi_turb = 0 * self.x
-            Qe_turb = 0 * self.x
+            Ge_turb_gB = 0 * self.x
+            Qi_turb_gB = 0 * self.x
+            Qe_turb_gB = 0 * self.x
 
         return self._assemble_fluxes(
             state,
-            Gamma_turb=Gamma_turb,
-            Gamma_neo=Gamma_neo,
-            Qi_turb=Qi_turb,
-            Qi_neo=Qi_neo,
-            Qe_turb=Qe_turb,
-            Qe_neo=Qe_neo,
+            Ge_turb_gB=Ge_turb_gB,
+            Ge_neo_gB=Ge_neo_gB,
+            Qi_turb_gB=Qi_turb_gB,
+            Qi_neo_gB=Qi_neo_gB,
+            Qe_turb_gB=Qe_turb_gB,
+            Qe_neo_gB=Qe_neo_gB,
             model_label="Fingerprints",
         )

@@ -179,7 +179,7 @@ class JacobianMixin:
         def _eval_residual(x_flat_eval: np.ndarray) -> Optional[np.ndarray]:
             try:
                 self._update_from_params(x_flat_eval)
-                self._evaluate(in_place=True, is_fd_sample=True)
+                self._evaluate(in_place=True)
                 return self._compute_residuals(self.Y, self.Y_target)
             except Exception:
                 return None
@@ -189,12 +189,10 @@ class JacobianMixin:
             return None
 
         for j in range(n):
-            span = hi_arr[j] - lo_arr[j]
-            scale_j = max(
-                abs(X_flat[j]),
-                0.5 * span if np.isfinite(span) and span > 0 else 0.0,
-                1.0,
-            )
+            # Scale by the parameter value itself; avoid the bounds span which can be
+            # huge (e.g. [0,100]) and would produce ~50% perturbations that push TGLF
+            # into completely different turbulent regimes, making the Jacobian useless.
+            scale_j = max(abs(X_flat[j]), 1.0)
             h = self.fd_epsilon * scale_j
 
             Xp = X_flat.copy()
@@ -208,8 +206,12 @@ class JacobianMixin:
             eps_eff = Xp_clip[j] - Xm_clip[j]
             eps_floor = 1e-8 * max(scale_j, 1.0)
 
-            Rp = _eval_residual(Xp_clip) if np.any(Xp_clip != X_flat) else None
-            Rm = _eval_residual(Xm_clip) if np.any(Xm_clip != X_flat) else None
+            # Check only element j: np.any(Xp_clip != X_flat) would be True
+            # whenever *any* unrelated element drifted due to floating-point round-trip
+            # through unflatten/flatten, which would silently trigger an unnecessary
+            # full model evaluation for the wrong column.
+            Rp = _eval_residual(Xp_clip) if Xp_clip[j] != X_flat[j] else None
+            Rm = _eval_residual(Xm_clip) if Xm_clip[j] != X_flat[j] else None
 
             if Rp is not None and Rm is not None and abs(eps_eff) >= eps_floor:
                 J[:, j] = (Rp - Rm) / eps_eff
@@ -228,5 +230,9 @@ class JacobianMixin:
                     continue
 
         _eval_residual(X_flat)
+
+        # Replace any remaining NaN/Inf entries (e.g. from a single failed FD
+        # evaluation) with zero so they don't corrupt the subsequent lstsq solve.
+        J = np.where(np.isfinite(J), J, 0.0)
 
         return J

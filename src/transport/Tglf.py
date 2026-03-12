@@ -43,11 +43,14 @@ class Tglf(TransportBase):
         if locpargen_file is None:
             raise RuntimeError(f"locpargen did not produce input.tglf.locpargen at rho={rho}")
 
+        f_trap_at_rho = float(np.interp(rho, state.rho, state.f_trap))
+        settings = {**self.settings, "THETA_TRAPPED": f_trap_at_rho}
+
         controls_lines = _load_controls("tglf")
         lines = _merge_controls_and_locpargen(
             controls_lines,
             locpargen_file,
-            self.settings,
+            settings,
             self.multipliers,
         )
 
@@ -81,14 +84,11 @@ class Tglf(TransportBase):
         n_species = data.size // 4
         data = data.reshape((4, n_species))
 
-        Ge = float(data[0, 0])
-        Qe = float(data[1, 0])
+        Ge_gB = float(data[0, 0])
+        Qe_gB = float(data[1, 0])
+        Qi_gB = float(np.sum(data[1, 1:]))
 
-        Qi = float(np.sum(data[1, 1:]))
-
-        Ge, Qi, Qe = self._gbflux_to_physical(rho, Ge, Qi, Qe)
-
-        return Ge, Qi, Qe
+        return Ge_gB, Qi_gB, Qe_gB
 
     def _evaluate_single(self, state) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         platform = self._get_platform_manager(self.work_dir)
@@ -147,28 +147,28 @@ class Tglf(TransportBase):
         """Read TGLF output files and build result dictionaries."""
         roa_eval = np.atleast_1d(self.roa_eval)
 
-        Gamma_turb = np.zeros_like(roa_eval, dtype=float)
-        Qi_turb = np.zeros_like(roa_eval, dtype=float)
-        Qe_turb = np.zeros_like(roa_eval, dtype=float)
+        Ge_turb_gB = np.zeros_like(roa_eval, dtype=float)
+        Qi_turb_gB = np.zeros_like(roa_eval, dtype=float)
+        Qe_turb_gB = np.zeros_like(roa_eval, dtype=float)
 
         for i, rho in enumerate(roa_eval):
             rho_dir = work_dir / f"rho_{rho:.3f}"
             out_path = rho_dir / "out.tglf.gbflux"
-            Ge, Qi, Qe = self._read_tglf_gbflux(out_path, rho)
-            Gamma_turb[i] = Ge
-            Qi_turb[i] = Qi
-            Qe_turb[i] = Qe
-            print(f"  ✓ Read fluxes for rho={rho:.3f}: Ge={Ge:.3e}, Qi={Qi:.3e}, Qe={Qe:.3e}")
+            ge_gB, qi_gB, qe_gB = self._read_tglf_gbflux(out_path, rho)
+            Ge_turb_gB[i] = ge_gB
+            Qi_turb_gB[i] = qi_gB
+            Qe_turb_gB[i] = qe_gB
+            print(f"  ✓ Read gB fluxes for rho={rho:.3f}: Ge={ge_gB:.3e}, Qi={qi_gB:.3e}, Qe={qe_gB:.3e}")
 
-        Gamma_neo, Qi_neo, Qe_neo = self._compute_neoclassical(state)
+        Ge_neo_gB, Qi_neo_gB, Qe_neo_gB = self._compute_neoclassical(state)
 
         return self._assemble_fluxes(
             state,
-            Gamma_turb=Gamma_turb,
-            Gamma_neo=Gamma_neo,
-            Qi_turb=Qi_turb,
-            Qi_neo=Qi_neo,
-            Qe_turb=Qe_turb,
-            Qe_neo=Qe_neo,
+            Ge_turb_gB=Ge_turb_gB,
+            Ge_neo_gB=Ge_neo_gB,
+            Qi_turb_gB=Qi_turb_gB,
+            Qi_neo_gB=Qi_neo_gB,
+            Qe_turb_gB=Qe_turb_gB,
+            Qe_neo_gB=Qe_neo_gB,
             model_label="TGLF",
         )

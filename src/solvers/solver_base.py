@@ -37,8 +37,40 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         )
         self.tol = float(self.options.get("tol", 1e-6))
         self.step_size = float(self.options.get("step_size", 1e-2))
-        self.min_step_size = float(self.options.get("min_step_size", 1e-3))
+        self.min_step_size = float(self.options.get("min_step_size", 1e-6))
         self.adaptive_step = bool(self.options.get("adaptive_step", True))
+
+        # Advanced adaptive step control (Jacobian-based, triggered by adaptive_step option)
+        if self.adaptive_step:
+            from .adaptive_step import AdaptiveStepControl
+            self._adaptive_step_ctrl = AdaptiveStepControl({
+                "step_size": self.step_size,
+                "min_step_size": self.min_step_size,
+                "max_step_size": float(self.options.get("max_step_size", 5e-2)),
+                "decay_gamma": float(self.options.get("decay_gamma", 0.75)),
+                "warmup_iters": int(self.options.get("warmup_iters", 3)),
+                "oscillation_damping": bool(self.options.get("oscillation_damping", True)),
+                "oscillation_window": int(self.options.get("oscillation_window", 5)),
+            })
+        else:
+            self._adaptive_step_ctrl = None
+
+        # Oscillation-aware convergence detection (triggered by use_oscillation_convergence option)
+        self.use_oscillation_convergence = bool(self.options.get("use_oscillation_convergence", True))
+        if self.use_oscillation_convergence:
+            from .oscillation_convergence import OscillationConvergenceDetector
+            self._osc_detector = OscillationConvergenceDetector({
+                "tol": self.tol,
+                "oscillation_rel_tol": float(self.options.get("oscillation_rel_tol", 0.05)),
+                "min_iterations_after_convergence": int(self.options.get("oscillation_min_iters", 5)),
+                "ema_alpha": float(self.options.get("ema_alpha", 0.3)),
+                "derivative_window": int(self.options.get("derivative_window", 3)),
+                # Allow stall check to fire after slightly more iters than the
+                # standard stall counter, so the two mechanisms don't race.
+                "oscillation_stall_min_iters": int(self.options.get("model_iter_to_stall", 10)) + 5,
+            })
+        else:
+            self._osc_detector = None
 
         self.converged = False
         self.stalled = False
@@ -48,6 +80,7 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         self._last_model_Z: Optional[float] = None
         self._last_model_iter: Optional[int] = None
         self._model_eval_nondec = 0
+        self._Z_window: list = []   # rolling window for stall detection
         self.iter_between_save = int(self.options.get("iter_between_save", 5))
         self.cwd = Path.cwd()
         self._active_sandbox = None
@@ -63,9 +96,39 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         self.R_dict: Dict[str, np.ndarray] = {}
 
         self.predicted_profiles = list(self.options.get("predicted_profiles", []))
-        self.target_vars = list(self.options.get("target_vars", []))
+
+        # Unit system for flux/flow matching in the residual.
+        # These options control how transport/target outputs are mapped before
+        # computing the residual R = Y_model - Y_target.
+        #   flux_or_flow        : 'flux' (per m²) | 'flow' (surface-integrated, MW)
+        #   gB_or_real          : 'gB' (dimensionless gyroBohm) | 'real' (physical)
+        #   total_or_conduction : 'total' | 'conduction' (heat channels only)
+        _output_units_cfg = self.options.get("output_units", {})
+        self.solver_output_units: Dict[str, str] = {
+            "flux_or_flow": str(_output_units_cfg.get("flux_or_flow", "flow")),
+            "gB_or_real": str(_output_units_cfg.get("gB_or_real", "real")),
+            "total_or_conduction": str(_output_units_cfg.get("total_or_conduction", "total")),
+        }
+
+        # target_vars: explicit override or auto-derived from output_units.
+        #   flux_or_flow=flow,  total_or_conduction=total      → [Ce, Pe, Pi]
+        #   flux_or_flow=flow,  total_or_conduction=conduction → [Ce, De, Di]
+        #   flux_or_flow=flux,  total_or_conduction=total      → [Ge, Qe, Qi]
+        #   flux_or_flow=flux,  total_or_conduction=conduction → [Ge, Qe, Qi]  (no separate conduction flux key)
+        _explicit_vars = self.options.get("target_vars", [])
+        if _explicit_vars:
+            self.target_vars = list(_explicit_vars)
+        else:
+            _fof = self.solver_output_units["flux_or_flow"]
+            _toc = self.solver_output_units["total_or_conduction"]
+            if _fof == "flow":
+                self.target_vars = ["Ce", "De" if _toc == "conduction" else "Pe", "Di" if _toc == "conduction" else "Pi"]
+            else:
+                self.target_vars = ["Ge", "Qe", "Qi"]
+
         self.transport_vars = [f"{t}_neo" for t in self.target_vars] + [f"{t}_turb" for t in self.target_vars]
         self.model_vars = self.transport_vars + self.target_vars
+
         self.n_params_per_profile = int(self.options.get("n_params_per_profile", 0))
 
         self.eval_coord = self.options.get("eval_coord", "roa").lower()
@@ -106,7 +169,7 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         self.J = None
         self.use_jacobian = bool(self.options.get("use_jacobian", True))
         self.jacobian_reg = float(self.options.get("jacobian_reg", 1e-8))
-        self.fd_epsilon = float(self.options.get("fd_epsilon", 0.05))
+        self.fd_epsilon = float(self.options.get("fd_epsilon", 0.02))
         self.gradient_clip = float(self.options.get("gradient_clip", 1e6))
 
         self._J_cache = None
@@ -349,25 +412,90 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         self._surrogate.fit()
         return True
 
+    def _convert_output_units(
+        self,
+        Y_dict: Dict[str, Any],
+        from_units: Dict[str, str],
+        Gamma_dict: Optional[Dict[str, np.ndarray]] = None,
+    ) -> Dict[str, np.ndarray]:
+        """Convert a variable dict from *from_units* to ``self.solver_output_units``.
+
+        Currently handles gB↔real and flux↔flow conversions via
+        ``tools.plasma.convert_output_units``.  The total↔conduction
+        decomposition requires particle-flux arrays in *Gamma_dict* and will be
+        fully activated once transport/targets are refactored to expose them.
+
+        Parameters
+        ----------
+        Y_dict : dict
+            Mapping of channel name → 1-D array at ``self.roa_eval``.
+        from_units : dict
+            Unit specification of the incoming data (same keys as
+            ``solver_output_units``).
+        Gamma_dict : dict, optional
+            Particle-flux arrays keyed by species (``'Ge'``, ``'Gi'``)
+            [1e19/m²/s] at ``self.roa_eval``, used to compute conductive flows.
+
+        Returns
+        -------
+        dict
+            Same keys as *Y_dict*, values converted to ``solver_output_units``.
+        """
+        from tools import plasma as _plasma
+
+        to_units = self.solver_output_units
+        # Fast path: no conversion needed
+        if from_units == to_units:
+            return Y_dict
+
+        state = self._state
+        roa_points = self.roa_eval
+        out = {}
+        for channel, value in Y_dict.items():
+            Gamma = None
+            if Gamma_dict is not None:
+                spec = 'e' if 'e' in channel.lower() else 'i'
+                Gamma = Gamma_dict.get(f'G{spec}')
+            out[channel] = _plasma.convert_output_units(
+                value=np.asarray(value, dtype=float),
+                channel=channel,
+                from_units=from_units,
+                to_units=to_units,
+                state=state,
+                roa_points=roa_points,
+                Gamma_1e19=Gamma,
+            )
+        return out
+
     def _evaluate(
         self,
         X: Optional[Dict[str, Dict[str, float]]] = None,
         in_place: bool = True,
-        is_fd_sample: bool = False,
     ):
         """Evaluate transport + target (or surrogate) optionally without mutating solver attributes."""
         X_current = self.X if X is None else X
         if self._use_surr_iter and self._surrogate is not None:
-            Y, Y_std = self._surrogate.evaluate(X_current, self._state)
-            Y_model = self._surrogate.transport
-            Y_model_std = getattr(self._surrogate, "transport_std", {})
-            Y_target = self._surrogate.targets
-            Y_target_std = getattr(self._surrogate, "targets_std", {})
+            Y_model, Y_model_std, Y_target, Y_target_std = self._surrogate.evaluate(X_current, self._state)
         else:
             Y_model, Y_model_std = self._transport.evaluate(self._state)
             Y_target, Y_target_std = self._targets.evaluate(self._state)
+            transport_dict = getattr(self._transport, "transport_dict", None)
             if in_place and self._surrogate is not None:
-                self._surrogate.add_sample(self._state, X_current, Y_model, Y_target, is_fd_sample=is_fd_sample)
+                # Pass full nested transport_dict for turb/neo breakdown;
+                # targets only have totals so the flat Y_gB dict suffices.
+                # Use totals-only Y_model here so the surrogate training set
+                # is not polluted with derived component keys.
+                Y_target_gB = getattr(self._targets, "Y_gB", None)
+                self._surrogate.add_sample(
+                    self._state, X_current, Y_model, Y_target,
+                    transport_dict=transport_dict, targets_gB=Y_target_gB,
+                )
+            # Augment Y_model with turb/neo component breakdown so that
+            # SolverData stores per-mechanism values alongside totals.
+            if transport_dict:
+                Y_model, Y_model_std = self._merge_transport_components(
+                    Y_model, Y_model_std, transport_dict
+                )
         if in_place:
             self.Y = Y_model
             self.Y_std = Y_model_std
@@ -375,11 +503,88 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
             self.Y_target_std = Y_target_std
         return Y_model, Y_model_std, Y_target, Y_target_std
 
+    def _get_channel_components(
+        self,
+        var: str,
+        transport_dict: Dict[str, Any],
+    ) -> Optional[Dict[str, np.ndarray]]:
+        """Return {'neo': arr, 'turb': arr} for *var* from *transport_dict*, or None.
+
+        Handles both direct flux channels (Ge, Gi, Qe, Qi) and derived flow
+        channels (Pe, Pi, Ce, Ci, De, Di) whose breakdowns live under nested
+        sub-keys in the flows dict.
+        """
+        fluxes_real = transport_dict.get("fluxes", {}).get("real", {})
+        flows_real  = transport_dict.get("flows",  {}).get("real", {})
+
+        # Direct flux channels (Ge, Gi, Qe, Qi)
+        if var in fluxes_real:
+            d = fluxes_real[var]
+            if "neo" in d and "turb" in d:
+                return {"neo": np.asarray(d["neo"], float),
+                        "turb": np.asarray(d["turb"], float)}
+
+        # Total flow channels (Pe, Pi)
+        if var in flows_real:
+            total = flows_real[var].get("total", {})
+            if "neo" in total and "turb" in total:
+                return {"neo": np.asarray(total["neo"], float),
+                        "turb": np.asarray(total["turb"], float)}
+
+        # Derived flow channels (Ce/De come from flows['Pe'], Ci/Di from flows['Pi'])
+        _derived_map: Dict[str, Tuple[str, str]] = {
+            "Ce": ("Pe", "conv"), "De": ("Pe", "cond"),
+            "Ci": ("Pi", "conv"), "Di": ("Pi", "cond"),
+        }
+        if var in _derived_map:
+            parent, level = _derived_map[var]
+            if parent in flows_real and level in flows_real[parent]:
+                d = flows_real[parent][level]
+                if "neo" in d and "turb" in d:
+                    return {"neo": np.asarray(d["neo"], float),
+                            "turb": np.asarray(d["turb"], float)}
+
+        return None
+
+    def _merge_transport_components(
+        self,
+        Y_model: Dict[str, Any],
+        Y_model_std: Dict[str, Any],
+        transport_dict: Dict[str, Any],
+    ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+        """Augment flat Y_model with turb/neo breakdown from transport_dict.
+
+        For each target variable (e.g. 'Pe') the method looks up per-mechanism
+        arrays in transport_dict and inserts them as additional keys
+        (e.g. 'Pe_neo', 'Pe_turb') so that SolverData / analysis can access
+        the component breakdown without reprocessing the nested dict.
+
+        Arrays that are not at the expected roa_eval size are skipped silently.
+        """
+        sigma = float(getattr(self._transport, "sigma", 0.1))
+        Y_out     = dict(Y_model)
+        Y_std_out = dict(Y_model_std)
+
+        for var in self.target_vars:
+            comps = self._get_channel_components(var, transport_dict)
+            if comps is None:
+                continue
+            for comp, arr in comps.items():
+                if arr.size != self.n_eval:
+                    continue
+                key = f"{var}_{comp}"
+                Y_out[key]     = arr.tolist()
+                Y_std_out[key] = [sigma * abs(float(v)) for v in Y_out[key]]
+
+        return Y_out, Y_std_out
+
     def _compute_residuals(self, Y_model: Dict[str, Any], Y_target: Dict[str, Any]) -> Optional[np.ndarray]:
         normalize = self.normalize_residual
         R_bc = np.array([], float)
         R_constraints = np.array([], float)
 
+        # Residuals are computed only on the target channels (totals), not on
+        # the augmented component keys (Pe_neo, Pe_turb, etc.).
         R_flux_dict = {
             k: np.array(Y_model[k]) - np.array(Y_target[k])
             for k in Y_target.keys()
@@ -568,6 +773,21 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
             self.Z_std = np.sqrt(varZ)
             self.R_std = np.sqrt(np.diag(C_R))
 
+        # Oscillation-aware convergence: feed history and check EMA stabilization
+        if self._osc_detector is not None:
+            self._osc_detector.add_iteration(
+                Z=float(self.Z),
+                X=self.X if isinstance(self.X, dict) else {},
+                Y=getattr(self, "Y", None),
+                R=self.R,
+            )
+            if not self.converged:
+                osc_converged, mean_state = self._osc_detector.check_oscillation_convergence()
+                if osc_converged and mean_state is not None:
+                    print("Oscillation convergence detected. Applying time-averaged state.")
+                    self.X = mean_state["X_mean"]
+                    self.converged = True
+
     def save(self, bundle, filename="solver_checkpoint.pkl"):
         """Save all key objects from current solver run into one pickle file."""
         bundle["data"].save(self.cwd / "solver_history.csv")
@@ -626,33 +846,54 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
             pickle.dump(module_specs, fh)
 
     def check_stalled(self) -> None:
-        """Set stalled when model Z shows < tol improvement over model_iter_to_stall evaluations."""
+        """Set stalled when total Z improvement over a model_iter_to_stall-wide window is < tol.
+
+        Uses a sliding window of the last model_iter_to_stall model evaluations.  Stall
+        fires when the best Z in the window hasn't improved over the oldest entry by at
+        least tol, regardless of step-to-step fluctuations.  This prevents the previous
+        consecutive-reset behaviour from making the argument effectively unreachable
+        during monotone-but-slow descent.
+        """
         if self._use_surr_iter or self.Z is None or self.iter < self.surr_warmup:
             return
 
         if self.model_iter_to_stall is None or self.model_iter_to_stall < 0:
             return
 
-        if self._last_model_Z is not None:
-            delta = self._last_model_Z - float(self.Z)
-            if delta < self.tol:
-                self._model_eval_nondec += 1
-                if self.model_iter_to_stall == 0 or self._model_eval_nondec >= self.model_iter_to_stall:
-                    self.stalled = True
-            else:
-                self._model_eval_nondec = 0
-        else:
-            self._model_eval_nondec = 0
+        self._Z_window.append(float(self.Z))
+        if len(self._Z_window) > self.model_iter_to_stall:
+            self._Z_window.pop(0)
 
         self._last_model_Z = float(self.Z)
         self._last_model_iter = self.iter
+
+        # Fire stall once the window is full and the best value in it hasn't
+        # improved on the oldest (window-start) value by more than tol.
+        if self.model_iter_to_stall == 0:
+            self.stalled = True
+        elif len(self._Z_window) >= self.model_iter_to_stall:
+            window_improvement = self._Z_window[0] - min(self._Z_window)
+            if window_improvement < self.tol:
+                self.stalled = True
+
+        # Oscillation-aware stall: standard counter resets on every downswing, so
+        # it never accumulates when Z oscillates.  Fire stall when the EMA trend
+        # has flattened but is still above tolerance.
+        if self._osc_detector is not None and not self.stalled:
+            if self._osc_detector.check_oscillation_stall():
+                print(
+                    f"Oscillation stall detected at iter {self.iter}: "
+                    f"EMA={self._osc_detector.Z_ema_history[-1]:.4e} is stable above "
+                    f"tol={self.tol:.4e}. Solver is stuck oscillating."
+                )
+                self.stalled = True
 
     def run(self, state, boundary, parameters, neutrals, transport, targets, surrogate=None) -> SolverData:
         state.domain = self.domain
         state._trim()
         self.ix_eval = np.searchsorted(state.roa, self.roa_eval)
         transport.roa_eval = self.roa_eval
-        transport.output_vars = self.transport_vars + self.target_vars
+        transport.output_vars = self.target_vars  # totals only; surrogate gets turb/neo via transport_dict
         targets.roa_eval = self.roa_eval
         targets.output_vars = self.target_vars
         parameters.predicted_profiles = self.predicted_profiles
@@ -672,7 +913,11 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         self.get_initial_parameters()
 
         if surrogate is not None:
-            surrogate._initialize(self.transport_vars, self.target_vars, self.roa_eval, state, self.X)
+            surrogate._initialize(
+                self.transport_vars, self.target_vars, self.roa_eval,
+                state, self.X,
+                solver_output_units=self.solver_output_units,
+            )
 
         module_bundle = {
             "solver_options": self.options,
@@ -788,3 +1033,9 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
             )
 
         return data
+
+    # def mapping(self):
+    #     {ne : Ge : Ce,
+    #      ni : Gi : Ci,
+    #      Te : Qe : Pe,
+    #      Ti : Qi : Pi,}

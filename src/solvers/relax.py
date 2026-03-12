@@ -1,59 +1,86 @@
 from __future__ import annotations
 
-import copy
-
 import numpy as np
 
 from .solver_base import SolverBase
 
 
-class RelaxSolver(SolverBase):
+class Relax(SolverBase):
     def __init__(self, options=None):
         super().__init__(options)
+        opts = options or {}
+        # Fractional clamp on the normalised step dx (applied before scaling by |x|).
+        # PORTALS uses ~0.5; None disables.
+        self.dx_max = float(opts.get("dx_max", 1.0))
+        # Absolute clamp on x_step = dx * |x| after scaling (None = disabled).
+        self.dx_max_abs = opts.get("dx_max_abs", None)
+        if self.dx_max_abs is not None:
+            self.dx_max_abs = float(self.dx_max_abs)
+        # Absolute minimum on |x_step| (enforces a floor on each move).
+        self.dx_min_abs = opts.get("dx_min_abs", None)
+        if self.dx_min_abs is not None:
+            self.dx_min_abs = float(self.dx_min_abs)
 
     def propose_parameters(self):
         """Relaxation-based parameter update with gradient clipping for stability."""
         R = np.asarray(self.R, float)
 
-        if self.adaptive_step:
-            res_norm = np.linalg.norm(R)
-            step_size = max(self.min_step_size, self.step_size * (1.0 / (1.0 + res_norm)))
+        if self._adaptive_step_ctrl is not None:
+            step_size = self._adaptive_step_ctrl.compute_step_size(
+                X=self.X, R=R, J=getattr(self, "J", None), iteration=self.iter
+            )
         else:
             step_size = self.step_size
 
-        if self.use_jacobian:
-            X_flat, schema = self._flatten_params(self.X)
-            direction = np.sign(np.nanmean(R)) * np.ones_like(X_flat)
+        # PORTALS simple relaxation:
+        #   denom = sqrt(Q^2 + QT^2).clamp(min=1e-10)
+        #   dx    = relax * (QT - Q) / denom        [bounded in (-sqrt(2), sqrt(2))]
+        #   dx    = clamp(dx, -dx_max, dx_max)
+        #   x_step = dx * abs(x)
+        #   optionally clamp x_step with dx_max_abs / dx_min_abs
+        X_flat, schema = self._flatten_params(self.X)
 
-            J = getattr(self, "J", None)
-            if J is None:
-                try:
-                    J = self._attempt_get_jacobian(X_flat, R)
-                    self.J = J
-                except Exception:
-                    J = None
+        Y = getattr(self, "Y", None)
+        Y_target = getattr(self, "Y_target", None)
+        y_keys = sorted([k for k in (Y or {}).keys() if k in (Y_target or {})])
 
-            if J is not None:
-                col_norms = np.linalg.norm(J, axis=0)
-                col_scale = 1.0 / np.maximum(col_norms, 1e-12)
-                J_hat = J * col_scale
+        if y_keys:
+            Q = np.concatenate([np.asarray(Y[k], float) for k in y_keys])
+            QT = np.concatenate([np.asarray(Y_target[k], float) for k in y_keys])
 
-                JTJ = J_hat.T @ J_hat + self.jacobian_reg * np.eye(J.shape[1])
-                rhs = -J_hat.T @ R
-                z = np.linalg.solve(JTJ, rhs)
-                delta = col_scale * z
+            denom = np.maximum(np.sqrt(Q ** 2 + QT ** 2), 1e-10)
+            dx = step_size * (QT - Q) / denom          # relax * (QT - Q) / denom
+            dx = np.clip(dx, -self.dx_max, self.dx_max)
 
-                if np.all(np.isfinite(delta)):
-                    direction = delta
+            n_x = len(X_flat)
+            n_q = len(Q)
 
-                X_new_flat = X_flat + step_size * direction
-                X_new_wo_bounds = self._unflatten_params(X_new_flat)
+            if n_x == n_q:
+                # Direct element-wise application (typical case: knots == roa_eval)
+                x_step = dx * np.abs(X_flat)
             else:
-                X_new_wo_bounds = copy.deepcopy(self.X)
+                # Sizes differ (e.g. spline knots < n_eval).
+                # Compute mean dx per profile channel then broadcast to parameters.
+                n_profiles = len(y_keys)
+                n_pts = n_q // n_profiles if n_profiles else n_q
+                dx_per_profile = dx.reshape(n_profiles, n_pts).mean(axis=1)
+                n_params_each = n_x // n_profiles if n_profiles else n_x
+                dx_broadcast = np.repeat(dx_per_profile, n_params_each)[:n_x]
+                x_step = dx_broadcast * np.abs(X_flat)
 
+            if self.dx_max_abs is not None:
+                x_step = np.sign(x_step) * np.minimum(np.abs(x_step), self.dx_max_abs)
+            if self.dx_min_abs is not None:
+                # sign_or_plus_one: treat zero-step as positive direction
+                sign_or_plus = np.where(x_step != 0, np.sign(x_step), 1.0)
+                x_step = sign_or_plus * np.maximum(np.abs(x_step), self.dx_min_abs)
+
+            X_new_flat = X_flat + x_step
+            X_new_wo_bounds = self._unflatten_params(X_new_flat)
         else:
+            # No flux data yet: fall back to sign-based uniform step
             sign_term = float(np.sign(np.nanmean(R)))
-            step = -self.step_size * sign_term
+            step = -step_size * sign_term
             X_new_wo_bounds = {}
             for prof, param_dict in self.X.items():
                 new_inner = {}

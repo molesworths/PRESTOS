@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Known Issues
+- Bayesian optimization solver is currently non-functional and should be considered experimental.
+- Surrogate models can be unreliable depending on regime and training history.
+- Neutral solver functionality is currently broken.
+- QLGYRO and CGYRO integrations are not yet fully verified.
+- Turbulent energy exchange is not yet implemented.
+
 ### Changed
 - **Major refactoring: Package restructuring**:
   - Split monolithic solver module into `src/solvers/` package
@@ -201,7 +208,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Initial Release
 - Modular transport solver framework
-- Multiple solver implementations (RelaxSolver, BayesianOptSolver, TimeStepperSolver)
+- Multiple solver implementations (RelaxSolver, Bayesian, TimeStepperSolver)
 - Surrogate acceleration with Gaussian processes
 - Spline-based profile parameterization
 - Fingerprints transport model

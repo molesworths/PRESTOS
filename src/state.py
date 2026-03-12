@@ -196,12 +196,12 @@ class PlasmaState:
 
         # Follow PORTALS approach to ion densities
         # Update thermal ion species to scale proportionally to ne
-        # self._ne_old = getattr(self, "_ne_old", self.ne.copy())
-        # scale_factor = self.ne / np.maximum(self._ne_old, 1e-30)
-        # self.ni_full *= scale_factor[:, np.newaxis]
-        # self.ni = self.ni_full[:,0].flatten() if self.ni_full.ndim == 2 else self.ni_full.flatten()
-        # self._ne_old = self.ne.copy()
-        # self.aLni = calc.aLy(self.r, self.ni)
+        self._ne_old = getattr(self, "_ne_old", self.ne.copy())
+        scale_factor = self.ne / np.maximum(self._ne_old, 1e-30)
+        self.ni_full *= scale_factor[:, np.newaxis]
+        self.ni = self.ni_full[:,0].flatten() if self.ni_full.ndim == 2 else self.ni_full.flatten()
+        self._ne_old = self.ne.copy()
+        self.aLni = calc.aLy(self.r, self.ni)
         # self.f_imp = 1.0 - self.ni / np.maximum(self.ne, 1e-30)
 
         neutrals_active = neutrals is not None and getattr(neutrals, "n0_edge", None) is not None
@@ -276,6 +276,7 @@ class PlasmaState:
         self.alpha = (-2*self.R*self.q**2/self.B**2)*np.gradient(self.pe,self.r) #-self.R * self.q**2 * np.gradient(self.betae,self.r)   
         self.pprime = plasma.p_prime(self.te, self.ne, self.aLte, self.aLne, 
                                      self.ti, self.ni_full, self.aLti, self.aLni, self.a, self.B_unit, self.q, self.r)
+        self.qprime = self.q**2*self.a**2*self.shear/self.r**2
         self.drmindr = np.gradient(self.r,self.r)
         self.dRmajdr = np.gradient(self.rmaj,self.r)
         self.dZmajdr = np.gradient(self.zmag,self.r)
@@ -384,8 +385,8 @@ class PlasmaState:
         """Compute normalization constants and derived scales."""
         self.keV_to_J = 1e3 * e
         self.J_to_keV = 1.0 / self.keV_to_J
-        self.n_norm = n_norm
-        self.T_norm = T_norm
+        self.n_norm = n_norm # 1/m^3
+        self.T_norm = T_norm # keV
         self.tau_norm = self.a / self.c_s
         self.mi_over_mp = self.mi_ref
         self.mi_over_me = self.mi_over_mp * m_p / m_e
@@ -396,7 +397,8 @@ class PlasmaState:
         self.chiGB_norm = self.a*self.v_norm*(self.rhostar_norm**2)
         self.G_norm = self.n_norm*self.v_norm*(self.rhostar_norm**2)
         self.Q_norm = self.n_norm*(self.T_norm*self.keV_to_J)*self.v_norm*(self.rhostar_norm**2)
-        self.Qnorm_to_P = self.Q_norm*self.surfArea*1e-6 # W/m^2 to MW
+        self.Qnorm_to_P = self.Q_norm*self.dVdr*1e-6 # W/m^2 to MW
+        self.Q_to_P = self.Qnorm_to_P * self.ne * self.te**1.5    # n*T^1.5
         self.nuii_norm = 4.8e-8 * self.Zeff * (self.n_norm*1e-6)*self.LogLam/(np.sqrt(self.mi_over_mp) * ( (self.T_norm*1e3)**1.5 ) )*self.tau_norm
         self.nuee_norm = 2.9e-6 * (self.n_norm*1e-6)*self.LogLam/((self.T_norm*1e3)**1.5)*self.tau_norm
         self.nuexch_norm = (self.Zeff/(1840.*self.mi_over_mp))*self.nuee_norm
@@ -700,6 +702,10 @@ class PlasmaState:
         new_aLy = parameters.get_aLy(X,self.roa)
         new_curv = parameters.get_curvature(X,self.roa)
 
+        # Snapshot ne before update for ion-density quasineutrality rescaling below.
+        _ne_attr = getattr(self, 'ne', None)
+        ne_prev = np.asarray(_ne_attr if _ne_attr is not None else new_y.get('ne', []), float).copy()
+
         # --- Transfer profile values ---
         for prof in X.keys():
             setattr(self, prof, new_y[prof])
@@ -771,3 +777,27 @@ class PlasmaState:
         # Update metadata with current scaling
         self.metadata['applied_scaling'] = {k: v for k, v in scale_factors.items() 
                                            if k.startswith('scale_')}
+
+    def gB_to_MWm2(self, x, Ge_gB, Gi_gB, Qe_gB, Qi_gB):
+        """
+        Convert gB fluxes to MW/m^2
+        Assumese g_gB is normalized to 1e20/m^2 
+        """
+
+        G_gB = np.interp(x, self.roa, self.g_gb*10)
+        Q_gB = np.interp(x, self.roa, self.q_gb)
+
+        return Ge_gB * G_gB, Gi_gB * G_gB, Qe_gB * Q_gB, Qi_gB * Q_gB
+
+    def gB_flux_to_flow(self,x,gB_fluxes: Dict[str,np.array]):
+        """
+        Convert from gB-normed fluxes to gB-normed power flows
+
+        """
+
+    def MWm2_to_MW(self,x,MWm2_fluxes: Dict[str,np.array]):
+        """
+        Convert from MW/m^2 fluxes to MW power flows
+
+        output dict like {'e':{'conv':array},}
+        """

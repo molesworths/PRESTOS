@@ -173,58 +173,13 @@ class CH_fingerprints(TransportBase):
             Qi_turb = 0*x
             Qe_turb = 0*x
 
-        # Convert particle flux to convective power flow
-        Ge_to_Ce = 1.5 * Te * state.Qnorm_to_P
-        Gi_to_Ci = 1.5 * Ti * state.Qnorm_to_P
-
-        # Storage
-
-        self.model = 'CH_fingerprints'
-        self.Ge_turb = Gamma_turb
-        self.Ge_neo = Gamma_neo
-        self.Ge = Gamma_turb + Gamma_neo
-        self.Gi_turb = self.Ge_turb / state.Zeff
-        self.Gi_neo = self.Ge_neo / state.Zeff
-        self.Gi = self.Gi_turb + self.Gi_neo
-        self.Ce_turb = self.Ge_turb * Ge_to_Ce
-        self.Ce_neo = self.Ge_neo * Ge_to_Ce
-        self.Ce = self.Ce_turb + self.Ce_neo
-        self.Gi_turb = self.Ge_turb / state.Zeff
-        self.Gi_neo = self.Ge_neo / state.Zeff
-        self.Gi = self.Gi_turb + self.Gi_neo
-        self.Ci_turb = self.Gi_turb * Gi_to_Ci
-        self.Ci_neo = self.Gi_neo * Gi_to_Ci
-        self.Ci = self.Ci_turb + self.Ci_neo
-        self.Qi_turb = Qi_turb
-        self.Qi_neo = Qi_neo
-        self.Qi = self.Qi_turb + self.Qi_neo
-        self.Pi_turb = self.Qi_turb * state.Qnorm_to_P
-        self.Pi_neo = self.Qi_neo * state.Qnorm_to_P
-        self.Pi = self.Pi_turb + self.Pi_neo
-        self.Qe_turb = Qe_turb
-        self.Qe_neo = Qe_neo
-        self.Qe = self.Qe_turb + self.Qe_neo
-        self.Pe_turb = self.Qe_turb * state.Qnorm_to_P
-        self.Pe_neo = self.Qe_neo * state.Qnorm_to_P
-        self.Pe = self.Pe_turb + self.Pe_neo
-
-        # Provide dict for requested outputs
-        output_dict = {
-            key: [
-            np.nan_to_num(getattr(self, key)[np.where(np.isclose(state.roa, roa, atol=1e-3))[0][0]], nan=0)
-            if np.any(np.isclose(state.roa, roa, atol=1e-3))
-            else np.interp(roa, state.roa, np.nan_to_num(getattr(self, key), nan=0))
-            for roa in self.roa_eval
-            ]
-            for key in self.output_vars
-        }
-
-        std_dict = {
-            key: [
-                self.sigma * abs(output_dict[key][i])
-                for i in range(len(self.roa_eval))
-            ]
-            for key in self.output_vars
-        }
-
-        return output_dict, std_dict
+        return self._assemble_fluxes(
+            state,
+            Ge_turb_gB=Gamma_turb,
+            Ge_neo_gB=Gamma_neo,
+            Qi_turb_gB=Qi_turb,
+            Qi_neo_gB=Qi_neo,
+            Qe_turb_gB=Qe_turb,
+            Qe_neo_gB=Qe_neo,
+            model_label="CH_fingerprints",
+        )

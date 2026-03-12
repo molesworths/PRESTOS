@@ -3,10 +3,15 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 
 import numpy as np
 import pandas as pd
+
+# Y and Y_target values may be plain Python lists (direct transport output) or
+# numpy arrays (after internal conversion).  Use Any for the value type so the
+# type-checker doesn't complain about either form.
+_YDict = Dict[str, Any]
 
 
 @dataclass
@@ -19,10 +24,14 @@ class SolverData:
     R_dict: List[Optional[Dict[str, np.ndarray]]] = field(default_factory=list)
     Z: List[Optional[float]] = field(default_factory=list)
     Z_std: List[Optional[float]] = field(default_factory=list)
-    Y: List[Dict[str, np.ndarray]] = field(default_factory=list)
-    Y_std: List[Dict[str, np.ndarray]] = field(default_factory=list)
-    Y_target: List[Dict[str, np.ndarray]] = field(default_factory=list)
-    Y_target_std: List[Dict[str, np.ndarray]] = field(default_factory=list)
+    # Y stores transport model outputs (totals + turb/neo component breakdown).
+    # Keys follow the pattern "<channel>" for totals and "<channel>_<component>"
+    # for per-mechanism values, e.g. {"Pe": arr, "Pe_neo": arr, "Pe_turb": arr}.
+    Y: List[_YDict] = field(default_factory=list)
+    Y_std: List[_YDict] = field(default_factory=list)
+    # Y_target stores power-balance target values (totals only).
+    Y_target: List[_YDict] = field(default_factory=list)
+    Y_target_std: List[_YDict] = field(default_factory=list)
     used_surrogate: List[bool] = field(default_factory=list)
     metadata: Dict[str, Any] = field(default_factory=dict)
 
@@ -36,10 +45,10 @@ class SolverData:
         R_dict: Optional[Dict[str, np.ndarray]],
         Z: Optional[float],
         Z_std: Optional[float],
-        Y: Dict[str, np.ndarray],
-        Y_std: Dict[str, np.ndarray],
-        Y_target: Dict[str, np.ndarray],
-        Y_target_std: Dict[str, np.ndarray],
+        Y: _YDict,
+        Y_std: _YDict,
+        Y_target: _YDict,
+        Y_target_std: _YDict,
         used_surr: bool,
     ) -> None:
         self.iterations.append(int(i))

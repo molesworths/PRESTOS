@@ -21,13 +21,13 @@ state:
     from_gacode: ~/git/PRESTOS/example/input.gacode # _H_HighColl_179449_1500
 
 boundary:
-  class: boundary.FixedInitial
+  class: fixedinitial
   args:
     sigma: 0.1
     
 # Parameter model (optional in current solver flow)
-parameters:
-  class: parameterizations.Spline
+parameterizations:
+  class: spline
   args:
     knots:  [0.88, 0.91, 0.94, 0.97] # alt: n_params_per_prof: []
     spline_type: akima #pchip for defined on y, akima for defined on aLy
@@ -37,12 +37,12 @@ parameters:
     # lcfs_aLti_in_params: False
 
 neutrals:
-  class: neutrals.Diffusive
+  class: diffusive
   args:
     n0_edge: None #[1e-2,1e-8] # 1e19/m^3
 
 transport:
-  class: transport.CH_fingerprints
+  class: tglf
   args:
     modes: all
     sigma: 0.1 # relative uncertainty on transport model, 1 sigma
@@ -65,35 +65,43 @@ transport:
     TGLF_options:
       keep_files: minimal
       settings: {
-        SAT_RULE: 2,
+        SAT_RULE: 3,
         UNITS: CGYRO,
-        USE_BPER: True,
-        # RLNP_CUTOFF: 100, # try at 10 too
-        # NBASIS_MIN: 4,
-        # NBASIS_MAX: 8,         
+        USE_BPER: False,
+        USE_BPAR: False,
+        # ADIABATIC_ELEC: FALSE,
+        NBASIS_MIN: 2,
+        NBASIS_MAX: 8,         
         # NWIDTH: 40,
-        # WIDTH: 3.,
-        # WIDTH_MIN: 0.2,
+        WIDTH: 2.,
+        WIDTH_MIN: 0.2,
         # NXGRID: 24,
         # NKY: 40,
         # KY: 0.05,
-        # KYGRID_MODEL: 1, # try with 4
+        KYGRID_MODEL: 4, # or 4 for SAT2/3
         # FILTER: 1.0,
         # USE_INBOARD_DETRAPPED: True,
         # WD_ZERO: 0.01,
         # DAMP_PSI: 0.1,
         # DAMP_SIG: 0.1,
+        XNU_MODEL: 3, # 2 for SAT0/1
+        # KX0_LOC: 0, # Kx0/ky ballooning mode offset
+        # ALPHA_ZF: -1, # avoid unphysical low ky peaks
+        #USE_MHD_RULE: True,
+        # USE_AVE_ION_GRID: True,
         }
       multipliers: {}
     QLGYRO_options: 
       keep_files: minimal
       settings: {
+        SAT_RULE: 3,
+        KYGRID_MODEL: 4,
         }
       multipliers: {}
     CGYRO_options:
       keep_files: minimal
       settings: {
-        NONLINEAR_FLAG: 1,
+        NONLINEAR_FLAG: 0,
         UP_THETA: 1.25,
         UP_RADIAL: 1.25,
         UP_ALPHA: 1.25,
@@ -115,7 +123,7 @@ transport:
 
 
 targets:
-  class: targets.Analytic
+  class: analytic
   args:
     scale_Pe_beam: 1.0
     scale_Pi_beam: 1.0
@@ -124,17 +132,30 @@ targets:
     sigma: 0.1 # relative uncertainty on targets, 1 sigma
 
 solver:
-  class: solvers.RelaxSolver
+  class: relax
   args:
     # map your predicted profiles to target variables from transport/targets
     predicted_profiles: [ne, te, ti]
-    target_vars: [Ce, Pe, Pi]
+    # target_vars is auto-derived from output_units when omitted:
+    #   flow+total → [Ce, Pe, Pi] | flow+conduction → [Ce, De, Di] | flux+* → [Ge, Qe, Qi]
+    # Override here only if you need non-standard channels.
+    # target_vars: [Ce, Pe, Pi]
+    # Unit system used for flux/flow matching in the residual.
+    # flux_or_flow    : 'flux' (MW/m² or 1e19/m²/s) | 'flow' (MW or 1e19/s, surface-integrated)
+    # gB_or_real      : 'gB' (dimensionless gyroBohm) | 'real' (physical units)
+    # total_or_conduction : 'total' (full heat) | 'conduction' (total minus convection)
+    #                       Applies to Te/Ti heat channels only; requires particle-flux output.
+    output_units:
+      flux_or_flow: flow
+      gB_or_real: real
+      total_or_conduction: total
     roa_eval:  [0.88, 0.91, 0.94, 0.97]
     domain: [0.88, 1.0]
-    tol: 1e-4
-    model_iter_to_stall: 100
-    max_iter: 1000
-    use_surrogate: False
+    tol: 1e-6
+    model_iter_to_stall: 10
+    max_iter: 100
+    use_oscillation_convergence: True
+    use_surrogate: True
     surrogate_warmup: 5
     surrogate_retrain_every: 5
     use_jacobian: False
@@ -145,9 +166,10 @@ solver:
       boundary_conditions: 0.0
       constraints: 0.0
     scale_objective: True # divides total by N_channels
-    step_size: 0.1
+    step_size: 0.5
+    min_step_size: 1e-6
     adaptive_step: True
-    bounds:  [0.0,1000] # [[0,200],[0,5],[0.9,1.0],[0.01,1.0]] # [[1.01,2], [0,10], [0.9,1.1]] # 
+    bounds:  [0.0,100.] # [[0,200],[0,5],[0.9,1.0],[0.01,1.0]] # [[1.01,2], [0,10], [0.9,1.1]] # 
     # [[0,10],[0,15],[0,25],[0,50],[0,100]]  # [0,100] #
 
         # two element list applied to all parameters or list of n_parameters tuples
@@ -173,13 +195,24 @@ solver:
 # Optional single-output surrogate (currently unused by default)
 # Optional: Surrogate configuration with warm-start
 surrogate:
-  class: surrogates.SurrogateManager
+  class: SurrogateManager
   args:
-    warm_start: false  # Enable to pre-train surrogates from evaluation log
+    warm_start: False  # Enable to pre-train surrogates from evaluation log
     type: gp
-    mode: global
+    mode: local
+    use_mean_function: True
+    # Unit system the surrogate is *trained on* and *predicts in* internally.
+    # SurrogateManager converts from these units to the solver's output_units before
+    # returning predictions, so the residual always sees consistent units.
+    # flux_or_flow    : 'flux' | 'flow'
+    # gB_or_real      : 'gB'   | 'real'
+    # total_or_conduction : 'total' | 'conduction'
+    train_units:
+      flux_or_flow: flux
+      gB_or_real: gB
+      total_or_conduction: total
     kwargs:
-      ard: False
+      ard: True
 
     
     # Warm-start configuration (if enabled):

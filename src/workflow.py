@@ -12,29 +12,123 @@ from interfaces import gacode
 from tools.platforms import resolve_platform_config
 from state import PlasmaState
 
-def load_class(path: str):
-    """Dynamically import class given 'Module.ClassName' string."""
+def load_class(path: str, module_prefix: Optional[str] = None):
+    """Dynamically import class given 'Module.ClassName' string or just 'ClassName' with module_prefix.
+    
+    Supports case-insensitive matching and intelligent suffix handling:
+    - "anderson" → finds "AndersonMixing" in solvers module
+    - "ivp" → finds "IvpSolver" in solvers module
+    - "Tglf" → finds "Tglf" in transport module (exact match)
+    
+    Parameters
+    ----------
+    path : str
+        Either full path like 'boundary.FixedInitial' or just class name like 'anderson'
+    module_prefix : str, optional
+        Module name to use if path doesn't contain a dot (e.g., 'boundary', 'solvers')
+        Typically comes from the config subsection header.
+    """
+    # Legacy full-path mappings
     legacy_map = {
         "surrogates.GaussianProcessModel": "surrogates.GaussianProcess",
         "surrogates.GaussianProcessSurrogate": "surrogates.GaussianProcess",
     }
     if path in legacy_map:
         path = legacy_map[path]
-    module_name, class_name = path.rsplit('.', 1)
+    
+    # Parse module and class names
+    if '.' in path:
+        module_name, class_name = path.rsplit('.', 1)
+    elif module_prefix:
+        module_name = module_prefix
+        class_name = path
+    else:
+        raise ValueError(f"Cannot load class '{path}': no module prefix provided and path contains no dot")
+    
+    # Import the module
     module = importlib.import_module(module_name)
-    return getattr(module, class_name)
+    
+    # Strategy 1: Try exact match (case-sensitive)
+    if hasattr(module, class_name):
+        obj = getattr(module, class_name)
+        # Ensure it's actually a class, not a module or function
+        if isinstance(obj, type):
+            return obj
+    
+    # Strategy 2: Try case-insensitive exact match
+    # Get only actual classes (exclude modules, functions, etc.)
+    available_classes = {name: obj for name, obj in vars(module).items() 
+                        if isinstance(obj, type) and not name.startswith('_')}
+    
+    class_name_lower = class_name.lower()
+    for name, obj in available_classes.items():
+        if name.lower() == class_name_lower:
+            return obj
+    
+    # Strategy 3: Try with common suffixes for each module type
+    suffix_patterns = {
+        'solvers': ['Solver', 'Mixing', ''],
+        'transport': ['', 'Model'],
+        'boundary': ['', 'Conditions'],
+        'targets': ['', 'Model'],
+        'neutrals': ['', 'Model'],
+        'parameterizations': ['', 'Base'],
+        'surrogates': ['', 'Surrogate'],
+    }
+    
+    # Get module base name (e.g., 'solvers' from 'solvers' or from 'src.solvers')
+    module_base = module_name.split('.')[-1]
+    patterns = suffix_patterns.get(module_base, [''])
+    
+    # Try each suffix pattern
+    for suffix in patterns:
+        candidate = class_name + suffix
+        candidate_lower = candidate.lower()
+        
+        for name, obj in available_classes.items():
+            if name.lower() == candidate_lower:
+                return obj
+    
+    # Strategy 4: Try partial match if class_name is a substring (case-insensitive)
+    # This handles cases like "anderson" matching "AndersonMixing"
+    for name, obj in available_classes.items():
+        if class_name_lower in name.lower() and not name.endswith('Base') and not name.endswith('Mixin'):
+            # Prefer matches that start with the search term
+            if name.lower().startswith(class_name_lower):
+                return obj
+    
+    # If no exact or prefix match, try any substring match
+    for name, obj in available_classes.items():
+        if class_name_lower in name.lower() and not name.endswith('Base') and not name.endswith('Mixin'):
+            return obj
+    
+    # If all strategies fail, provide helpful error message
+    available_names = [name for name in available_classes.keys() if not name.endswith('Base') and not name.endswith('Mixin')]
+    raise ValueError(
+        f"Cannot find class '{class_name}' in module '{module_name}'. "
+        f"Available classes: {', '.join(sorted(available_names))}"
+    )
 
-def build_module(config_entry: Dict[str, Any]):
+def build_module(config_entry: Dict[str, Any], module_prefix: Optional[str] = None):
     """Instantiate a module given its dict from setup.
 
     Expects: {"class": "package.Module.Class", "args": {...}}
+    or {"class": "ClassName", "args": {...}} with module_prefix provided.
+    
+    Parameters
+    ----------
+    config_entry : Dict[str, Any]
+        Configuration dictionary with 'class' and optional 'args'
+    module_prefix : str, optional
+        Module name from config subsection (e.g., 'boundary', 'solvers')
+        Used when class path doesn't include module name.
     """
     if not config_entry:
         return None
     class_path = config_entry.get("class")
     if not class_path:
         return None
-    cls = load_class(class_path)
+    cls = load_class(class_path, module_prefix=module_prefix)
     args = config_entry.get("args", {})
     return cls(args)
 
@@ -77,7 +171,7 @@ def build_state(config_entry: Dict[str, Any]):
 
     # Fallback: try to instantiate a class if provided
     if "class" in (config_entry or {}):
-        cls = load_class(config_entry["class"])
+        cls = load_class(config_entry["class"], module_prefix="state")
         st = cls(**config_entry.get("args", {}))
         # If it looks like a PlasmaState, process it
         if isinstance(st, PlasmaState) and getattr(st, "metadata", None) is not None:
@@ -146,8 +240,20 @@ def restore_module_from_checkpoint(module_name: str, module_specs: Dict[str, Any
         if override_class:
             class_path = override_class
     
+    # Map module names to module prefixes for loading
+    module_prefix_map = {
+        "parameters": "parameterizations",
+        "neutrals": "neutrals",
+        "transport": "transport",
+        "targets": "targets",
+        "surrogate": "surrogates",
+        "solver": "solvers",
+        "boundary": "boundary",
+    }
+    module_prefix = module_prefix_map.get(module_name)
+    
     # Reconstruct the module by instantiating its class
-    cls = load_class(class_path)
+    cls = load_class(class_path, module_prefix=module_prefix)
     
     # Use new config if provided, otherwise extract from checkpoint
     if new_config is not None:
@@ -235,14 +341,14 @@ def run_workflow(setup_file="setup.yaml"):
             state = build_state(config.get("state", {}))
         
         # Restore other modules with new configurations from run_config
-        params_cfg = config.get("parameters") or config.get("parameterization")
+        params_cfg = config.get("parameters") or config.get("parameterization") or config.get("parameterizations")
         parameters = restore_module_from_checkpoint("parameters", module_specs, _inject_verbose(params_cfg, verbose))
         if parameters is None and params_cfg:
-            parameters = build_module(_inject_verbose(params_cfg, verbose))
+            parameters = build_module(_inject_verbose(params_cfg, verbose), module_prefix="parameterizations")
         
         neutrals = restore_module_from_checkpoint("neutrals", module_specs, _inject_verbose(config.get("neutrals", {}), verbose))
         if neutrals is None:
-            neutrals = build_module(_inject_verbose(config.get("neutrals", {}), verbose))
+            neutrals = build_module(_inject_verbose(config.get("neutrals", {}), verbose), module_prefix="neutrals")
         
         transport_cfg = config.get("transport", {})
         if transport_cfg and "args" in transport_cfg:
@@ -252,7 +358,7 @@ def run_workflow(setup_file="setup.yaml"):
                 transport_cfg["args"]["platform"] = config["platform"]
         transport = restore_module_from_checkpoint("transport", module_specs, _inject_verbose(transport_cfg, verbose))
         if transport is None:
-            transport = build_module(_inject_verbose(transport_cfg, verbose))
+            transport = build_module(_inject_verbose(transport_cfg, verbose), module_prefix="transport")
         if transport is not None:
             print(
                 "Transport model initialized: "
@@ -262,7 +368,7 @@ def run_workflow(setup_file="setup.yaml"):
         targets_cfg = config.get("targets", {})
         targets = restore_module_from_checkpoint("targets", module_specs, _inject_verbose(targets_cfg, verbose))
         if targets is None:
-            targets = build_module(_inject_verbose(targets_cfg, verbose))
+            targets = build_module(_inject_verbose(targets_cfg, verbose), module_prefix="targets")
         
         # Apply scaling factors to state for parameter scans
         # This must happen at initialization and be held constant
@@ -271,18 +377,18 @@ def run_workflow(setup_file="setup.yaml"):
         
         surrogate = restore_module_from_checkpoint("surrogate", module_specs, _inject_verbose(config.get("surrogate", {}), verbose))
         if surrogate is None:
-            surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose))
+            surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose), module_prefix="surrogates")
     else:
         # Fresh run: build all modules from config
         # Build state first (supports from_gacode path)
         state = build_state(config.get("state", {}))
 
-        # Parameters: accept either 'parameters' or legacy 'parameterization'
-        params_cfg = config.get("parameters") or config.get("parameterization")
-        parameters = build_module(_inject_verbose(params_cfg, verbose)) if params_cfg else None
+        # Parameters: accept either 'parameters' or legacy 'parameterization' or 'parameterizations'
+        params_cfg = config.get("parameters") or config.get("parameterization") or config.get("parameterizations")
+        parameters = build_module(_inject_verbose(params_cfg, verbose), module_prefix="parameterizations") if params_cfg else None
         
         # Other components
-        neutrals = build_module(_inject_verbose(config.get("neutrals", {}), verbose))
+        neutrals = build_module(_inject_verbose(config.get("neutrals", {}), verbose), module_prefix="neutrals")
         
         # Inject work_dir and platform config into transport module
         transport_cfg = config.get("transport", {})
@@ -291,7 +397,7 @@ def run_workflow(setup_file="setup.yaml"):
             # Pass platform config to transport so model execution can run on remote platform
             if "platform" in config:
                 transport_cfg["args"]["platform"] = config["platform"]
-        transport = build_module(_inject_verbose(transport_cfg, verbose))
+        transport = build_module(_inject_verbose(transport_cfg, verbose), module_prefix="transport")
         if transport is not None:
             print(
                 "Transport model initialized: "
@@ -299,14 +405,14 @@ def run_workflow(setup_file="setup.yaml"):
             )
         
         targets_cfg = config.get("targets", {})
-        targets = build_module(_inject_verbose(targets_cfg, verbose))
+        targets = build_module(_inject_verbose(targets_cfg, verbose), module_prefix="targets")
         
         # Apply scaling factors to state for parameter scans
         # This must happen at initialization and be held constant
         if targets and hasattr(targets, 'targets') and hasattr(targets.targets, 'options'):
             _apply_target_scaling_to_state(state, targets.targets.options)
         
-        surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose))
+        surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose), module_prefix="surrogates")
     
     # Update solver config with parameter count
     if parameters:
@@ -315,8 +421,8 @@ def run_workflow(setup_file="setup.yaml"):
     if parameters:
         config["solver"]["args"]["n_params_per_profile"] = parameters.n_params_per_profile
     
-    solver = build_module(_inject_verbose(config.get("solver", {}), verbose))
-    boundary = build_module(_inject_verbose(config.get("boundary", {}), verbose))
+    solver = build_module(_inject_verbose(config.get("solver", {}), verbose), module_prefix="solvers")
+    boundary = build_module(_inject_verbose(config.get("boundary", {}), verbose), module_prefix="boundary")
 
     # Now execute workflow logic
     solver.run(state, boundary, parameters, neutrals, transport, targets, surrogate=surrogate)

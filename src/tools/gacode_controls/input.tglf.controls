@@ -20,12 +20,11 @@ THETA_TRAPPED           = 0.7        # Parameter to adjust trapped fraction mode
 USE_BPER                = False     # Include transverse magnetic fluctuations, delta A parallel -> PERPENDICULAR FLUCTUATIONS
 USE_BPAR                = False     # Include compressional magnetic fluctuations, \delta B_{\lVert }}  -> COMPRESSIONAL EFFECTS
 USE_MHD_RULE            = False     # Ignore pressure gradient contribution to curvature drift
-XNU_MODEL               = 2         # Collision model (2=new)
+XNU_MODEL               = 3         # Collision model (2 for SAT01, 3 for SAT2/3)
 VPAR_MODEL              = 0         # 0=low-Mach-number limit (DEPRECATED?)
 VPAR_SHEAR_MODEL        = 1
 USE_AVE_ION_GRID        = False      # T:Use weighted average charge of ions for the gyroradius reference, F: Use first ion
 USE_INBOARD_DETRAPPED   = False      # Set trapped fraction to zero if eigenmode is inward ballooning.
-RLNP_CUTOFF             = 18.0       # Limits SAT2 factor of R/Lp < RLNP_CUTOFF
 NEW_EIKONAL             = True
 
 # ~~~ Wavenumber grid
@@ -66,5 +65,4 @@ LINSKER_FACTOR          = 0.0
 GRADB_FACTOR            = 0.0
 WD_ZERO                 = 0.1       # Cutoff for curvature drift eigenvalues to prevent zero
 FILTER                  = 2.0       # Sets threshold for frequency/drift frequency to filter out non-driftwave instabilities
-WDIA_TRAPPED            = 0.0
 

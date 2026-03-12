@@ -56,27 +56,21 @@ class HistoryData:
     Y_target_list: List[Dict[str, np.ndarray]]
 
 
-def load_history(path: str) -> HistoryData:
+def load_history(path: str) -> pd.DataFrame:
+    """Load solver history CSV produced by SolverData.save().
+
+    Returns a DataFrame with one row per iteration.  Key column groups:
+      - ``iter``, ``Z``, ``used_surrogate``
+      - ``X_{profile}_{param}`` / ``X_std_...`` – solver parameters
+      - ``R_{block}_{j}`` – residual channels per block
+      - ``model_{var}_{j}`` / ``model_{var}_std_{j}`` – transport model outputs
+          (totals *and* per-mechanism components, e.g. ``model_Pe_neo_0``)
+      - ``target_{var}_{j}`` / ``target_{var}_std_{j}`` – power-balance targets
+    """
     df = pd.read_csv(path)
-    # Normalize objective column name
-    obj_col = 'Z' if 'Z' in df.columns else ('J' if 'J' in df.columns else None)
+    obj_col = "Z" if "Z" in df.columns else ("J" if "J" in df.columns else None)
     if obj_col is None:
-        raise ValueError('Objective column (Z or J) not found in history CSV.')
-    iterations = df['iter'].to_numpy()
-    objective = df[obj_col].to_numpy()
-    used_surrogate = df.get('used_surrogate', pd.Series([False]*len(df))).astype(bool).to_numpy()
-
-    X_list = []
-    R_list = []
-    Y_list = []
-    Y_target_list = []
-    for _, row in df.iterrows():
-        X_list.append(_safe_eval(row.get('X', '{}')))
-        R_raw = _safe_eval(row.get('R', '[]'))
-        R_list.append(np.asarray(R_raw, dtype=float) if isinstance(R_raw, (list, tuple, np.ndarray)) else np.array([]))
-        Y_list.append(_safe_eval(row.get('Y', '{}')))
-        Y_target_list.append(_safe_eval(row.get('Y_target', '{}')))
-
+        raise ValueError("Objective column (Z or J) not found in history CSV.")
     return df
 
 

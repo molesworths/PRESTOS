@@ -6,11 +6,13 @@ from typing import Any, Dict, Optional, Tuple, List
 import numpy as np
 
 try:
-    from sklearn.preprocessing import StandardScaler
+    from sklearn.preprocessing import MinMaxScaler, StandardScaler
 except Exception:
+    MinMaxScaler = None
     StandardScaler = None
 
 from .base import SurrogateBase
+from .mean_functions import MeanFunctionBase, create_mean_function
 from .registry import SURROGATE_MODELS
 
 
@@ -34,33 +36,61 @@ class SurrogateManager:
         self.models: Dict[str, Any] = {}
         self.X_train: List[Dict[str, np.ndarray]] = []
         self.Y_train: List[Dict[str, np.ndarray]] = []
-        self.max_train_samples = options.get("max_train_samples", 10)
         self.min_score_threshold = options.get("min_score_threshold", 0.5)
-        self.min_sample_distance = options.get("min_sample_distance", 0.01)
         self.trained = False
-        self._X_train_bounds = None
-        self.x_scaler = None  # StandardScaler for input standardization
-        self.y_scalers = {}  # Output scalers per output variable
+        self.x_scaler = None  # MinMaxScaler for input normalisation to [0, 1]
+        self.y_scalers = {}  # Output scalers per output variable (StandardScaler)
         self.score = {}  # R^2 scores per output
+        # Mean function options
+        self.use_mean_function: bool = bool(options.get("use_mean_function", False))
+        self.mean_function_config: Dict[str, Any] = dict(options.get("mean_function_config", {}))
+        # gyroBohm flux option: train on gB-normalised fluxes
+        # Use train_units['gB_or_real'] == 'gB' to enable; use_gB is an alias
+        self.use_gB: bool = bool(options.get("use_gB", False))  # kept for config compatibility
         self.state_features: List[str] = []
         self.param_features: List[str] = []
         self.all_features: List[str] = []
         self._full_state_features = [
-            "aLne", "aLte", "aLti", "vexb_shear",
-            "rhostar", "nustar", "tite", "betae",
-            "q", "shear", "eps", "Zeff",
+            "aLne", "aLte", "aLti", "vexb_shear",   # stage 1: gradients + rotation shear
+            "nustar", "tite",                          # stage 2: collisionality, Ti/Te ratio
+            "betae",                                   # stage 3: electromagnetic effects
         ]
         self._full_all_features: List[str] = []
         self._active_stage: Optional[str] = None
 
-    def _initialize(self, transport_vars: List[str], target_vars: List[str], roa_eval: np.ndarray, state: Any, X_params: Dict[str, Dict[str, np.ndarray]]):
-        """Delayed initialization to receive vars from solver."""
+        # Unit system in which this surrogate stores training data and makes
+        # predictions internally.  Configured via ``surrogate.args.train_units``
+        # in run_config.  Defaults to gB-normalised fluxes (compact,
+        # physics-informed).  Surrogate predictions are converted from train_units
+        # → solver_output_units before being returned to the solver.
+        _train_units_cfg = options.get("train_units", options.get("output_units", {}))
+        self.train_units: Dict[str, str] = {
+            "flux_or_flow": str(_train_units_cfg.get("flux_or_flow", "flux")),
+            "gB_or_real": str(_train_units_cfg.get("gB_or_real", "gB")),
+            "total_or_conduction": str(_train_units_cfg.get("total_or_conduction", "total")),
+        }
+        # Set by solver during _initialize() — this is the unit system the
+        # solver uses for residual computation (i.e. what transport/targets return).
+        # Defaults to train_units so no conversion is applied unless the solver
+        # explicitly overrides it.
+        self.solver_output_units: Dict[str, str] = dict(self.train_units)
+
+    def _initialize(
+        self,
+        transport_vars: List[str],
+        target_vars: List[str],
+        roa_eval: np.ndarray,
+        state: Any,
+        X_params: Dict[str, Dict[str, np.ndarray]],
+        solver_output_units: Optional[Dict[str, str]] = None,
+    ):
+        """Delayed initialization to receive vars and unit config from solver."""
         self.transport_vars = transport_vars
         self.target_vars = target_vars
         self.roa_eval = roa_eval
         self.output_list = self.transport_vars + self.target_vars
-        if self.roa_eval is not None and len(self.roa_eval) > 5:
-            self.mode = 'global'
+        if solver_output_units is not None:
+            self.solver_output_units = dict(solver_output_units)
         self._ensure_param_features(X_params)
         self._refresh_full_features()
         self._set_active_features(len(self.X_train))
@@ -125,17 +155,15 @@ class SurrogateManager:
         return all_features
 
     def _stage_state_features(self, n_samples: int) -> List[str]:
-        stage1 = ["aLne", "aLte", "aLti", "vexb_shear"]
-        stage2 = stage1 + ["rhostar", "nustar", "tite", "betae"]
-        if n_samples < 5:
-            return stage1
+        # Thresholds aligned with PORTALS: stage transitions at 10 and 30 evaluations
+        stage1 = ["aLne", "aLte", "aLti", "vexb_shear"]    # gradients + rotation shear
+        stage2 = stage1 + ["nustar", "tite"]               # + collisionality, Ti/Te
+        stage3 = stage2 + ["betae"]                        # + electromagnetic effects
         if n_samples < 10:
+            return stage1
+        if n_samples < 30:
             return stage2
-        if n_samples > 20:
-            return stage2 + ["q", "shear", "eps", "Zeff"]
-
-        # Later: convert to physics-informed composite features, e.g., trapped fraction, resistive drive, etc.
-        return stage2
+        return stage3
 
     def _set_active_features(self, n_samples: int) -> bool:
         next_state_features = self._stage_state_features(n_samples)
@@ -143,14 +171,12 @@ class SurrogateManager:
             return False
         self.state_features = next_state_features
         self.all_features = self._build_all_features(self.state_features)
-        if n_samples < 5:
+        if n_samples < 10:
             self._active_stage = "stage1"
-        elif n_samples < 10:
+        elif n_samples < 30:
             self._active_stage = "stage2"
-        elif n_samples > 20:
-            self._active_stage = "stage3"
         else:
-            self._active_stage = "stage2"
+            self._active_stage = "stage3"
         return True
 
     # ------------------------------------------------
@@ -161,16 +187,46 @@ class SurrogateManager:
         for key in self.output_list:
             if self.mode == 'local':
                 self.models[key] = [
-                    self.create_surrogate_model(self.model_config, features=self.all_features) for _ in range(len(self.roa_eval))
+                    self.create_surrogate_model(
+                        self.model_config,
+                        features=self.all_features,
+                        output_key=key,
+                    )
+                    for _ in range(len(self.roa_eval))
                 ]
             else:
-                self.models[key] = self.create_surrogate_model(self.model_config, features=self.all_features)
+                self.models[key] = self.create_surrogate_model(
+                    self.model_config,
+                    features=self.all_features,
+                    output_key=key,
+                )
 
-    def create_surrogate_model(self, config: Dict[str, Any], features: List[str]) -> SurrogateBase:
+    def create_surrogate_model(
+        self,
+        config: Dict[str, Any],
+        features: List[str],
+        output_key: Optional[str] = None,
+    ) -> SurrogateBase:
         kind = config.get("type", "gaussian_process").lower()
-        if kind in SURROGATE_MODELS:
-            return SURROGATE_MODELS[kind](config, features=features)
-        raise ValueError(f"Unknown surrogate type '{kind}'.")
+        if kind not in SURROGATE_MODELS:
+            raise ValueError(f"Unknown surrogate type '{kind}'.")
+
+        # Per-channel mean function: target channels get a full linear (ridge) mean;
+        # transport channels get the physics-constrained single-gradient mean.
+        mean_function: Optional[MeanFunctionBase] = None
+        if self.use_mean_function and output_key is not None:
+            is_target = output_key in self.target_vars
+            mean_function = create_mean_function(
+                output_key, features, self.mean_function_config, is_target=is_target
+            )
+
+        # GaussianProcess accepts mean_function; other models ignore it
+        cls = SURROGATE_MODELS[kind]
+        try:
+            return cls(config, features=features, mean_function=mean_function)
+        except TypeError:
+            # Fallback for surrogate classes that don't accept mean_function
+            return cls(config, features=features)
 
     def get_features(self, state: Any = None, X_params=None,
                      state_features: Optional[List[str]] = None,
@@ -287,41 +343,124 @@ class SurrogateManager:
 
         return X_samples
 
-    def get_outputs(self, transport: dict, targets: dict) -> np.ndarray:
-        """Construct output array for all transport and target variables."""
+    @staticmethod
+    def _extract_from_transport_dict(transport_dict: dict, key: str, norm: str) -> "np.ndarray":
+        """Extract a channel array from the nested transport_dict.
+
+        Key convention: ``'{channel}'`` (total) or ``'{channel}_turb'`` / ``'{channel}_neo'``.
+
+        Channel routing::
+
+            Ge, Gi, Qe, Qi  → fluxes[norm][channel][component]
+            Pe, Pi           → flows[norm][Pe|Pi]['total'][component]
+            Ce, Ci           → flows[norm][Pe|Pi]['conv'][component]
+            De, Di           → flows[norm][Pe|Pi]['cond'][component]
+        """
+        import numpy as _np
+        if key.endswith('_turb'):
+            base, comp = key[:-5], 'turb'
+        elif key.endswith('_neo'):
+            base, comp = key[:-4], 'neo'
+        else:
+            base, comp = key, 'total'
+
+        fluxes = transport_dict.get('fluxes', {}).get(norm, {})
+        flows  = transport_dict.get('flows',  {}).get(norm, {})
+
+        if base in ('Ge', 'Gi', 'Qe', 'Qi'):
+            return _np.asarray(fluxes[base][comp])
+        if base in ('Pe', 'Pi'):
+            return _np.asarray(flows[base]['total'][comp])
+        if base == 'Ce':
+            return _np.asarray(flows['Pe']['conv'][comp])
+        if base == 'De':
+            return _np.asarray(flows['Pe']['cond'][comp])
+        if base == 'Ci':
+            return _np.asarray(flows['Pi']['conv'][comp])
+        if base == 'Di':
+            return _np.asarray(flows['Pi']['cond'][comp])
+        raise KeyError(f"Unknown transport channel '{key}' in transport_dict (norm='{norm}')")
+
+    def get_outputs(
+        self,
+        transport: dict,
+        targets: dict,
+        transport_gB: Optional[dict] = None,
+        targets_gB: Optional[dict] = None,
+        transport_dict: Optional[dict] = None,
+    ) -> np.ndarray:
+        """Construct output array for all transport and target variables.
+
+        Prefers ``transport_dict`` (full nested structure from TransportBase) for
+        extracting turb/neo/total components.  Falls back to flat ``transport_gB``
+        or ``transport`` when not available.
+
+        Parameters
+        ----------
+        transport : dict
+            Transport fluxes keyed by variable name (physical units, totals only).
+        targets : dict
+            Target values keyed by variable name (physical units).
+        transport_gB : dict, optional
+            Flat gB-normalised transport dict (legacy fallback).
+        targets_gB : dict, optional
+            Flat gB-normalised target dict.
+        transport_dict : dict, optional
+            Full nested transport dict ``{'fluxes': ..., 'flows': ...}`` with
+            ``'gB'`` and ``'real'`` sub-dicts, each containing turb/neo/total.
+            Takes precedence over ``transport_gB`` when provided.
+        """
+        use_gB_training = self.train_units.get('gB_or_real', 'real') == 'gB' or self.use_gB
+        norm = 'gB' if use_gB_training else 'real'
+        eff_targets = targets_gB if (use_gB_training and targets_gB is not None) else targets
+
         Y_sample = np.empty((len(self.roa_eval), len(self.output_list)))
         for i, roa in enumerate(self.roa_eval):
-            transport_sample = np.array([transport[name][i] for name in self.transport_vars], dtype=float)
-            targets_sample = np.array([targets[name][i] for name in self.target_vars], dtype=float)
+            if transport_dict is not None:
+                transport_sample = np.array(
+                    [float(self._extract_from_transport_dict(transport_dict, name, norm)[i])
+                     for name in self.transport_vars],
+                    dtype=float,
+                )
+            elif use_gB_training and transport_gB is not None:
+                transport_sample = np.array([transport_gB[name][i] for name in self.transport_vars], dtype=float)
+            else:
+                transport_sample = np.array([transport[name][i] for name in self.transport_vars], dtype=float)
+            targets_sample = np.array([eff_targets[name][i] for name in self.target_vars], dtype=float)
             Y_sample[i] = np.concatenate([transport_sample, targets_sample])
 
         return Y_sample  # row for each roa_eval
 
-    def add_sample(self, state, X_params, transport, targets, is_fd_sample: bool = False):
+    def add_sample(
+        self,
+        state,
+        X_params,
+        transport: dict,
+        targets: dict,
+        transport_gB: Optional[dict] = None,
+        targets_gB: Optional[dict] = None,
+        transport_dict: Optional[dict] = None,
+    ):
         """Extract new training data from current iteration and append.
 
-        Always stores ALL stage-3 features (all 12 state features + parameters) regardless
-        of current training stage. This ensures training data is complete and feature-complete.
-        During fit(), only stage-appropriate features are used for trained based on sample count.
+        Always stores ALL stage-3 features regardless of current training stage;
+        fit() uses only the stage-appropriate subset.
 
         Parameters
         ----------
         state : PlasmaState
-            Current plasma state
         X_params : dict
-            Design parameters
         transport : dict
-            Transport coefficients
+            Transport fluxes (physical units, totals).
         targets : dict
-            Target values
-        is_fd_sample : bool
-            If True, skip adding (finite-difference perturbations pollute training data)
+            Target values (physical units).
+        transport_gB : dict, optional
+            Flat gB-normalised transport dict (legacy fallback).
+        targets_gB : dict, optional
+            Flat gB-normalised target dict.
+        transport_dict : dict, optional
+            Full nested transport dict; takes precedence over transport_gB.
         """
-        # Skip finite-difference samples - they cluster around single points
-        # and crowd out diverse trajectory samples with limited max_train_samples
-        if is_fd_sample:
-            return
-
         self._ensure_param_features(X_params)
         self._refresh_full_features()
         # Always extract ALL features (stage 3) for storage
@@ -331,11 +470,7 @@ class SurrogateManager:
             state_features=self._full_state_features,
             all_features=self._full_all_features,
         )
-        Y_sample_array = self.get_outputs(transport, targets)
-
-        # Check diversity: skip samples too close to existing training data
-        if self._is_too_similar(X_features_array):
-            return  # Skip near-duplicate samples to maintain diversity
+        Y_sample_array = self.get_outputs(transport, targets, transport_gB=transport_gB, targets_gB=targets_gB, transport_dict=transport_dict)
 
         # Store with ALL stage-3 features (complete feature set)
         X_sample_dict = {self._full_all_features[i]: X_features_array[:, i] for i in range(len(self._full_all_features))}
@@ -344,48 +479,6 @@ class SurrogateManager:
         self.X_train.append(X_sample_dict)
         self.Y_train.append(Y_sample_dict)
         self.trained = False
-
-        # Limit training set size - remove oldest samples if needed
-        if len(self.X_train) > self.max_train_samples:
-            # Remove oldest samples to stay at max_train_samples
-            n_excess = len(self.X_train) - self.max_train_samples
-            self.X_train = self.X_train[n_excess:]
-            self.Y_train = self.Y_train[n_excess:]
-
-    def _is_too_similar(self, X_new: np.ndarray) -> bool:
-        """Check if new sample is too close to existing training data.
-
-        Parameters
-        ----------
-        X_new : np.ndarray
-            New feature array, shape (n_roa, n_features)
-
-        Returns
-        -------
-        bool
-            True if sample is redundant (too similar to existing data)
-        """
-        if not self.X_train or self.min_sample_distance <= 0:
-            return False  # No filtering if no training data or disabled
-
-        # Convert to flat feature vector for distance calculation
-        X_new_flat = X_new.flatten()
-
-        # Compute normalized distance to all existing samples
-        feature_list = self._full_all_features if self._full_all_features else self.all_features
-        for X_dict in self.X_train:
-            X_old_flat = np.array([X_dict.get(feat, np.zeros_like(X_dict[self.state_features[0]])) for feat in feature_list]).flatten()
-
-            # Normalize by feature ranges to make distance scale-invariant
-            # Use robust scaling based on current sample range
-            diff = X_new_flat - X_old_flat
-            scale = np.maximum(np.abs(X_new_flat), np.abs(X_old_flat), np.ones_like(X_new_flat))
-            normalized_dist = np.linalg.norm(diff / scale) / np.sqrt(len(X_new_flat))
-
-            if normalized_dist < self.min_sample_distance:
-                return True  # Too similar to existing sample
-
-        return False  # Sufficiently different
 
     # ------------------------------------------------
     # Training interface
@@ -434,16 +527,15 @@ class SurrogateManager:
             for o_idx, output in enumerate(self.output_list):
                 Y_all_samples[s_idx, :, o_idx] = sample_dict[output]
 
-        # Stage 1: Apply input standardization (StandardScaler)
-        self.x_scaler = StandardScaler()
+        # Stage 1: Normalise inputs to [0, 1] per feature (calibrates lengthscale priors)
+        self.x_scaler = MinMaxScaler()
         X_scaled = self.x_scaler.fit_transform(X_all_samples.reshape(-1, n_features)).reshape(n_samples, n_roa, n_features)
 
         # Stage 2: Standardize outputs per variable (StandardScaler)
         self.y_scalers = {key: StandardScaler() for key in self.output_list}
 
-        # Track training bounds for extrapolation detection
+        # Track training bounds for extrapolation detection (available post-fit via x_scaler)
         X_flat = X_scaled.reshape(-1, n_features)
-        self._X_train_bounds = np.column_stack([X_flat.min(axis=0), X_flat.max(axis=0)])
 
         # Train all models using stage-appropriate features
         for j, key in enumerate(self.models.keys()):
@@ -453,9 +545,13 @@ class SurrogateManager:
                 self.models[key].fit(X_fit, Y_fit)
                 scores[key] = self.models[key].score(X_fit, Y_fit)
             else:  # local
+                # Fit a single scaler on all roa-point data for this channel so that
+                # evaluate() can use one inverse_transform for all roa positions.
+                self.y_scalers[key].fit(Y_all_samples[:, :, j].reshape(-1, 1))
+
                 for i, model in enumerate(self.models[key]):
                     i_features = X_scaled[:, i, :]
-                    i_outputs = self.y_scalers[key].fit_transform(Y_all_samples[:, i, j].reshape(-1, 1))
+                    i_outputs = self.y_scalers[key].transform(Y_all_samples[:, i, j].reshape(-1, 1))
 
                     if n_samples < 3:
                         print(f"Warning: Local GP for '{key}' at knot {i} has only {n_samples} sample(s)")
@@ -621,6 +717,64 @@ class SurrogateManager:
     # ------------------------------------------------
     # Evaluation
     # ------------------------------------------------
+
+    def _convert_surr_to_solver_units(
+        self,
+        transport: Dict[str, np.ndarray],
+        targets: Dict[str, np.ndarray],
+        state: Any,
+    ) -> tuple:
+        """Convert surrogate predictions from ``train_units`` to ``solver_output_units``.
+
+        If both unit configs are identical, the dicts are returned unchanged.
+        Conversion is performed via ``tools.plasma.convert_output_units``.
+
+        Returns
+        -------
+        tuple
+            (transport_converted, targets_converted)
+        """
+        from tools import plasma as _plasma
+
+        if self.train_units == self.solver_output_units:
+            return transport, targets
+
+        roa_points = self.roa_eval
+        from_units = self.train_units
+        to_units = self.solver_output_units
+
+        # Assemble a combined particle-flux dict for conduction conversions.
+        Gamma_combining = {}
+        for key in list(transport.keys()) + list(targets.keys()):
+            base = _plasma._get_base_channel(key)
+            if base in _plasma._PARTICLE_BASE_CHANNELS:
+                spec = 'e' if 'e' in base.lower() else 'i'
+                # Convert to real first if in gB
+                val = np.asarray(transport.get(key, targets.get(key, np.zeros_like(roa_points))), dtype=float)
+                if from_units.get('gB_or_real', 'real') == 'gB':
+                    g_gb = np.interp(roa_points, state.roa, state.g_gb)
+                    val = _plasma.particle_flux_gB_to_real(val, g_gb)
+                Gamma_combining[f'G{spec}'] = val
+
+        def _convert_dict(d):
+            out = {}
+            for ch, val in d.items():
+                base = _plasma._get_base_channel(ch)
+                spec = 'e' if 'e' in base.lower() else 'i'
+                Gamma = Gamma_combining.get(f'G{spec}')
+                out[ch] = _plasma.convert_output_units(
+                    value=np.asarray(val, dtype=float),
+                    channel=ch,
+                    from_units=from_units,
+                    to_units=to_units,
+                    state=state,
+                    roa_points=roa_points,
+                    Gamma_1e19=Gamma,
+                )
+            return out
+
+        return _convert_dict(transport), _convert_dict(targets)
+
     def evaluate(self, params, state: Any):
         """Predict surrogate outputs for current state.
 
@@ -739,32 +893,42 @@ class SurrogateManager:
                 transport[base_var] = summed_value
                 transport_std[base_var] = summed_std
 
-        self.transport = transport
-        self.transport_std = transport_std
-        self.targets = targets
-        self.targets_std = targets_std
+        # Convert from surrogate training units → solver's residual units
+        # (no-op when both unit configs are identical)
+        if not is_batched:
+            transport, targets = self._convert_surr_to_solver_units(transport, targets, state)
 
-        # Return in format matching input
-        if is_batched:
-            # Stack as (n_batch, n_outputs, n_roa)
-            transport_vals = np.array([transport[k] for k in self.transport_vars])
-            transport_std_vals = np.array([transport_std[k] for k in self.transport_vars])
-            targets_vals = np.array([targets[k] for k in self.target_vars])
-            targets_std_vals = np.array([targets_std[k] for k in self.target_vars])
+        return transport, transport_std, targets, targets_std
 
-            values = np.concatenate([transport_vals, targets_vals], axis=0).transpose(1, 0, 2)
-            stds = np.concatenate([transport_std_vals, targets_std_vals], axis=0).transpose(1, 0, 2)
-        else:
-            # Stack as (n_outputs, n_roa)
-            transport_vals = np.array([transport[k] for k in self.transport_vars])
-            transport_std_vals = np.array([transport_std[k] for k in self.transport_vars])
-            targets_vals = np.array([targets[k] for k in self.target_vars])
-            targets_std_vals = np.array([targets_std[k] for k in self.target_vars])
+    # ------------------------------------------------
+    # Differentiation
+    # ------------------------------------------------
 
-            values = np.concatenate([transport_vals, targets_vals], axis=0)
-            stds = np.concatenate([transport_std_vals, targets_std_vals], axis=0)
+    @staticmethod
+    def _model_grad_fd(
+        model: Any,
+        X: np.ndarray,
+        eps: float = 1e-4,
+    ) -> np.ndarray:
+        """Finite-difference gradient of model.predict mean w.r.t. normalised inputs X.
 
-        return values, stds
+        Works for any model with a `predict(X)` → array or (array, std) interface.
+        Returns shape (n_roa, n_features) matching X.
+        """
+        if hasattr(model, 'get_gradients'):
+            return model.get_gradients(X)
+        n, d = X.shape
+        grad = np.zeros((n, d))
+        for j in range(d):
+            dX = np.zeros_like(X)
+            dX[:, j] = eps
+            p = model.predict(X + dX)
+            m = model.predict(X - dX)
+            grad[:, j] = (
+                np.asarray(p[0] if isinstance(p, tuple) else p).ravel()
+                - np.asarray(m[0] if isinstance(m, tuple) else m).ravel()
+            ) / (2 * eps)
+        return grad
 
     def get_grads(self, params, state: Any) -> Dict[str, np.ndarray]:
         """Compute gradients of surrogate outputs with respect to inputs at current state.
@@ -809,84 +973,25 @@ class SurrogateManager:
         for key in self.output_list:
             gradients = transport_grads if key in self.transport_vars else target_grads
             if is_batched:
-                # Process each batch sample using finite differences
                 batch_grads = []
                 for b in range(n_batch):
                     X_b = X[b]  # (n_roa, n_features)
                     if self.mode == 'global':
-                        model = self.models[key]
-                        if hasattr(model, 'gp_mean_grad_fd'):
-                            grad = model.gp_mean_grad_fd(X_b)
-                        else:
-                            # Generic finite differences on model.predict
-                            eps = 1e-4
-                            n_roa, n_feat = X_b.shape
-                            grad = np.zeros((n_roa, n_feat))
-                            for j in range(n_feat):
-                                dX = np.zeros_like(X_b)
-                                dX[:, j] = eps
-                                mu_plus = model.predict(X_b + dX)[0] if isinstance(model.predict(X_b + dX), tuple) else model.predict(X_b + dX)
-                                mu_minus = model.predict(X_b - dX)[0] if isinstance(model.predict(X_b - dX), tuple) else model.predict(X_b - dX)
-                                grad[:, j] = (np.asarray(mu_plus).ravel() - np.asarray(mu_minus).ravel()) / (2 * eps)
-                            # Unscale gradient to original feature space
-                            grad = grad / np.asarray(self.x_scaler.scale_)
+                        g = self._model_grad_fd(self.models[key], X_b)
                     else:
-                        # Local models per-roa; compute FD per knot
-                        n_roa, n_feat = X_b.shape
-                        grad = np.zeros((n_roa, n_feat))
+                        g = np.zeros_like(X_b)
                         for i, model in enumerate(self.models[key]):
-                            X_i = X_b[i, :].reshape(1, -1)
-                            if hasattr(model, 'gp_mean_grad_fd'):
-                                grad_i = model.gp_mean_grad_fd(X_i)
-                                grad[i, :] = grad_i[0]
-                            else:
-                                eps = 1e-4
-                                dX = np.zeros_like(X_i)
-                                for j in range(n_feat):
-                                    dX[:] = 0.0
-                                    dX[:, j] = eps
-                                    mu_plus = model.predict(X_i + dX)[0] if isinstance(model.predict(X_i + dX), tuple) else model.predict(X_i + dX)
-                                    mu_minus = model.predict(X_i - dX)[0] if isinstance(model.predict(X_i - dX), tuple) else model.predict(X_i - dX)
-                                    grad[i, j] = (float(np.asarray(mu_plus).ravel()) - float(np.asarray(mu_minus).ravel())) / (2 * eps)
-                                grad[i, :] = grad[i, :] / np.asarray(self.x_scaler.scale_)
-                    batch_grads.append(grad)
+                            g[i] = self._model_grad_fd(model, X_b[i:i+1])[0]
+                    batch_grads.append(g)
                 gradients[key] = np.array(batch_grads)  # (n_batch, n_roa, n_features)
             else:
-                # Single sample using finite differences
                 if self.mode == 'global':
-                    model = self.models[key]
-                    if hasattr(model, 'gp_mean_grad_fd'):
-                        grad = model.gp_mean_grad_fd(X)
-                    else:
-                        eps = 1e-4
-                        n_roa, n_feat = X.shape
-                        grad = np.zeros((n_roa, n_feat))
-                        for j in range(n_feat):
-                            dX = np.zeros_like(X)
-                            dX[:, j] = eps
-                            mu_plus = model.predict(X + dX)[0] if isinstance(model.predict(X + dX), tuple) else model.predict(X + dX)
-                            mu_minus = model.predict(X - dX)[0] if isinstance(model.predict(X - dX), tuple) else model.predict(X - dX)
-                            grad[:, j] = (np.asarray(mu_plus).ravel() - np.asarray(mu_minus).ravel()) / (2 * eps)
-                        grad = grad / np.asarray(self.x_scaler.scale_)
+                    gradients[key] = self._model_grad_fd(self.models[key], X)
                 else:
-                    n_roa, n_feat = X.shape
-                    grad = np.zeros((n_roa, n_feat))
+                    g = np.zeros_like(X)
                     for i, model in enumerate(self.models[key]):
-                        X_i = X[i, :].reshape(1, -1)
-                        if hasattr(model, 'gp_mean_grad_fd'):
-                            grad_i = model.gp_mean_grad_fd(X_i)
-                            grad[i, :] = grad_i[0]
-                        else:
-                            eps = 1e-4
-                            dX = np.zeros_like(X_i)
-                            for j in range(n_feat):
-                                dX[:] = 0.0
-                                dX[:, j] = eps
-                                mu_plus = model.predict(X_i + dX)[0] if isinstance(model.predict(X_i + dX), tuple) else model.predict(X_i + dX)
-                                mu_minus = model.predict(X_i - dX)[0] if isinstance(model.predict(X_i - dX), tuple) else model.predict(X_i - dX)
-                                grad[i, j] = (float(np.asarray(mu_plus).ravel()) - float(np.asarray(mu_minus).ravel())) / (2 * eps)
-                            grad[i, :] = grad[i, :] / np.asarray(self.x_scaler.scale_)
-                gradients[key] = grad  # (n_roa, n_features)
+                        g[i] = self._model_grad_fd(model, X[i:i+1])[0]
+                    gradients[key] = g
 
         # sum components for transport variables
         for base_var in self.target_vars:

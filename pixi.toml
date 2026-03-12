@@ -21,7 +21,7 @@ paramiko = ">=4.0.0,<5"
 
 [pypi-dependencies]
 pyqt6 = ">=6.9.1, <7"
-#aurorafusion = { path = "../Aurora", editable = true }
+#aurorafusion = { git = "https://github.com/fsciortino/Aurora.git" }
 
 #[feature.dev.dependencies]
 # Add development dependencies here, e.g. pytest, black, etc.

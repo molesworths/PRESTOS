@@ -12,6 +12,14 @@ A modular, parametric tokamak plasma transport solver with integrated surrogate 
 
 Much of the PRESTOS functionality remains under development. Please report issues, suggest improvements, and ask to become a contributor. 
 
+### Current limitations (next push)
+
+- Bayesian optimization solver is not working yet and should be treated as experimental.
+- Surrogate model behavior is inconsistent (hit-or-miss) and requires case-by-case validation.
+- Neutral solver workflows are currently broken.
+- QLGYRO and CGYRO transport paths have not been fully verified end-to-end.
+- Turbulent energy exchange is not implemented yet and is planned for a future update.
+
 ---
 
 ## Overview
@@ -92,7 +100,7 @@ state:
 
 Edit `run_config.yaml` to specify:
 - Transport model (Fingerprints, TGLF, Cgyro, Fixed, Analytic)
-- Solver type (RelaxSolver, BayesianOptSolver, IvpSolver)
+- Solver type (RelaxSolver, Bayesian, IvpSolver)
 - Parameterization scheme (Spline, Gaussian, GaussianDipole)
 - Target variables and evaluation domain
 - Surrogate settings
@@ -299,7 +307,7 @@ Available models:
 
 ```yaml
 solver:
-  class: solvers.RelaxSolver  # RelaxSolver | BayesianOptSolver | IvpSolver
+  class: solvers.RelaxSolver  # RelaxSolver | Bayesian | IvpSolver
   args:
     predicted_profiles: [ne, te, ti]  # Profiles to optimize
     target_vars: [Ce, Pe, Pi]  # Target quantities (fluxes/powers)
@@ -337,7 +345,7 @@ solver:
   - Good for quick iterations and debugging
   - Supports adaptive step sizing for robustness
   - New: Jacobian caching and adaptive recomputation for efficiency
-- `BayesianOptSolver`: Bayesian optimization with Monte Carlo acquisition functions
+- `Bayesian`: Bayesian optimization with Monte Carlo acquisition functions
   - For expensive evaluations or when surrogate model is primary method
   - Supports expected improvement (EI) and upper confidence bound (UCB)
 - `IvpSolver`: **NEW** - Pseudo-time integration using scipy ODE solvers
@@ -783,7 +791,7 @@ src/
 │   ├── __init__.py          # Solver factory and exports
 │   ├── solver_base.py       # Base class: SolverBase
 │   ├── relax.py             # RelaxSolver: relaxation-based optimization
-│   ├── bayesian_opt.py      # BayesianOptSolver: Bayesian optimization
+│   ├── bayesian_opt.py      # Bayesian: Bayesian optimization
 │   ├── ivp.py               # IvpSolver: pseudo-time integration via ODE
 │   ├── objectives.py        # Objective function definitions
 │   ├── jacobian.py          # Jacobian computation utilities
@@ -911,7 +919,7 @@ from .my_solver import MySolver
 
 SOLVER_MODELS = {
     'relax': RelaxSolver,
-    'bayesian_opt': BayesianOptSolver,
+    'bayesian_opt': Bayesian,
     'ivp': IvpSolver,
     'my_solver': MySolver,  # Add here
 }

@@ -106,8 +106,8 @@ class TwoFluidTwoPoint_PeretSSF(BoundaryConditions):
 
         # Sheath power exhaust factor
         #gamma_0 = (c_s / R0) * np.sqrt(rho_s / R0)
-        gamma_0 = 2.5*ti/te - 0.5*np.log10(2*np.pi*me_over_mi*(1+ti/te))
-        gamma = max(1+1e-6,2*gamma_0/3)
+        gamma_0 = 2.5*ti/te - 0.5*np.log(2*np.pi*me_over_mi*(1+ti/te))
+        gamma = 2*gamma_0/3 # max(1+1e-6,
 
         # Get plasma parameters from state
         rho_s = self.rho_s

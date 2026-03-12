@@ -25,11 +25,32 @@ except ImportError:
 class TargetModel:
     """
     Base class for target models.
-    
+
+    Output structure follows the nested flux/flow dict framework:
+
+      targets_dict = {
+          'fluxes': {
+              'gB'  : {'Ge': {component: arr, ...}, 'Gi': {...}, 'Qe': {...}, 'Qi': {...}},
+              'real': {same, physical units},
+          },
+          'flows': {
+              'gB'  : {'Pe': {component: arr, ...}, 'Pi': {...}},
+              'real': {same, [MW]},
+          },
+      }
+
+    Component keys for target models (replacing the transport turb/neo split):
+      heat flows  : 'aux', 'alpha', 'rad', 'exch', 'total', 'conv', 'cond'
+      particle fluxes : 'beam', 'wall', 'total'
+
+    The flat dict returned by evaluate() contains the channels requested via
+    ``output_vars`` in the natural (real-unit) representation.  gB-normalised
+    values of the same channels are stored on ``self.Y_gB`` for surrogate use.
+
     Supports batch processing:
     - evaluate(state) handles both single PlasmaState and list of PlasmaState objects
-    - Returns results for single state or list of results for batched states
     """
+
     def __init__(self, **kwargs):
         self.verbose = kwargs.get('verbose', False)
 
@@ -37,13 +58,24 @@ class TargetModel:
             pass
         self.targets = TargetsObj()
         self.targets.options = dict(kwargs) if kwargs else {}
-        self.sigma = self.targets.options.get('sigma', 0.1) # relative epistemic uncertainty for target model outputs
+        self.sigma = self.targets.options.get('sigma', 0.1)
+
+        # Containers populated by _evaluate_single in subclasses
+        self.fluxes: Dict[str, Dict] = {'gB': {}, 'real': {}}   # per-m² quantities
+        self.flows:  Dict[str, Dict] = {'gB': {}, 'real': {}}   # surface-integrated [MW]
+        self.targets_dict: Dict = {}   # full nested dict (fluxes + flows)
+        self.Y_gB:    Dict[str, list] = {}  # gB values at roa_eval (for surrogate)
+        self.Y_target: Dict[str, list] = {}
+        self.Y_std:   Dict[str, list] = {}
+
+        # Set by solver before evaluation
+        self.roa_eval = None
+        self.output_vars = []
 
     def _is_batched(self, state) -> bool:
         """Check if state is a batch (list/array of states) vs single state."""
         if isinstance(state, (list, tuple)):
             return True
-        # Check if it's a numpy array of PlasmaState objects
         if isinstance(state, np.ndarray) and state.dtype == object:
             return True
         return False
@@ -109,59 +141,173 @@ class Analytic(TargetModel):
         super().__init__(**config)
 
     def _evaluate_single(self, state: PlasmaState) -> Dict[str, np.ndarray]:
+        """Build power-balance target fluxes and flows.
+
+        All physical source terms are computed and stored on *state* as
+        volumetric power densities [MW/m³].  They are then cumulatively
+        integrated to radial flow profiles [MW] and normalized to gyroBohm
+        units.
+
+        The full nested dict is stored on ``self.targets_dict`` / ``self.fluxes``
+        / ``self.flows`` for diagnostics and surrogate training (``self.Y_gB``).
+
+        Channels available for ``output_vars`` / ``target_vars``:
+          'Pe', 'Pi'  – total net heat flow [MW]
+          'Ce', 'Ci'  – convective heat flow [MW]
+          'De', 'Di'  – conductive heat flow [MW]  (= Pe/Pi - Ce/Ci)
+          'Ge', 'Gi'  – total particle flux [1e19/m²/s]
+          'Qe', 'Qi'  – total heat flux [MW/m²]  (= Pe/Pi / surfArea)
+
+        Returns
+        -------
+        tuple(output_dict, std_dict)
+            Flat dicts keyed by ``self.output_vars``, values are lists of
+            floats at ``self.roa_eval``.
         """
-        Calculate target heat fluxes (Qe, Qi) based on analytical models for
-        fusion heating, radiation, and energy exchange.
+        roa_eval = getattr(self, 'roa_eval', state.roa)
+        output_vars = getattr(self, 'output_vars', ['Pe', 'Pi'])
 
-        - Computes and stores intermediate power densities on state:
-          state.qie, state.qfuse, state.qfusi, state.qrad  [MW/m^3]
-        - Computes target fluxes on full grid and stores on state:
-          state.Qe_target, state.Qi_target  [MW/m^2]
-        - If state.eval_indices exists, returns values sliced to that grid.
-        """
-    # Power densities [MW/m^3]
-        self._evaluate_energy_exchange(state)
-        self._evaluate_alpha_heating(state)
-        self._evaluate_radiation(state)
+        # ------------------------------------------------------------------
+        # 1. Volumetric source/sink densities [MW/m³]
+        # ------------------------------------------------------------------
+        self._evaluate_energy_exchange(state)   # → state.qie
+        self._evaluate_alpha_heating(state)     # → state.qfuse, state.qfusi
+        self._evaluate_radiation(state)         # → state.qrade, state.qradi
 
-        # Electron and ion heat density to powers
-        state.Pfus_e = calc.volume_integrate(state.r, state.qfuse, state.dVdr)
-        state.Pfus_i = calc.volume_integrate(state.r, state.qfusi, state.dVdr)
-        state.Prad_e = calc.volume_integrate(state.r, state.qrade, state.dVdr)
-        state.Prad_i = calc.volume_integrate(state.r, state.qradi, state.dVdr)
-        state.P_ie = calc.volume_integrate(state.r, state.qie, state.dVdr)*0.01
-        state.Paux_e = state.Paux_e if hasattr(state, 'Paux_e') else np.zeros_like(state.r)
-        state.Paux_i = state.Paux_i if hasattr(state, 'Paux_i') else np.zeros_like(state.r)
+        # ------------------------------------------------------------------
+        # 2. Cumulative component heat flows [MW]  (integrated from r=0 outward)
+        # ------------------------------------------------------------------
+        Pfus_e = calc.volume_integrate(state.r, state.qfuse, state.dVdr)
+        Pfus_i = calc.volume_integrate(state.r, state.qfusi, state.dVdr)
+        Prad_e = calc.volume_integrate(state.r, state.qrade, state.dVdr)
+        Prad_i = calc.volume_integrate(state.r, state.qradi, state.dVdr)
+        # Electron-ion exchange [MW]; *0.01 preserves historical scaling
+        Pexch  = calc.volume_integrate(state.r, state.qie,   state.dVdr) * 0.01
+        Paux_e = getattr(state, 'Paux_e', np.zeros_like(state.r))
+        Paux_i = getattr(state, 'Paux_i', np.zeros_like(state.r))
 
-        # Store to state for power-balance matching (total powers) [MW]
-        state.Pe = state.Paux_e - state.Prad_e + state.Pfus_e - state.P_ie
-        state.Pi = state.Paux_i - state.Prad_i + state.Pfus_i + state.P_ie
-        state.Ge = -state.Gamma0*state.Zeff + state.Gbeam_e if hasattr(state,'Gamma0') \
-            else state.Gwall_e + state.Gbeam_e
-        state.Gi = state.Ge / state.Zeff # 1e19/m^2/s
-        state.Ce = state.Ge * 1.5 * state.te * state.Qnorm_to_P  # MW
-        state.Ci = state.Gi * 1.5 * state.ti * state.Qnorm_to_P  # MW
+        # ------------------------------------------------------------------
+        # 3. Net total heat flows [MW]
+        #    sign convention: Prad / Pexch are losses for electrons, gains for ions
+        # ------------------------------------------------------------------
+        Pe = Paux_e + Pfus_e - Prad_e - Pexch
+        Pi = Paux_i + Pfus_i - Prad_i + Pexch
 
+        # ------------------------------------------------------------------
+        # 4. Particle fluxes [1e19/m²/s]
+        # ------------------------------------------------------------------
+        Gbeam_e = getattr(state, 'Gbeam_e', np.zeros_like(state.r))
+        Gwall_e = getattr(state, 'Gwall_e', np.zeros_like(state.r))
+        if hasattr(state, 'Gamma0'):
+            Ge = -state.Gamma0 * state.Zeff + Gbeam_e
+        else:
+            Ge = Gbeam_e + Gwall_e
+        Zeff_safe = np.maximum(state.Zeff, 1e-12)
+        Gi = Ge / Zeff_safe
+        Gbeam_i = Gbeam_e / Zeff_safe
+        Gwall_i = Gwall_e / Zeff_safe
 
-        # Provide dict for requested outputs
+        # ------------------------------------------------------------------
+        # 5. Convective and conductive heat flows [MW]
+        # ------------------------------------------------------------------
+        Ce = plasma.get_convective_flow(state.te, Ge, state.surfArea)
+        Ci = plasma.get_convective_flow(state.ti, Gi, state.surfArea)
+        De = Pe - Ce   # conductive electron heat flow [MW]
+        Di = Pi - Ci   # conductive ion heat flow [MW]
+
+        # ------------------------------------------------------------------
+        # 6. Heat fluxes [MW/m²] = flows / surfArea
+        # ------------------------------------------------------------------
+        Qe = plasma.heat_flow_to_flux(Pe, state.surfArea)
+        Qi = plasma.heat_flow_to_flux(Pi, state.surfArea)
+
+        # ------------------------------------------------------------------
+        # 7. gyroBohm normalization factors
+        # ------------------------------------------------------------------
+        q_gb    = state.q_gb                   # [MW/m²]
+        g_gb    = state.g_gb                   # [1e20/m²/s]
+        P_gB    = q_gb * state.surfArea        # [MW]  flow-level gB norm
+        G_gB    = g_gb * 10.0                  # [1e19/m²/s]  particle-flux gB norm
+        _safe   = lambda x: np.maximum(x, 1e-30)
+
+        # ------------------------------------------------------------------
+        # 8. Build nested flows dict  (component breakdown replaces turb/neo)
+        #    Component keys:  'aux', 'alpha', 'rad', 'exch', 'total', 'conv', 'cond'
+        # ------------------------------------------------------------------
+        Pe_comps_real = {
+            'aux': Paux_e, 'alpha': Pfus_e, 'rad': Prad_e, 'exch': Pexch,
+            'total': Pe, 'conv': Ce, 'cond': De,
+        }
+        Pi_comps_real = {
+            'aux': Paux_i, 'alpha': Pfus_i, 'rad': Prad_i, 'exch': Pexch,
+            'total': Pi, 'conv': Ci, 'cond': Di,
+        }
+        self.flows = {
+            'real': {'Pe': Pe_comps_real, 'Pi': Pi_comps_real},
+            'gB': {
+                'Pe': {k: v / _safe(P_gB) for k, v in Pe_comps_real.items()},
+                'Pi': {k: v / _safe(P_gB) for k, v in Pi_comps_real.items()},
+            },
+        }
+
+        # ------------------------------------------------------------------
+        # 9. Build nested fluxes dict
+        #    Component keys for particle: 'beam', 'wall', 'total'
+        #    Component keys for heat: 'total'  (component flows are in flows dict)
+        # ------------------------------------------------------------------
+        Ge_comps_real = {'beam': Gbeam_e, 'wall': Gwall_e, 'total': Ge}
+        Gi_comps_real = {'beam': Gbeam_i, 'wall': Gwall_i, 'total': Gi}
+        self.fluxes = {
+            'real': {
+                'Ge': Ge_comps_real,
+                'Gi': Gi_comps_real,
+                'Qe': {'total': Qe},
+                'Qi': {'total': Qi},
+            },
+            'gB': {
+                'Ge': {k: v / _safe(G_gB) for k, v in Ge_comps_real.items()},
+                'Gi': {k: v / _safe(G_gB) for k, v in Gi_comps_real.items()},
+                'Qe': {'total': Qe / _safe(q_gb)},
+                'Qi': {'total': Qi / _safe(q_gb)},
+            },
+        }
+
+        self.targets_dict = {'fluxes': self.fluxes, 'flows': self.flows}
+
+        # ------------------------------------------------------------------
+        # 10. All available channels mapped to radial profiles for flat output
+        # ------------------------------------------------------------------
+        all_channels = {
+            'Pe': Pe, 'Pi': Pi,
+            'Ce': Ce, 'Ci': Ci,
+            'De': De, 'Di': Di,
+            'Ge': Ge, 'Gi': Gi,
+            'Qe': Qe, 'Qi': Qi,
+        }
+        all_channels_gB = {
+            'Pe': Pe / _safe(P_gB), 'Pi': Pi / _safe(P_gB),
+            'Ce': Ce / _safe(P_gB), 'Ci': Ci / _safe(P_gB),
+            'De': De / _safe(P_gB), 'Di': Di / _safe(P_gB),
+            'Ge': Ge / _safe(G_gB), 'Gi': Gi / _safe(G_gB),
+            'Qe': Qe / _safe(q_gb), 'Qi': Qi / _safe(q_gb),
+        }
+
+        def _extract(arr):
+            arr = np.atleast_1d(arr)
+            return [float(np.interp(roa, state.roa, arr)) for roa in roa_eval]
+
         output_dict = {
-            key: [
-            getattr(state, key)[np.where(np.isclose(state.roa, roa, atol=1e-3))[0][0]]
-            if np.any(np.isclose(state.roa, roa, atol=1e-3))
-            else np.interp(roa, state.roa, getattr(state, key))
-            for roa in self.roa_eval
-            ]
-            for key in self.output_vars
+            key: _extract(all_channels[key])
+            for key in output_vars if key in all_channels
         }
-
         std_dict = {
-            key: [
-                self.sigma * abs(output_dict[key][i])
-                for i in range(len(self.roa_eval))
-            ]
-            for key in self.output_vars
+            key: [self.sigma * abs(v) for v in output_dict[key]]
+            for key in output_dict
         }
-
+        self.Y_gB = {
+            key: _extract(all_channels_gB[key])
+            for key in output_vars if key in all_channels_gB
+        }
         self.Y_target = output_dict
         self.Y_std = std_dict
 

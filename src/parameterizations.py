@@ -22,7 +22,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, Optional, Sequence, Tuple, Union, List
 import numpy as np
-from scipy.interpolate import interp1d, Akima1DInterpolator as akima, PchipInterpolator as pchip, CubicSpline
+from scipy.interpolate import InterpolatedUnivariateSpline as linear, Akima1DInterpolator as akima, PchipInterpolator as pchip, CubicSpline
 from tools import calc
 from scipy.special import erf
 from scipy.optimize import curve_fit
@@ -181,8 +181,8 @@ class Spline(ParameterBase):
         self.spline_type = options.get('spline_type', 'akima').lower()
         self.knots = np.array(options.get('knots', []) or [])
         self.defined_on = options.get('defined_on', 'aLy')
-        if self.spline_type not in ('akima', 'pchip', 'cubic'):
-            raise ValueError("spline_type must be 'akima', 'pchip', or 'cubic'")
+        if self.spline_type not in ('akima', 'pchip', 'cubic', 'linear'):
+            raise ValueError("spline_type must be 'akima', 'pchip', 'cubic', or 'linear'")
         self.param_names = [self.defined_on+str(i) for i in range(len(self.knots))]
         if self.lcfs_aLti_in_params:
             #raise NotImplementedError("lcfs_aLti_in_params=True not implemented for SplineParameterModel.")
@@ -214,6 +214,8 @@ class Spline(ParameterBase):
             spline = pchip(x_spline, y_spline, extrapolate=True)
         elif self.spline_type in ("cubic", "cspline"):
             spline = CubicSpline(x_spline, y_spline, extrapolate=True)
+        elif self.spline_type == "linear":
+            spline = linear(x_spline, y_spline, k=1)
         else:
             raise ValueError(f"Unknown spline_type: {self.spline_type}")
         
@@ -651,7 +653,7 @@ class Gaussian(ParameterBase):
             prof_name = f"aL{prof}"
             aLy_data = getattr(state, prof_name)
             aLy_data = aLy_data[mask]
-            aLy_fine = interp1d(x_data, aLy_data, kind='linear', fill_value='extrapolate')(xfine)
+            aLy_fine = linear(x_data, aLy_data, extrapolate=True)(xfine)
 
             # Get BC at x=1
             bc1 = self.get_nearest_bc(prof_name, 1.0)

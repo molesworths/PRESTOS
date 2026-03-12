@@ -1,6 +1,5 @@
-from .bayesian_opt import BayesianOptSolver
+from .bayesian_opt import Bayesian
 from .factory import SOLVER_MODELS, create_solver
-from .ivp import IvpSolver
 from .objectives import (
     ObjectiveFunction,
     MeanAbsolute,
@@ -9,23 +8,19 @@ from .objectives import (
     SumSquares,
     create_objective_function,
 )
-from .relax import RelaxSolver
+from .relax import Relax
+from .root import RootSolver
 from .solver_base import SolverBase
 from .solver_data import SolverData
 
-IVPSolver = IvpSolver
-FiniteDifferenceSolver = RelaxSolver
-
 __all__ = [
-    "BayesianOptSolver",
-    "FiniteDifferenceSolver",
-    "IVPSolver",
-    "IvpSolver",
+    "Bayesian",
     "MeanAbsolute",
     "MeanSquares",
     "ObjectiveFunction",
-    "RelaxSolver",
+    "Relax",
     "RootMeanSquareError",
+    "RootSolver",
     "SOLVER_MODELS",
     "SolverBase",
     "SolverData",

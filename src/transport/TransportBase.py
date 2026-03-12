@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 import shutil
 import time
+from tools import plasma
 
 import numpy as np
 
@@ -56,6 +57,10 @@ class TransportBase:
         self.roa_eval = self.options.get("roa_eval", None)
         self.output_vars = self.options.get("output_vars", None)
         self.state_vars_extracted = False
+
+        self.fluxes: Dict = {'gB': {}, 'real': {}}   # real: Ge/Gi [1e19/m²/s], Qe/Qi [MW/m²]
+        self.flows: Dict = {'gB': {}, 'real': {}}    # real: Pe/Pi [MW]
+        self.transport_dict: Dict = {}
 
         self.external = False # if True, model is responsible for its own platform execution and evaluate() only orchestrates inputs/outputs
         self.platform_config = self.options.get("platform", None)
@@ -253,6 +258,7 @@ class TransportBase:
         self.mi_over_me = state.mi_over_me
         self.gamma_exb_state = getattr(state, "gamma_exb_norm", np.zeros_like(self.x))
         self.f_imp = state.f_imp if hasattr(state, "f_imp") else np.ones_like(self.x) * 0.01
+        self.surfArea = state.surfArea
         self.state_vars_extracted = True
         
 
@@ -317,65 +323,59 @@ class TransportBase:
             "sigma": self.sigma,
         }
 
-    def _gbflux_to_physical(self, rho: float, Ge: float, Qi: float, Qe: float) -> Tuple[float, float, float]:
-        """Convert gyroBohm-normalized fluxes to physical units at rho."""
-        g_gb = np.asarray(self.g_gb)
-        q_gb = np.asarray(self.q_gb)
-        if g_gb.size == 1:
-            g_val = float(g_gb)
-        else:
-            g_val = np.interp(rho, self.x, g_gb)
-        if q_gb.size == 1:
-            q_val = float(q_gb)
-        else:
-            q_val = np.interp(rho, self.x, q_gb)
-
-        g_area_1e19 = g_val * 10.0
-
-        return Ge * g_area_1e19, Qi * q_val, Qe * q_val
-
     def _compute_neoclassical(self, state) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute neoclassical fluxes according to selected model."""
+        """Compute neoclassical fluxes (gB-normalised: Ge_gB, Qi_gB, Qe_gB)."""
         if self.neoclassical_model == "analytic":
             self._extract_from_state(state)
-            Gamma_neo, Qi_neo, Qe_neo = self.compute_analytic()
+            Ge_gB, Qi_gB, Qe_gB = self.compute_analytic()
             if self.roa_eval is not None:
                 roa_eval = np.atleast_1d(self.roa_eval)
-                if len(Gamma_neo) != len(roa_eval):
-                    Gamma_neo = np.interp(roa_eval, state.roa, Gamma_neo)
-                    Qi_neo = np.interp(roa_eval, state.roa, Qi_neo)
-                    Qe_neo = np.interp(roa_eval, state.roa, Qe_neo)
-            return Gamma_neo, Qi_neo, Qe_neo
+                if len(Ge_gB) != len(roa_eval):
+                    Ge_gB = np.interp(roa_eval, state.roa, Ge_gB)
+                    Qi_gB = np.interp(roa_eval, state.roa, Qi_gB)
+                    Qe_gB = np.interp(roa_eval, state.roa, Qe_gB)
+            return Ge_gB, Qi_gB, Qe_gB
         if self.neoclassical_model == "neo":
             roa_eval = np.array(self.roa_eval) if self.roa_eval is not None else np.array(state.roa)
-            Ge_neo_gb, Qi_neo_gb, Qe_neo_gb = self.compute_neo(state, roa_eval)
-            Ge_neo, Qi_neo, Qe_neo = self._gbflux_to_physical(roa_eval, Ge_neo_gb, Qi_neo_gb, Qe_neo_gb)
-            if len(Ge_neo) == len(roa_eval):
-                Gamma_neo = np.interp(state.roa, roa_eval, Ge_neo)
-                Qi_neo = np.interp(state.roa, roa_eval, Qi_neo)
-                Qe_neo = np.interp(state.roa, roa_eval, Qe_neo)
-                return Gamma_neo, Qi_neo, Qe_neo
-            raise RuntimeError("NEO output size does not match evaluation grid")
+            Ge_gB, Qi_gB, Qe_gB = self.compute_neo(state, roa_eval)
+            return Ge_gB, Qi_gB, Qe_gB
         raise ValueError(f"Unknown neoclassical_model: {self.neoclassical_model}")
 
     def compute_analytic(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute analytic neoclassical fluxes."""
-        chii_nc = self.f_trap * (self.Ti * (self.q / np.maximum(self.eps, 1e-9)) ** 2) * self.nuii
-        chie_nc = (
-            self.f_trap
-            * ((self.Te * (self.q / np.maximum(self.eps, 1e-9)) ** 2) / (1840.0 * self.mi_over_mp))
-            * self.nuei
+        """Compute analytic neoclassical fluxes (gB-normalised, dimensionless).
+
+        Returns Ge_gB, Qi_gB, Qe_gB — all dimensionless gyroBohm units.
+
+        Uses the banana-regime neoclassical transport in gyroBohm-normalised form:
+            χ̃_i^nc  = f_trap · (q/ε)² / √ε · ν̃_ii
+            χ̃_e^nc  = χ̃_i^nc / (1840 · mi_over_mp)   (mass-ratio factor)
+        where ν̃ = ν_phys · τ_norm = ν_phys · (a / c_s)  [dimensionless].
+
+        Gradient drives use the gyroBohm-normalised inverse scale lengths
+        aLne, aLTe, aLTi (all dimensionless and positive for peaked profiles)
+        with sign conventions consistent with TGLF/CGYRO gbflux output.
+        """
+        eps_safe = np.maximum(np.abs(self.eps), 1e-9)
+        q_fac    = (np.abs(self.q) / eps_safe) ** 2 / np.sqrt(eps_safe)  # (q/ε)²/√ε
+
+        # Normalised neoclassical diffusivities [dimensionless gB]
+        # self.nuii and self.nuei are already nuii_phys * tau_norm (set in _extract_from_state)
+        chii_nc = self.f_trap * q_fac * self.nuii
+        chie_nc = self.f_trap * q_fac * self.nuei / (1840.0 * self.mi_over_mp)
+
+        # Neoclassical particle flux [gB units]
+        # Positive → outward (same sign convention as TGLF gbflux row 0)
+        Ge_gB = chie_nc * (
+            1.53 * (1.0 + self.tite) * self.aLne   # density-gradient pinch
+            - 0.59 * self.aLTe                       # Te-gradient drive
+            - 0.26 * self.tite * self.aLTi           # Ti-gradient drive
         )
 
-        Gamma_neo = chie_nc * (
-            -1.53 * (1.0 + self.Ti / self.Te) * self.dne_dx
-            + 0.59 * (self.ne / self.Te) * self.dTe_dx
-            + 0.26 * (self.ne / self.Te) * self.dTi_dx
-        )
-        Qi_neo = -self.ne * chii_nc * self.dTi_dx + 1.5 * self.Ti * Gamma_neo
-        Qe_neo = -self.ne * chie_nc * self.dTe_dx + 1.5 * self.Te * Gamma_neo
-        
-        return Gamma_neo, Qi_neo, Qe_neo
+        # Neoclassical heat fluxes [gB units]: conduction + convection
+        Qi_gB = chii_nc * self.aLTi + 1.5 * self.tite * Ge_gB
+        Qe_gB = chie_nc * self.aLTe + 1.5 * Ge_gB
+
+        return Ge_gB, Qi_gB, Qe_gB
 
     # def compute_analytic(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
     #     """Compute analytic neoclassical fluxes across all collisionality regimes.
@@ -633,70 +633,193 @@ class TransportBase:
         self,
         state,
         *,
-        Gamma_turb: np.ndarray,
-        Gamma_neo: np.ndarray,
-        Qi_turb: np.ndarray,
-        Qi_neo: np.ndarray,
-        Qe_turb: np.ndarray,
-        Qe_neo: np.ndarray,
+        Ge_turb_gB: np.ndarray,
+        Ge_neo_gB: np.ndarray,
+        Qi_turb_gB: np.ndarray,
+        Qi_neo_gB: np.ndarray,
+        Qe_turb_gB: np.ndarray,
+        Qe_neo_gB: np.ndarray,
         model_label: str = "Transport",
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
-        """Assemble and store flux components and output dictionaries."""
+        """Assemble flux/flow dicts and output from gB-normalised fluxes.
+
+        Inputs
+        ------
+        Ge_turb_gB / Ge_neo_gB  : electron particle flux (gB-normalised), at roa_eval
+        Qi_turb_gB / Qi_neo_gB  : ion heat flux (gB-normalised), same grid
+        Qe_turb_gB / Qe_neo_gB  : electron heat flux (gB-normalised), same grid
+
+        Populates
+        ---------
+        self.fluxes         – nested dict matching flux_flow_ref.txt
+        self.flows          – nested dict matching flux_flow_ref.txt
+        self.transport_dict – {'fluxes': self.fluxes, 'flows': self.flows}
+
+        Returns
+        -------
+        (output_dict, std_dict) – flat dicts of physical values at roa_eval
+        """
+        if self.roa_eval is None:
+            self.roa_eval = list(state.roa)
         roa_eval = np.atleast_1d(self.roa_eval)
 
         def _to_roa_eval(data: np.ndarray) -> np.ndarray:
-            if self.roa_eval is not None:
-                if len(data) == len(state.roa):
-                    return np.interp(roa_eval, state.roa, data)
-            return data
+            arr = np.asarray(data, dtype=float)
+            if arr.ndim == 1 and len(arr) == len(state.roa):
+                return np.interp(roa_eval, state.roa, arr)
+            return arr
 
-        Zeff = _to_roa_eval(state.Zeff)
-        Qnorm_to_P = _to_roa_eval(state.Qnorm_to_P)
+        if not self.state_vars_extracted:
+            self._extract_from_state(state)
 
-        Ge_to_Ce = _to_roa_eval(1.5 * self.Te * self.Qnorm_to_P)
-        Gi_to_Ci = _to_roa_eval(1.5 * self.Ti * self.Qnorm_to_P)
+        # ------------------------------------------------------------------
+        # 1. gB normalization factors (at roa_eval)
+        # ------------------------------------------------------------------
+        Zeff     = _to_roa_eval(self.Zeff)
+        surfArea = _to_roa_eval(self.surfArea)
+        g_gb     = _to_roa_eval(self.g_gb)    # [1e20/m²/s]
+        q_gb     = _to_roa_eval(self.q_gb)    # [MW/m²]
+        Te_ev    = _to_roa_eval(self.Te)       # [keV]
+        Ti_ev    = _to_roa_eval(self.Ti)       # [keV]
 
-        Gamma_turb_eval = _to_roa_eval(Gamma_turb)
-        Gamma_neo_eval = _to_roa_eval(Gamma_neo)
-        Qi_turb_eval = _to_roa_eval(Qi_turb)
-        Qi_neo_eval = _to_roa_eval(Qi_neo)
-        Qe_turb_eval = _to_roa_eval(Qe_turb)
-        Qe_neo_eval = _to_roa_eval(Qe_neo)
+        G_gB = g_gb * 10.0       # [1e19/m²/s]  – particle-flux gB norm
+        Q_gB = q_gb               # [MW/m²]       – heat-flux gB norm
+        P_gB = q_gb * surfArea    # [MW]           – heat-flow gB norm
+        _safe = lambda x: np.where(np.abs(x) < 1e-30, 1e-30, x)
 
-        self.Ge_turb = Gamma_turb_eval
-        self.Ge_neo = Gamma_neo_eval
-        self.Ge = Gamma_turb_eval + Gamma_neo_eval
-        self.Gi_turb = self.Ge_turb / Zeff
-        self.Gi_neo = self.Ge_neo / Zeff
-        self.Gi = self.Gi_turb + self.Gi_neo
-        self.Ce_turb = self.Ge_turb * Ge_to_Ce
-        self.Ce_neo = self.Ge_neo * Ge_to_Ce
-        self.Ce = self.Ce_turb + self.Ce_neo
-        self.Ci_turb = self.Gi_turb * Gi_to_Ci
-        self.Ci_neo = self.Gi_neo * Gi_to_Ci
-        self.Ci = self.Ci_turb + self.Ci_neo
-        self.Qi_turb = Qi_turb_eval
-        self.Qi_neo = Qi_neo_eval
-        self.Qi = self.Qi_turb + self.Qi_neo
-        self.Pi_turb = self.Qi_turb * Qnorm_to_P
-        self.Pi_neo = self.Qi_neo * Qnorm_to_P
-        self.Pi = self.Pi_turb + self.Pi_neo
-        self.Qe_turb = Qe_turb_eval
-        self.Qe_neo = Qe_neo_eval
-        self.Qe = self.Qe_turb + self.Qe_neo
-        self.Pe_turb = self.Qe_turb * Qnorm_to_P
-        self.Pe_neo = self.Qe_neo * Qnorm_to_P
-        self.Pe = self.Pe_turb + self.Pe_neo
+        # ------------------------------------------------------------------
+        # 2. Convert gB inputs to real units
+        # ------------------------------------------------------------------
+        Ge_turb_gB = np.asarray(Ge_turb_gB, dtype=float)
+        Ge_neo_gB  = np.asarray(Ge_neo_gB,  dtype=float)
+        Qe_turb_gB = np.asarray(Qe_turb_gB, dtype=float)
+        Qe_neo_gB  = np.asarray(Qe_neo_gB,  dtype=float)
+        Qi_turb_gB = np.asarray(Qi_turb_gB, dtype=float)
+        Qi_neo_gB  = np.asarray(Qi_neo_gB,  dtype=float)
 
-        if self.roa_eval is None:
-            self.roa_eval = list(state.roa)
+        Ge_turb = Ge_turb_gB * G_gB   # [1e19/m²/s]
+        Ge_neo  = Ge_neo_gB  * G_gB
+        Qe_t    = Qe_turb_gB * Q_gB   # [MW/m²]
+        Qe_n    = Qe_neo_gB  * Q_gB
+        Qi_t    = Qi_turb_gB * Q_gB
+        Qi_n    = Qi_neo_gB  * Q_gB
+
+        # ------------------------------------------------------------------
+        # 3. Totals
+        # ------------------------------------------------------------------
+        Ge       = Ge_turb + Ge_neo
+        Qi_total = Qi_t + Qi_n
+        Qe_total = Qe_t + Qe_n
+
+        # ion particle fluxes (ambipolarity: Gi ≈ Ge / Zeff)
+        Gi_turb = Ge_turb / np.maximum(Zeff, 1e-12)
+        Gi_neo  = Ge_neo  / np.maximum(Zeff, 1e-12)
+        Gi      = Gi_turb + Gi_neo
+
+        # ------------------------------------------------------------------
+        # 4. Convective heat flows  Ce = 1.5 T Ge A   [MW]
+        #    Using plasma.get_convective_flow which takes T[keV], Ge[1e19/m²/s], A[m²]
+        # ------------------------------------------------------------------
+        Ce_turb = plasma.get_convective_flow(Te_ev, Ge_turb, surfArea)
+        Ce_neo  = plasma.get_convective_flow(Te_ev, Ge_neo,  surfArea)
+        Ce      = Ce_turb + Ce_neo
+
+        Ci_turb = plasma.get_convective_flow(Ti_ev, Gi_turb, surfArea)
+        Ci_neo  = plasma.get_convective_flow(Ti_ev, Gi_neo,  surfArea)
+        Ci      = Ci_turb + Ci_neo
+
+        # ------------------------------------------------------------------
+        # 5. Heat flows  Pe/Pi = Q * surfArea   [MW]
+        # ------------------------------------------------------------------
+        Pe_turb = Qe_t * surfArea
+        Pe_neo  = Qe_n * surfArea
+        Pe      = Pe_turb + Pe_neo
+
+        Pi_turb = Qi_t * surfArea
+        Pi_neo  = Qi_n * surfArea
+        Pi      = Pi_turb + Pi_neo
+
+        # Conductive = total - convective
+        De_turb = Pe_turb - Ce_turb
+        De_neo  = Pe_neo  - Ce_neo
+        De      = Pe - Ce
+
+        Di_turb = Pi_turb - Ci_turb
+        Di_neo  = Pi_neo  - Ci_neo
+        Di      = Pi - Ci
+
+        # ------------------------------------------------------------------
+        # 6. Nested fluxes dict  (matches flux_flow_ref.txt)
+        #    real: Ge/Gi [1e19/m²/s], Qe/Qi [MW/m²]
+        #    gB: dimensionless; turb/neo inputs are already normalised
+        # ------------------------------------------------------------------
+        Gi_turb_gB = Ge_turb_gB / np.maximum(Zeff, 1e-12)
+        Gi_neo_gB  = Ge_neo_gB  / np.maximum(Zeff, 1e-12)
+        self.fluxes = {
+            'real': {
+                'Ge': {'turb': Ge_turb, 'neo': Ge_neo, 'total': Ge},
+                'Gi': {'turb': Gi_turb, 'neo': Gi_neo, 'total': Gi},
+                'Qe': {'turb': Qe_t,    'neo': Qe_n,   'total': Qe_total},
+                'Qi': {'turb': Qi_t,    'neo': Qi_n,   'total': Qi_total},
+            },
+            'gB': {
+                'Ge': {'turb': Ge_turb_gB, 'neo': Ge_neo_gB, 'total': Ge / _safe(G_gB)},
+                'Gi': {'turb': Gi_turb_gB, 'neo': Gi_neo_gB, 'total': Gi / _safe(G_gB)},
+                'Qe': {'turb': Qe_turb_gB, 'neo': Qe_neo_gB, 'total': Qe_total / _safe(Q_gB)},
+                'Qi': {'turb': Qi_turb_gB, 'neo': Qi_neo_gB, 'total': Qi_total / _safe(Q_gB)},
+            },
+        }
+
+        # ------------------------------------------------------------------
+        # 7. Nested flows dict  (matches flux_flow_ref.txt)
+        #    real: [MW]   gB: dimensionless (÷ P_gB = Q_gB × surfArea)
+        #    3rd key: 'conv', 'cond', 'total'
+        #    each contains:  'turb', 'neo', 'total'
+        # ------------------------------------------------------------------
+        def _flow_entry(turb, neo, total):
+            return {'turb': turb, 'neo': neo, 'total': total}
+
+        flows_real = {
+            'Pe': {
+                'conv':  _flow_entry(Ce_turb, Ce_neo, Ce),
+                'cond':  _flow_entry(De_turb, De_neo, De),
+                'total': _flow_entry(Pe_turb, Pe_neo, Pe),
+            },
+            'Pi': {
+                'conv':  _flow_entry(Ci_turb, Ci_neo, Ci),
+                'cond':  _flow_entry(Di_turb, Di_neo, Di),
+                'total': _flow_entry(Pi_turb, Pi_neo, Pi),
+            },
+        }
+        _P = _safe(P_gB)
+        flows_gB = {
+            P_key: {
+                level: {comp: flows_real[P_key][level][comp] / _P for comp in ('turb', 'neo', 'total')}
+                for level in ('conv', 'cond', 'total')
+            }
+            for P_key in ('Pe', 'Pi')
+        }
+        self.flows = {'real': flows_real, 'gB': flows_gB}
+        self.transport_dict = {'fluxes': self.fluxes, 'flows': self.flows}
+
+        # ------------------------------------------------------------------
+        # 8. Flat output dict for solver
+        # ------------------------------------------------------------------
+        all_channels = {
+            "Ge": Ge, "Gi": Gi,
+            "Qe": Qe_total, "Qi": Qi_total,
+            "Pe": Pe, "Pi": Pi,
+            "Ce": Ce, "Ci": Ci,
+            "De": De, "Di": Di,
+        }
+
         if self.output_vars is None:
             if hasattr(self, "labels"):
                 self.output_vars = list(self.labels)
             else:
                 self.output_vars = [
                     key for key in ["Ge", "Gi", "Ce", "Ci", "Pe", "Pi", "Qe", "Qi"]
-                    if hasattr(self, key)
+                    if key in all_channels
                 ]
 
         def _value_at_roa(data: np.ndarray, roa: float) -> float:
@@ -706,8 +829,8 @@ class TransportBase:
             if arr.ndim == 1:
                 if len(arr) == len(state.roa):
                     xp = state.roa
-                elif self.roa_eval is not None and len(arr) == len(self.roa_eval):
-                    xp = np.asarray(self.roa_eval)
+                elif len(arr) == len(roa_eval):
+                    xp = roa_eval
                 else:
                     return float(np.nan_to_num(arr, nan=0.0)[0])
                 if np.any(np.isclose(xp, roa, atol=1e-3)):
@@ -716,20 +839,23 @@ class TransportBase:
                 return float(np.interp(roa, xp, np.nan_to_num(arr, nan=0.0)))
             return float(np.nan_to_num(arr, nan=0.0).flat[0])
 
-        output_dict = {
-            key: [_value_at_roa(getattr(self, key), roa) for roa in self.roa_eval]
-            for key in self.output_vars
-        }
+        output_dict = {}
+        for key in self.output_vars:
+            if key in all_channels:
+                output_dict[key] = [_value_at_roa(all_channels[key], roa) for roa in roa_eval]
 
         std_dict = {
-            key: [self.sigma * abs(output_dict[key][i]) for i in range(len(self.roa_eval))]
-            for key in self.output_vars
+            key: [self.sigma * abs(output_dict[key][i]) for i in range(len(roa_eval))]
+            for key in output_dict
         }
 
         self.output_dict = output_dict
         self.std_dict = std_dict
-
         self.state_vars_extracted = False
+
+        # transport_dict (self.fluxes / self.flows) is the canonical source for the
+        # surrogate — all turb/neo/total components at all normalizations are there.
+        # No flat Y_gB needed; solver_base passes transport_dict directly to add_sample.
 
         return output_dict, std_dict
 

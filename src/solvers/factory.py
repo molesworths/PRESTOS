@@ -2,16 +2,16 @@ from __future__ import annotations
 
 from typing import Any
 
-from .bayesian_opt import BayesianOptSolver
-from .ivp import IvpSolver
-from .relax import RelaxSolver
+from .bayesian_opt import Bayesian
+from .relax import Relax
+from .root import RootSolver as Root
 from .solver_base import SolverBase
 
 
 SOLVER_MODELS = {
-    "relax": RelaxSolver,
-    "bayesian_opt": BayesianOptSolver,
-    "ivp": IvpSolver,
+    "relax": Relax,
+    "root": Root,
+    "bayesian_opt": Bayesian,
 }
 
 

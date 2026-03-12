@@ -51,9 +51,8 @@ from .neutrals import (
 from .solvers import (
     create_solver,
     SolverBase,
-    RelaxSolver,
-    BayesianOptSolver,
-    IvpSolver,
+    Bayesian,
+    RootSolver,
     ObjectiveFunction,
 )
 from .surrogates import (
@@ -83,7 +82,7 @@ __all__ = [
     # neutrals
     'NeutralModel', 'Kinetic', 'Diffusive',
     # solvers
-    'create_solver', 'SolverBase', 'RelaxSolver', 'BayesianOptSolver', 'IvpSolver', 'ObjectiveFunction',
+    'create_solver', 'SolverBase', 'Relax', 'Bayesian', 'RootSolver', 'ObjectiveFunction',
     # surrogates
     'SurrogateManager', 'SurrogateBase', 'create_surrogate_model', 'GaussianProcess', 'GaussianProcessSurrogate',
     # tools package
