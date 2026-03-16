@@ -1,5 +1,5 @@
 # Where to store files
-work_dir: ~/git/PRESTOS/example/
+work_dir: $PRESTOS/example/
 
 # Full print outs or not
 verbose: False
@@ -18,7 +18,7 @@ platform:
 # Initial plasma state: point to a GACODE profiles file
 state:
   args:
-    from_gacode: ~/git/PRESTOS/example/input.gacode # _H_HighColl_179449_1500
+    from_gacode: $PRESTOS/example/input.gacode # _H_HighColl_179449_1500
 
 boundary:
   class: fixedinitial
