@@ -151,11 +151,11 @@ solver:
       total_or_conduction: total
     roa_eval:  [0.88, 0.91, 0.94, 0.97]
     domain: [0.88, 1.0]
-    tol: 1e-4
+    tol: 1e-6
     model_iter_to_stall: 5
     max_iter: 100
     use_oscillation_convergence: True
-    use_surrogate: False
+    use_surrogate: True
     surrogate_warmup: 5
     surrogate_retrain_every: 5
     use_jacobian: False
@@ -167,7 +167,7 @@ solver:
       constraints: 0.0
     scale_objective: True # divides total by N_channels
     step_size: 0.5
-    min_step_size: 1e-4
+    min_step_size: 1e-6
     adaptive_step: True
     bounds:  [0.0,100.] # [[0,200],[0,5],[0.9,1.0],[0.01,1.0]] # [[1.01,2], [0,10], [0.9,1.1]] # 
     # [[0,10],[0,15],[0,25],[0,50],[0,100]]  # [0,100] #
