@@ -781,14 +781,14 @@ class TransportBase:
         # ------------------------------------------------------------------
         # 2. Convert gB inputs to real units
         # ------------------------------------------------------------------
-        Ge_turb_gB = np.asarray(Ge_turb_gB, dtype=float)
-        Ge_neo_gB  = np.asarray(Ge_neo_gB,  dtype=float)
-        Qe_turb_gB = np.asarray(Qe_turb_gB, dtype=float)
-        Qe_neo_gB  = np.asarray(Qe_neo_gB,  dtype=float)
-        Qi_turb_gB = np.asarray(Qi_turb_gB, dtype=float)
-        Qi_neo_gB  = np.asarray(Qi_neo_gB,  dtype=float)
-        Qie_turb_gB = np.zeros_like(Qe_turb_gB) if Qie_turb_gB is None else np.asarray(Qie_turb_gB, dtype=float)
-        Qie_neo_gB = np.zeros_like(Qe_turb_gB) if Qie_neo_gB is None else np.asarray(Qie_neo_gB, dtype=float)
+        Ge_turb_gB = _to_roa_eval(Ge_turb_gB)
+        Ge_neo_gB  = _to_roa_eval(Ge_neo_gB)
+        Qe_turb_gB = _to_roa_eval(Qe_turb_gB)
+        Qe_neo_gB  = _to_roa_eval(Qe_neo_gB)
+        Qi_turb_gB = _to_roa_eval(Qi_turb_gB)
+        Qi_neo_gB  = _to_roa_eval(Qi_neo_gB)
+        Qie_turb_gB = np.zeros_like(Qe_turb_gB) if Qie_turb_gB is None else _to_roa_eval(Qie_turb_gB)
+        Qie_neo_gB = np.zeros_like(Qe_turb_gB) if Qie_neo_gB is None else _to_roa_eval(Qie_neo_gB)
 
         Ge_turb = Ge_turb_gB * G_gB   # [1e19/m²/s]
         Ge_neo  = Ge_neo_gB  * G_gB
