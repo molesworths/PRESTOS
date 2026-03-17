@@ -10,7 +10,6 @@ import numpy as np
 import copy
 from typing import Dict, List, Optional
 from collections import OrderedDict
-#from state import PlasmaState
 from tools import io
 
 

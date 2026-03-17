@@ -36,11 +36,12 @@ class Fingerprints(TransportBase):
         gamma_ExB = np.maximum(np.absolute(gamma_ExB), 0.0)
 
         if self.modes == "neo" or self.modes == "all":
-            Ge_neo_gB, Qi_neo_gB, Qe_neo_gB = self._compute_neoclassical(state)
+            Ge_neo_gB, Qi_neo_gB, Qe_neo_gB, Qie_neo_gB = self._compute_neoclassical(state)
         else:
             Ge_neo_gB = np.zeros_like(self.x)
             Qi_neo_gB = np.zeros_like(self.x)
             Qe_neo_gB = np.zeros_like(self.x)
+            Qie_neo_gB = np.zeros_like(self.x)
 
         RLTi_crit = np.maximum(
             (4.0 / 3.0) * (1.0 + self.Ti / self.Te),
@@ -115,5 +116,6 @@ class Fingerprints(TransportBase):
             Qi_neo_gB=Qi_neo_gB,
             Qe_turb_gB=Qe_turb_gB,
             Qe_neo_gB=Qe_neo_gB,
+            Qie_neo_gB=Qie_neo_gB,
             model_label="Fingerprints",
         )

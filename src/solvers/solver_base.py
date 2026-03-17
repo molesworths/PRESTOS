@@ -127,6 +127,10 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
                 self.target_vars = ["Ge", "Qe", "Qi"]
 
         self.transport_vars = [f"{t}_neo" for t in self.target_vars] + [f"{t}_turb" for t in self.target_vars]
+        exchange_supported = {"Qe", "Qi", "Pe", "Pi", "De", "Di"}
+        exchange_targets = [t for t in self.target_vars if t in exchange_supported]
+        self.transport_vars += [f"{t}_exch_neo" for t in exchange_targets]
+        self.transport_vars += [f"{t}_exch_turb" for t in exchange_targets]
         self.model_vars = self.transport_vars + self.target_vars
 
         self.n_params_per_profile = int(self.options.get("n_params_per_profile", 0))
@@ -508,7 +512,7 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         var: str,
         transport_dict: Dict[str, Any],
     ) -> Optional[Dict[str, np.ndarray]]:
-        """Return {'neo': arr, 'turb': arr} for *var* from *transport_dict*, or None.
+        """Return available mechanism components for *var* from *transport_dict*.
 
         Handles both direct flux channels (Ge, Gi, Qe, Qi) and derived flow
         channels (Pe, Pi, Ce, Ci, De, Di) whose breakdowns live under nested
@@ -516,20 +520,30 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         """
         fluxes_real = transport_dict.get("fluxes", {}).get("real", {})
         flows_real  = transport_dict.get("flows",  {}).get("real", {})
+        out: Dict[str, np.ndarray] = {}
+
+        def _collect_components(src: Dict[str, Any]) -> None:
+            mapping = {
+                "neo": "neo",
+                "turb": "turb",
+                "neo_exch": "exch_neo",
+                "turb_exch": "exch_turb",
+            }
+            for src_key, dst_key in mapping.items():
+                if src_key in src:
+                    out[dst_key] = np.asarray(src[src_key], float)
 
         # Direct flux channels (Ge, Gi, Qe, Qi)
         if var in fluxes_real:
-            d = fluxes_real[var]
-            if "neo" in d and "turb" in d:
-                return {"neo": np.asarray(d["neo"], float),
-                        "turb": np.asarray(d["turb"], float)}
+            _collect_components(fluxes_real[var])
+            if out:
+                return out
 
         # Total flow channels (Pe, Pi)
         if var in flows_real:
-            total = flows_real[var].get("total", {})
-            if "neo" in total and "turb" in total:
-                return {"neo": np.asarray(total["neo"], float),
-                        "turb": np.asarray(total["turb"], float)}
+            _collect_components(flows_real[var].get("total", {}))
+            if out:
+                return out
 
         # Derived flow channels (Ce/De come from flows['Pe'], Ci/Di from flows['Pi'])
         _derived_map: Dict[str, Tuple[str, str]] = {
@@ -539,10 +553,9 @@ class SolverBase(JacobianMixin, UncertaintyMixin):
         if var in _derived_map:
             parent, level = _derived_map[var]
             if parent in flows_real and level in flows_real[parent]:
-                d = flows_real[parent][level]
-                if "neo" in d and "turb" in d:
-                    return {"neo": np.asarray(d["neo"], float),
-                            "turb": np.asarray(d["turb"], float)}
+                _collect_components(flows_real[parent][level])
+                if out:
+                    return out
 
         return None
 

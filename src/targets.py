@@ -181,8 +181,7 @@ class Analytic(TargetModel):
         Pfus_i = calc.volume_integrate(state.r, state.qfusi, state.dVdr)
         Prad_e = calc.volume_integrate(state.r, state.qrade, state.dVdr)
         Prad_i = calc.volume_integrate(state.r, state.qradi, state.dVdr)
-        # Electron-ion exchange [MW]; *0.01 preserves historical scaling
-        Pexch  = calc.volume_integrate(state.r, state.qie,   state.dVdr) * 0.01
+        Pexch  = calc.volume_integrate(state.r, state.qie,   state.dVdr) + state.Pei_0
         Paux_e = getattr(state, 'Paux_e', np.zeros_like(state.r))
         Paux_i = getattr(state, 'Paux_i', np.zeros_like(state.r))
 
@@ -190,8 +189,8 @@ class Analytic(TargetModel):
         # 3. Net total heat flows [MW]
         #    sign convention: Prad / Pexch are losses for electrons, gains for ions
         # ------------------------------------------------------------------
-        Pe = Paux_e + Pfus_e - Prad_e - Pexch
-        Pi = Paux_i + Pfus_i - Prad_i + Pexch
+        Pe = Paux_e + Pfus_e - Prad_e + Pexch
+        Pi = Paux_i + Pfus_i - Prad_i - Pexch
 
         # ------------------------------------------------------------------
         # 4. Particle fluxes [1e19/m²/s]
@@ -316,7 +315,7 @@ class Analytic(TargetModel):
     def _evaluate_energy_exchange(self, state: PlasmaState) -> np.ndarray:
         """Classical electron-ion energy exchange power density (MW/m^3)."""
 
-        q_ie = plasma.energy_exchange(state.ne,state.te,state.ti,state.nuexch)  # MW/m^3
+        q_ie = plasma.energy_exchange(state.ne,state.te,state.ti,state.nuei)  # MW/m^3
         state.qie = q_ie
 
 

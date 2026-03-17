@@ -133,20 +133,25 @@ class Cgyro(TransportBase):
         Ge_turb_gB = np.zeros_like(roa_eval, dtype=float)
         Qi_turb_gB = np.zeros_like(roa_eval, dtype=float)
         Qe_turb_gB = np.zeros_like(roa_eval, dtype=float)
+        Qie_turb_gB = np.zeros_like(roa_eval, dtype=float)
 
         for i, rho in enumerate(roa_eval):
             if nonlinear:
                 rho_dir = work_dir / f"rho_{rho:.3f}"
                 if self.read_mode == "json":
                     json_path = rho_dir / "fluxes_turb.json"
-                    ge_gB, qi_gB, qe_gB = self._read_cgyro_fluxes_json(json_path, rho)
+                    ge_gB, qi_gB, qe_gB, qie_gB = self._read_cgyro_fluxes_json(json_path, rho)
                 else:
-                    ge_gB, qi_gB, qe_gB = self._read_cgyro_fluxes_pygacode(rho_dir, rho)
+                    ge_gB, qi_gB, qe_gB, qie_gB = self._read_cgyro_fluxes_pygacode(rho_dir, rho)
 
                 Ge_turb_gB[i] = ge_gB
                 Qi_turb_gB[i] = qi_gB
                 Qe_turb_gB[i] = qe_gB
-                print(f"  ✓ Read gB fluxes for rho={rho:.3f}: Ge={ge_gB:.3e}, Qi={qi_gB:.3e}, Qe={qe_gB:.3e}")
+                Qie_turb_gB[i] = qie_gB
+                print(
+                    f"  ✓ Read gB fluxes for rho={rho:.3f}: "
+                    f"Ge={ge_gB:.3e}, Qi={qi_gB:.3e}, Qe={qe_gB:.3e}, Qie={qie_gB:.3e}"
+                )
             else:
                 ky_list = self._resolve_linear_ky_list(self.settings)
                 if not ky_list:
@@ -155,6 +160,7 @@ class Cgyro(TransportBase):
                 ge_sum = 0.0
                 qi_sum = 0.0
                 qe_sum = 0.0
+                qie_sum = 0.0
                 multiple_ky = len(ky_list) > 1
 
                 for ky in ky_list:
@@ -165,23 +171,26 @@ class Cgyro(TransportBase):
 
                     if self.read_mode == "json":
                         json_path = sim_dir / "fluxes_turb.json"
-                        ge_gB, qi_gB, qe_gB = self._read_cgyro_fluxes_json(json_path, rho)
+                        ge_gB, qi_gB, qe_gB, qie_gB = self._read_cgyro_fluxes_json(json_path, rho)
                     else:
-                        ge_gB, qi_gB, qe_gB = self._read_cgyro_fluxes_pygacode(sim_dir, rho)
+                        ge_gB, qi_gB, qe_gB, qie_gB = self._read_cgyro_fluxes_pygacode(sim_dir, rho)
 
                     ge_sum += ge_gB
                     qi_sum += qi_gB
                     qe_sum += qe_gB
+                    qie_sum += qie_gB
 
                 Ge_turb_gB[i] = ge_sum
                 Qi_turb_gB[i] = qi_sum
                 Qe_turb_gB[i] = qe_sum
+                Qie_turb_gB[i] = qie_sum
                 print(
-                    f"  ✓ Read gB fluxes for rho={rho:.3f}: Ge={ge_sum:.3e}, Qi={qi_sum:.3e}, Qe={qe_sum:.3e}"
+                    f"  ✓ Read gB fluxes for rho={rho:.3f}: "
+                    f"Ge={ge_sum:.3e}, Qi={qi_sum:.3e}, Qe={qe_sum:.3e}, Qie={qie_sum:.3e}"
                 )
 
         self._extract_from_state(state)
-        Ge_neo_gB, Qi_neo_gB, Qe_neo_gB = self._compute_neoclassical(state)
+        Ge_neo_gB, Qi_neo_gB, Qe_neo_gB, Qie_neo_gB = self._compute_neoclassical(state)
 
         return self._assemble_fluxes(
             state,
@@ -191,6 +200,8 @@ class Cgyro(TransportBase):
             Qi_neo_gB=Qi_neo_gB,
             Qe_turb_gB=Qe_turb_gB,
             Qe_neo_gB=Qe_neo_gB,
+            Qie_turb_gB=Qie_turb_gB,
+            Qie_neo_gB=Qie_neo_gB,
             model_label="CGYRO",
         )
 
@@ -360,7 +371,7 @@ class Cgyro(TransportBase):
 
         return input_cgyro
 
-    def _read_cgyro_fluxes_json(self, path: Path, rho: float) -> Tuple[float, float, float]:
+    def _read_cgyro_fluxes_json(self, path: Path, rho: float) -> Tuple[float, float, float, float]:
         """Read CGYRO flux JSON file."""
         max_wait = 120.0
         poll_interval = 1.0
@@ -385,14 +396,19 @@ class Cgyro(TransportBase):
         Qe = data.get("Qe", data.get("Qe_mean", []))
         Qi = data.get("Qi", data.get("Qi_mean", []))
         Ge = data.get("Ge", data.get("Ge_mean", []))
+        Qie = data.get("Qie", data.get("Qie_mean", data.get("QieGB", data.get("QieGB_mean", []))))
 
         Ge_gB = float(np.asarray(Ge)[idx])
         Qi_gB = float(np.asarray(Qi)[idx])
         Qe_gB = float(np.asarray(Qe)[idx])
+        if np.asarray(Qie).size:
+            Qie_gB = float(np.asarray(Qie)[idx])
+        else:
+            Qie_gB = 0.0
 
-        return Ge_gB, Qi_gB, Qe_gB
+        return Ge_gB, Qi_gB, Qe_gB, Qie_gB
 
-    def _read_cgyro_fluxes_pygacode(self, rho_dir: Path, rho: float) -> Tuple[float, float, float]:
+    def _read_cgyro_fluxes_pygacode(self, rho_dir: Path, rho: float) -> Tuple[float, float, float, float]:
         """Read CGYRO fluxes using pygacode."""
         try:
             from pygacode.cgyro.data_plot import cgyrodata_plot
@@ -471,11 +487,15 @@ class Cgyro(TransportBase):
 
         Qe_gb = time_avg(sum_fields(electron_idx, 1))
         Ge_gb = time_avg(sum_fields(electron_idx, 0))
+        try:
+            Qie_gb = time_avg(sum_fields(electron_idx, 3))
+        except Exception:
+            Qie_gb = 0.0
         Qi_gb = 0.0
         for i in ion_idxs:
             Qi_gb += time_avg(sum_fields(i, 1))
 
-        return Ge_gb, Qi_gb, Qe_gb
+        return Ge_gb, Qi_gb, Qe_gb, Qie_gb
 
 
     def check_cgyro_saturation(

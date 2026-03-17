@@ -651,7 +651,7 @@ def surrogate_heatmap(modules, cfg: Dict[str, Any], outdir: Path):
 
     # Reconstruct models if needed
     if not models or all(m is None for m in models.values()):
-        from src import surrogates  # Adjust import path as needed
+        import surrogates
         reconstructed_models = {}
         for out in outputs:
             try:

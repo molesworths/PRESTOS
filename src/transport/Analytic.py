@@ -10,8 +10,6 @@ from typing import Dict, Tuple
 
 import numpy as np
 
-from src import state
-
 from .TransportBase import TransportBase
 
 
@@ -435,11 +433,12 @@ class Analytic(TransportBase):
         
         # Neoclassical transport (if modes include "neo" or "all")
         if self.modes == "neo" or self.modes == "all":
-            Gamma_neo, Qi_neo, Qe_neo = self._compute_neoclassical(state)
+            Gamma_neo, Qi_neo, Qe_neo, Qie_neo = self._compute_neoclassical(state)
         else:
             Gamma_neo = np.zeros_like(self.x)
             Qi_neo = np.zeros_like(self.x)
             Qe_neo = np.zeros_like(self.x)
+            Qie_neo = np.zeros_like(self.x)
         
         # For mode selection
         if self.modes == "neo":
@@ -449,11 +448,12 @@ class Analytic(TransportBase):
         
         return self._assemble_fluxes(
             state,
-            Gamma_turb=Gamma_turb,
-            Gamma_neo=Gamma_neo,
-            Qi_turb=Qi_turb,
-            Qi_neo=Qi_neo,
-            Qe_turb=Qe_turb,
-            Qe_neo=Qe_neo,
+            Ge_turb_gB=Gamma_turb,
+            Ge_neo_gB=Gamma_neo,
+            Qi_turb_gB=Qi_turb,
+            Qi_neo_gB=Qi_neo,
+            Qe_turb_gB=Qe_turb,
+            Qe_neo_gB=Qe_neo,
+            Qie_neo_gB=Qie_neo,
             model_label="Analytic",
         )

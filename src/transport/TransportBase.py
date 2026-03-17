@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union, TYPE_CHECKING
 import shutil
 import time
-from tools import plasma
+from tools import calc, plasma
 
 import numpy as np
 
@@ -323,22 +323,24 @@ class TransportBase:
             "sigma": self.sigma,
         }
 
-    def _compute_neoclassical(self, state) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Compute neoclassical fluxes (gB-normalised: Ge_gB, Qi_gB, Qe_gB)."""
+    def _compute_neoclassical(self, state) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Compute neoclassical channels (Ge_gB, Qi_gB, Qe_gB, Qie_gB)."""
         if self.neoclassical_model == "analytic":
             self._extract_from_state(state)
             Ge_gB, Qi_gB, Qe_gB = self.compute_analytic()
+            Qie_gB = np.zeros_like(np.asarray(Qe_gB, dtype=float))
             if self.roa_eval is not None:
                 roa_eval = np.atleast_1d(self.roa_eval)
                 if len(Ge_gB) != len(roa_eval):
                     Ge_gB = np.interp(roa_eval, state.roa, Ge_gB)
                     Qi_gB = np.interp(roa_eval, state.roa, Qi_gB)
                     Qe_gB = np.interp(roa_eval, state.roa, Qe_gB)
-            return Ge_gB, Qi_gB, Qe_gB
+                    Qie_gB = np.interp(roa_eval, state.roa, Qie_gB)
+            return Ge_gB, Qi_gB, Qe_gB, Qie_gB
         if self.neoclassical_model == "neo":
             roa_eval = np.array(self.roa_eval) if self.roa_eval is not None else np.array(state.roa)
-            Ge_gB, Qi_gB, Qe_gB = self.compute_neo(state, roa_eval)
-            return Ge_gB, Qi_gB, Qe_gB
+            Ge_gB, Qi_gB, Qe_gB, Qie_gB = self.compute_neo(state, roa_eval)
+            return Ge_gB, Qi_gB, Qe_gB, Qie_gB
         raise ValueError(f"Unknown neoclassical_model: {self.neoclassical_model}")
 
     def compute_analytic(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -507,8 +509,8 @@ class TransportBase:
         
     #     return Ge_neo, Qi_neo, Qe_neo
 
-    def compute_neo(self, state, roa_eval: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
-        """Run or parse NEO to obtain neoclassical fluxes (GB units)."""
+    def compute_neo(self, state, roa_eval: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Run or parse NEO to obtain neoclassical channels (GB units)."""
         work_dir = self.neo_work_dir
         keep_files = self.neo_opts.get("keep_files", "minimal")
         settings = self.neo_opts.get("settings", {})
@@ -563,36 +565,66 @@ class TransportBase:
         rho_dirs = {p.name.replace("rho_", ""): p for p in work_dir.glob("rho_*") if p.is_dir()}
         available_rhos = np.array([float(k) for k in rho_dirs.keys()]) if rho_dirs else np.array([])
 
-        def parse_transport_flux(path: Path) -> Tuple[float, float, float]:
+        def parse_transport_flux(path: Path) -> Tuple[float, float, float, float]:
             with open(path, "r") as f:
-                lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
-            if not lines:
-                raise RuntimeError(f"Empty NEO output: {path}")
+                lines = f.readlines()
 
+            # Read only the dke block:
+            #   # Z pflux_dke eflux_dke mflux_dke
+            in_dke_block = False
             data = []
-            for ln in lines:
+            for raw in lines:
+                s = raw.strip()
+                if not s:
+                    continue
+
+                if s.startswith("#"):
+                    s_lower = s.lower()
+                    if "pflux_dke" in s_lower and "eflux_dke" in s_lower:
+                        in_dke_block = True
+                    elif in_dke_block and "pflux_" in s_lower and "_dke" not in s_lower:
+                        # Reached the next section header (e.g. gv/tgyro).
+                        break
+                    continue
+
+                if not in_dke_block:
+                    continue
+
                 try:
-                    cols = [float(x) for x in ln.split()[:4]]
-                    data.append(cols)
+                    cols = [float(x) for x in s.split()]
                 except (ValueError, IndexError):
                     continue
 
+                if len(cols) < 3:
+                    continue
+
+                # Keep (Z, pflux_dke, eflux_dke)
+                data.append(cols[:3])
+
             if not data:
-                raise RuntimeError(f"Could not parse NEO output: {path}")
+                raise RuntimeError(f"Could not parse dke flux block from NEO output: {path}")
 
-            data = np.array(data)
+            data = np.asarray(data, dtype=float)
             Z = data[:, 0]
-            G = data[:, 1]
-            Q = data[:, 2]
+            G_dke = data[:, 1]
+            Q_dke = data[:, 2]
 
-            ie = int(np.where(np.isclose(Z, -1.0))[0][0])
-            Ge = float(G[ie])
-            Qe = float(Q[ie])
-            Qi = float(np.sum(np.delete(Q, ie)))
+            e_idx = np.where(np.isclose(Z, -1.0))[0]
+            if e_idx.size == 0:
+                raise RuntimeError(f"Could not find electron row (Z=-1) in NEO output: {path}")
 
-            return Ge, Qi, Qe
+            ie = int(e_idx[0])
+            ion_mask = np.ones_like(Z, dtype=bool)
+            ion_mask[ie] = False
 
-        Ge_list, Qi_list, Qe_list = [], [], []
+            Ge = float(G_dke[ie])
+            Qe = float(Q_dke[ie])
+            Qi = float(np.sum(Q_dke[ion_mask]))
+            Qie = 0.0
+
+            return Ge, Qi, Qe, Qie
+
+        Ge_list, Qi_list, Qe_list, Qie_list = [], [], [], []
         for rho in roa_eval:
             rho_key = f"{rho:.3f}"
             if rho_key in rho_dirs:
@@ -622,24 +654,63 @@ class TransportBase:
                     f"NEO output not generated after {max_wait}s: {output_path}"
                 )
 
-            Ge, Qi, Qe = parse_transport_flux(output_path)
+            Ge, Qi, Qe, Qie = parse_transport_flux(output_path)
             Ge_list.append(Ge)
             Qi_list.append(Qi)
             Qe_list.append(Qe)
+            Qie_list.append(Qie)
 
-        return np.array(Ge_list), np.array(Qi_list), np.array(Qe_list)
+        return np.array(Ge_list), np.array(Qi_list), np.array(Qe_list), np.array(Qie_list)
+
+    def _exchange_density_gB_to_flux(
+        self,
+        state,
+        qie_gB: np.ndarray,
+        roa_eval: np.ndarray,
+        q_gb_eval: np.ndarray,
+    ) -> np.ndarray:
+        """Convert exchange density in gB units to heat flux [MW/m^2] on roa_eval."""
+        qie_gB = np.asarray(qie_gB, dtype=float)
+        if qie_gB.size == 0:
+            return np.zeros_like(roa_eval, dtype=float)
+        if qie_gB.size != len(roa_eval):
+            qie_gB = np.interp(roa_eval, state.roa, qie_gB)
+
+        a_minor = float(getattr(state, "a", self.a if hasattr(self, "a") else 1.0))
+        a_minor = max(a_minor, 1e-30)
+        s_gb = q_gb_eval / a_minor  # [MW/m^3]
+        qie_mw_m3_eval = qie_gB * s_gb
+
+        if np.all(np.abs(qie_mw_m3_eval) < 1e-30):
+            return np.zeros_like(roa_eval, dtype=float)
+
+        try:
+            qie_mw_m3_state = np.interp(state.roa, roa_eval, qie_mw_m3_eval)
+            qie_flux_state = calc.integrated_flux(
+                qie_mw_m3_state,
+                np.asarray(state.r, dtype=float),
+                np.asarray(state.dVdr, dtype=float),
+                np.asarray(state.surfArea, dtype=float),
+            )
+            return np.interp(roa_eval, state.roa, np.asarray(qie_flux_state, dtype=float))
+        except Exception:
+            # Fallback local-length estimate when full geometry arrays are unavailable.
+            return qie_mw_m3_eval * a_minor
 
     def _assemble_fluxes(
         self,
         state,
         *,
-        Ge_turb_gB: np.ndarray,
-        Ge_neo_gB: np.ndarray,
-        Qi_turb_gB: np.ndarray,
-        Qi_neo_gB: np.ndarray,
-        Qe_turb_gB: np.ndarray,
-        Qe_neo_gB: np.ndarray,
+        Ge_turb_gB: Optional[np.ndarray] = None,
+        Ge_neo_gB: Optional[np.ndarray] = None,
+        Qi_turb_gB: Optional[np.ndarray] = None,
+        Qi_neo_gB: Optional[np.ndarray] = None,
+        Qe_turb_gB: Optional[np.ndarray] = None,
+        Qe_neo_gB: Optional[np.ndarray] = None,
+        Qie_turb_gB: Optional[np.ndarray] = None,
+        Qie_neo_gB: Optional[np.ndarray] = None,
         model_label: str = "Transport",
+        **legacy_kwargs,
     ) -> Tuple[Dict[str, Any], Dict[str, Any]]:
         """Assemble flux/flow dicts and output from gB-normalised fluxes.
 
@@ -648,6 +719,7 @@ class TransportBase:
         Ge_turb_gB / Ge_neo_gB  : electron particle flux (gB-normalised), at roa_eval
         Qi_turb_gB / Qi_neo_gB  : ion heat flux (gB-normalised), same grid
         Qe_turb_gB / Qe_neo_gB  : electron heat flux (gB-normalised), same grid
+        Qie_turb_gB / Qie_neo_gB: exchange density (Sgb-normalised), same grid
 
         Populates
         ---------
@@ -659,6 +731,25 @@ class TransportBase:
         -------
         (output_dict, std_dict) – flat dicts of physical values at roa_eval
         """
+        Ge_turb_gB = Ge_turb_gB if Ge_turb_gB is not None else legacy_kwargs.pop("Gamma_turb", None)
+        Ge_neo_gB = Ge_neo_gB if Ge_neo_gB is not None else legacy_kwargs.pop("Gamma_neo", None)
+        Qi_turb_gB = Qi_turb_gB if Qi_turb_gB is not None else legacy_kwargs.pop("Qi_turb", None)
+        Qi_neo_gB = Qi_neo_gB if Qi_neo_gB is not None else legacy_kwargs.pop("Qi_neo", None)
+        Qe_turb_gB = Qe_turb_gB if Qe_turb_gB is not None else legacy_kwargs.pop("Qe_turb", None)
+        Qe_neo_gB = Qe_neo_gB if Qe_neo_gB is not None else legacy_kwargs.pop("Qe_neo", None)
+
+        required = {
+            "Ge_turb_gB": Ge_turb_gB,
+            "Ge_neo_gB": Ge_neo_gB,
+            "Qi_turb_gB": Qi_turb_gB,
+            "Qi_neo_gB": Qi_neo_gB,
+            "Qe_turb_gB": Qe_turb_gB,
+            "Qe_neo_gB": Qe_neo_gB,
+        }
+        missing = [name for name, value in required.items() if value is None]
+        if missing:
+            raise ValueError(f"Missing required transport channels for _assemble_fluxes: {missing}")
+
         if self.roa_eval is None:
             self.roa_eval = list(state.roa)
         roa_eval = np.atleast_1d(self.roa_eval)
@@ -696,6 +787,8 @@ class TransportBase:
         Qe_neo_gB  = np.asarray(Qe_neo_gB,  dtype=float)
         Qi_turb_gB = np.asarray(Qi_turb_gB, dtype=float)
         Qi_neo_gB  = np.asarray(Qi_neo_gB,  dtype=float)
+        Qie_turb_gB = np.zeros_like(Qe_turb_gB) if Qie_turb_gB is None else np.asarray(Qie_turb_gB, dtype=float)
+        Qie_neo_gB = np.zeros_like(Qe_turb_gB) if Qie_neo_gB is None else np.asarray(Qie_neo_gB, dtype=float)
 
         Ge_turb = Ge_turb_gB * G_gB   # [1e19/m²/s]
         Ge_neo  = Ge_neo_gB  * G_gB
@@ -704,12 +797,23 @@ class TransportBase:
         Qi_t    = Qi_turb_gB * Q_gB
         Qi_n    = Qi_neo_gB  * Q_gB
 
+        # Exchange source density [MW/m^3] integrated to equivalent heat flux [MW/m^2].
+        Qie_t = self._exchange_density_gB_to_flux(state, Qie_turb_gB, roa_eval, Q_gB)
+        Qie_n = self._exchange_density_gB_to_flux(state, Qie_neo_gB, roa_eval, Q_gB)
+
+        # PORTALS convention: exchange term is additive in electron channel and
+        # subtractive in ion channel for final transport totals.
+        Qe_x_t = Qie_t
+        Qe_x_n = Qie_n
+        Qi_x_t = -Qie_t
+        Qi_x_n = -Qie_n
+
         # ------------------------------------------------------------------
         # 3. Totals
         # ------------------------------------------------------------------
         Ge       = Ge_turb + Ge_neo
-        Qi_total = Qi_t + Qi_n
-        Qe_total = Qe_t + Qe_n
+        Qi_total = Qi_t + Qi_n + Qi_x_t + Qi_x_n
+        Qe_total = Qe_t + Qe_n + Qe_x_t + Qe_x_n
 
         # ion particle fluxes (ambipolarity: Gi ≈ Ge / Zeff)
         Gi_turb = Ge_turb / np.maximum(Zeff, 1e-12)
@@ -733,19 +837,29 @@ class TransportBase:
         # ------------------------------------------------------------------
         Pe_turb = Qe_t * surfArea
         Pe_neo  = Qe_n * surfArea
+        Pe_exch_turb = Qe_x_t * surfArea
+        Pe_exch_neo  = Qe_x_n * surfArea
         Pe      = Pe_turb + Pe_neo
+        Pe      = Pe + Pe_exch_turb + Pe_exch_neo
 
         Pi_turb = Qi_t * surfArea
         Pi_neo  = Qi_n * surfArea
+        Pi_exch_turb = Qi_x_t * surfArea
+        Pi_exch_neo  = Qi_x_n * surfArea
         Pi      = Pi_turb + Pi_neo
+        Pi      = Pi + Pi_exch_turb + Pi_exch_neo
 
         # Conductive = total - convective
         De_turb = Pe_turb - Ce_turb
         De_neo  = Pe_neo  - Ce_neo
+        De_exch_turb = Pe_exch_turb
+        De_exch_neo = Pe_exch_neo
         De      = Pe - Ce
 
         Di_turb = Pi_turb - Ci_turb
         Di_neo  = Pi_neo  - Ci_neo
+        Di_exch_turb = Pi_exch_turb
+        Di_exch_neo = Pi_exch_neo
         Di      = Pi - Ci
 
         # ------------------------------------------------------------------
@@ -759,14 +873,38 @@ class TransportBase:
             'real': {
                 'Ge': {'turb': Ge_turb, 'neo': Ge_neo, 'total': Ge},
                 'Gi': {'turb': Gi_turb, 'neo': Gi_neo, 'total': Gi},
-                'Qe': {'turb': Qe_t,    'neo': Qe_n,   'total': Qe_total},
-                'Qi': {'turb': Qi_t,    'neo': Qi_n,   'total': Qi_total},
+                'Qe': {
+                    'turb': Qe_t,
+                    'neo': Qe_n,
+                    'turb_exch': Qe_x_t,
+                    'neo_exch': Qe_x_n,
+                    'total': Qe_total,
+                },
+                'Qi': {
+                    'turb': Qi_t,
+                    'neo': Qi_n,
+                    'turb_exch': Qi_x_t,
+                    'neo_exch': Qi_x_n,
+                    'total': Qi_total,
+                },
             },
             'gB': {
                 'Ge': {'turb': Ge_turb_gB, 'neo': Ge_neo_gB, 'total': Ge / _safe(G_gB)},
                 'Gi': {'turb': Gi_turb_gB, 'neo': Gi_neo_gB, 'total': Gi / _safe(G_gB)},
-                'Qe': {'turb': Qe_turb_gB, 'neo': Qe_neo_gB, 'total': Qe_total / _safe(Q_gB)},
-                'Qi': {'turb': Qi_turb_gB, 'neo': Qi_neo_gB, 'total': Qi_total / _safe(Q_gB)},
+                'Qe': {
+                    'turb': Qe_turb_gB,
+                    'neo': Qe_neo_gB,
+                    'turb_exch': Qe_x_t / _safe(Q_gB),
+                    'neo_exch': Qe_x_n / _safe(Q_gB),
+                    'total': Qe_total / _safe(Q_gB),
+                },
+                'Qi': {
+                    'turb': Qi_turb_gB,
+                    'neo': Qi_neo_gB,
+                    'turb_exch': Qi_x_t / _safe(Q_gB),
+                    'neo_exch': Qi_x_n / _safe(Q_gB),
+                    'total': Qi_total / _safe(Q_gB),
+                },
             },
         }
 
@@ -776,25 +914,32 @@ class TransportBase:
         #    3rd key: 'conv', 'cond', 'total'
         #    each contains:  'turb', 'neo', 'total'
         # ------------------------------------------------------------------
-        def _flow_entry(turb, neo, total):
-            return {'turb': turb, 'neo': neo, 'total': total}
+        zeros = np.zeros_like(Pe_turb)
+
+        def _flow_entry(turb, neo, total, turb_exch=None, neo_exch=None):
+            entry = {'turb': turb, 'neo': neo, 'total': total}
+            if turb_exch is not None:
+                entry['turb_exch'] = turb_exch
+            if neo_exch is not None:
+                entry['neo_exch'] = neo_exch
+            return entry
 
         flows_real = {
             'Pe': {
-                'conv':  _flow_entry(Ce_turb, Ce_neo, Ce),
-                'cond':  _flow_entry(De_turb, De_neo, De),
-                'total': _flow_entry(Pe_turb, Pe_neo, Pe),
+                'conv':  _flow_entry(Ce_turb, Ce_neo, Ce, zeros, zeros),
+                'cond':  _flow_entry(De_turb, De_neo, De, De_exch_turb, De_exch_neo),
+                'total': _flow_entry(Pe_turb, Pe_neo, Pe, Pe_exch_turb, Pe_exch_neo),
             },
             'Pi': {
-                'conv':  _flow_entry(Ci_turb, Ci_neo, Ci),
-                'cond':  _flow_entry(Di_turb, Di_neo, Di),
-                'total': _flow_entry(Pi_turb, Pi_neo, Pi),
+                'conv':  _flow_entry(Ci_turb, Ci_neo, Ci, zeros, zeros),
+                'cond':  _flow_entry(Di_turb, Di_neo, Di, Di_exch_turb, Di_exch_neo),
+                'total': _flow_entry(Pi_turb, Pi_neo, Pi, Pi_exch_turb, Pi_exch_neo),
             },
         }
         _P = _safe(P_gB)
         flows_gB = {
             P_key: {
-                level: {comp: flows_real[P_key][level][comp] / _P for comp in ('turb', 'neo', 'total')}
+                level: {comp: flows_real[P_key][level][comp] / _P for comp in flows_real[P_key][level].keys()}
                 for level in ('conv', 'cond', 'total')
             }
             for P_key in ('Pe', 'Pi')

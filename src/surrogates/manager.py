@@ -347,7 +347,10 @@ class SurrogateManager:
     def _extract_from_transport_dict(transport_dict: dict, key: str, norm: str) -> "np.ndarray":
         """Extract a channel array from the nested transport_dict.
 
-        Key convention: ``'{channel}'`` (total) or ``'{channel}_turb'`` / ``'{channel}_neo'``.
+                Key convention:
+                    - ``'{channel}'`` (total)
+                    - ``'{channel}_turb'`` / ``'{channel}_neo'``
+                    - ``'{channel}_exch_turb'`` / ``'{channel}_exch_neo'``
 
         Channel routing::
 
@@ -357,7 +360,11 @@ class SurrogateManager:
             De, Di           → flows[norm][Pe|Pi]['cond'][component]
         """
         import numpy as _np
-        if key.endswith('_turb'):
+        if key.endswith('_exch_turb'):
+            base, comp = key[:-10], 'turb_exch'
+        elif key.endswith('_exch_neo'):
+            base, comp = key[:-9], 'neo_exch'
+        elif key.endswith('_turb'):
             base, comp = key[:-5], 'turb'
         elif key.endswith('_neo'):
             base, comp = key[:-4], 'neo'

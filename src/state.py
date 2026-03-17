@@ -124,6 +124,10 @@ class PlasmaState:
             self.ni_full = self.ni
             self.ti = self.ti[:,0].flatten() if self.ti.ndim == 2 else self.ti.flatten()
             self.ni = self.ni[:,0].flatten() if self.ni.ndim == 2 else self.ni.flatten()
+            # Freeze per-species fractions fi = <ni_k/ne> so that ni_k = fi*ne each iteration,
+            # enforcing d(ni_k/ne)/dr = 0 => aLni_k = aLne analytically.
+            _ni2d = self.ni_full if self.ni_full.ndim == 2 else self.ni_full[:, np.newaxis]
+            self._f_species = np.mean(_ni2d / self.ne[:, np.newaxis], axis=0)  # (n_species,)
             self.n0 = get("n0(10^19/m^3)", np.ones_like(self.ni_full)*0.01)
             self.metadata['gacode_mapping']['ti(keV)'] = 'ti_full'
             self.metadata['gacode_mapping']['ni(10^19/m^3)'] = 'ni_full'
@@ -194,15 +198,22 @@ class PlasmaState:
                 self.mi_ref = 2.0
                 self.Z_ref = 1.0
 
-        # Follow PORTALS approach to ion densities
-        # Update thermal ion species to scale proportionally to ne
-        self._ne_old = getattr(self, "_ne_old", self.ne.copy())
-        scale_factor = self.ne / np.maximum(self._ne_old, 1e-30)
-        self.ni_full *= scale_factor[:, np.newaxis]
-        self.ni = self.ni_full[:,0].flatten() if self.ni_full.ndim == 2 else self.ni_full.flatten()
-        self._ne_old = self.ne.copy()
-        self.aLni = calc.aLy(self.r, self.ni)
+        # Enforce fixed species fractions: ni_k/ne = f_k (const) => aLni = aLnZ = aLne.
+        # ni_full[:,k] = f_k * ne with f_k frozen from initialization.
+        _f = getattr(self, '_f_species', None)
+        if _f is not None:
+            ni2d = _f[np.newaxis, :] * self.ne[:, np.newaxis]  # (n_radial, n_species)
+            self.ni_full = ni2d if self.ni_full.ndim == 2 else ni2d[:, 0]
+            self.ni = ni2d[:, 0].flatten()
+        self.aLni = self.aLne
+        self.aLnZ = self.aLne
         # self.f_imp = 1.0 - self.ni / np.maximum(self.ne, 1e-30)
+
+        # Keep ti_full aligned with the solver's current ti
+        if hasattr(self, 'ti_full') and self.ti_full is not None:
+            if self.ti_full.ndim == 2:
+                self.ti_full[:, 0] = self.ti[np.newaxis, :]   # all columns are Ti
+                # For multi-species: assume Ts/Ti ratio is frozen (like _f_species for density)
 
         neutrals_active = neutrals is not None and getattr(neutrals, "n0_edge", None) is not None
         if neutrals_active:
@@ -216,7 +227,7 @@ class PlasmaState:
         self.rho_s = plasma.rho_s(self.te, getattr(self, "mi_ref", 2.0), self.B)
         self.vth = plasma.vthermal(self.ti, self.mi_ref)
         self.vthe = plasma.vthermal(self.te,self.mi_ref,'electron')
-        self.q_gb, self.g_gb, *_ = plasma.gyrobohm_units(
+        self.q_gb, self.g_gb, self.p_gb, self.s_gb, self.c_gb = plasma.gyrobohm_units(
             self.te,
             self.ne * 1e-1,  # convert 10^19/m^3 -> 10^20/m^3
             self.mi_ref,
@@ -233,7 +244,7 @@ class PlasmaState:
         self.shear = plasma.magnetic_shear(self.q, self.r)
         self.rhostar = plasma.rho_star(self.te,self.mi_ref,self.a,self.B)
         self.nustar = plasma.nu_star(self.te,self.ne,self.a,self.mi_ref)
-        self.eps = self.r/self.aspect_ratio
+        self.eps = self.r / self.R0
         self.q95 = np.interp(0.95, self.rho, self.q) if self.q is not None else np.nan
         self.Lpar = pi * abs(self.q95) * self.R[-1] * self.kappa_hat[-1] / 2  # m
         self.kappa95 = np.interp(0.95, self.rho, self.kappa) if self.kappa is not None else np.nan
@@ -291,19 +302,19 @@ class PlasmaState:
         # VPAR_2 =+1.44804E-01 # sign(Ip)*R0*Vtor/(R*c_s)
         # VPAR_SHEAR_2 =+1.69199E+00 # -sign(Ip)*R0*d(VPar)/dr * a
 
-        self.gacode_species = []
-        for i, spec in enumerate(self.species):
-            gacode_spec = {
-                "ZS": spec["Z"],
-                "MASS": spec["A"] / 2.0,  # normalized to deuterium
-                "AS": self.nine_full[:,i],
-                "TAUS": self.tite_full[:,i],
-                "RLNS": calc.aLy(self.r, self.ni_full[:,i]),
-                "RLTS": calc.aLy(self.r, self.ti_full[:,i]),
-                "VPAR": self.vpar,
-                "VPAR_SHEAR": self.vpar_shear,
-            }
-            self.gacode_species.append(gacode_spec)
+        # self.gacode_species = []
+        # for i, spec in enumerate(self.species):
+        #     gacode_spec = {
+        #         "ZS": spec["Z"],
+        #         "MASS": spec["A"] / 2.0,  # normalized to deuterium
+        #         "AS": self.nine_full[:,i],
+        #         "TAUS": self.tite_full[:,i],
+        #         "RLNS": calc.aLy(self.r, self.ni_full[:,i]),
+        #         "RLTS": calc.aLy(self.r, self.ti_full[:,i]),
+        #         "VPAR": self.vpar,
+        #         "VPAR_SHEAR": self.vpar_shear,
+        #     }
+        #     self.gacode_species.append(gacode_spec)
 
         return
 
@@ -546,6 +557,8 @@ class PlasmaState:
         self.Pohm_i = calc.volume_integrate(self.r, getattr(self,'qohmi',np.zeros_like(self.roa)), self.dVdr)
         self.Pbeam_i = calc.volume_integrate(self.r, getattr(self,'qbeami',np.zeros_like(self.roa)), self.dVdr)
         self.Prf_i = calc.volume_integrate(self.r, getattr(self,'qrfi',np.zeros_like(self.roa)), self.dVdr)
+
+        self.Pei = calc.volume_integrate(self.r, getattr(self,'qei',np.zeros_like(self.roa)), self.dVdr)
             
         # check for integrated_vars to add integration constant on each flow after trimming
         if hasattr(self, 'integrated_vars'):
@@ -561,7 +574,8 @@ class PlasmaState:
 
         self.integrated_vars = ['Gbeam_e','Gwall_e',
                                 'Pohm_e','Pbeam_e','Prf_e',
-                                'Pohm_i','Pbeam_i','Prf_i']
+                                'Pohm_i','Pbeam_i','Prf_i',
+                                'Pei']
 
     def _trim(self):
         """Trim all array attributes to domain. """

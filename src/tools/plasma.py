@@ -15,7 +15,7 @@ PI = np.pi
 E_J = e  # Electron charge in Joules
 U_KG = m_p  # Atomic mass unit in kg (using proton mass as reference)
 MU0 = mu_0
-factor_convection = 3/2
+factor_convection = 3 / 2
 mp_over_me = m_p / m_e
 
 def c_s(Te_keV: float, m_ref_u: float) -> float:
@@ -433,7 +433,7 @@ def debye(Te_keV, ne_20, mi_u, B_T):
 
     return db
 
-def energy_exchange(ne,Te,Ti,nu_exch):
+def energy_exchange(ne,Te,Ti,nu_x, mi_ref_u=1.0):
     """
     Compute energy exchange source S_exch per radial point for single ion species.
 
@@ -442,14 +442,15 @@ def energy_exchange(ne,Te,Ti,nu_exch):
         ne : (N_roa,) 1e19/m^3
         Te : (N_roa,) keV
         Ti : (N_roa,) keV
-        nu_exch : (N_roa,) 1/s
+        nu_x : (N_roa,) 1/s
+        mi_ref_u : float, optional
 
     Returns
-        s_exch : (N_roa, 1)
+        q_exch : (N_roa, 1)
     """
-    s_exch = 1.5*ne*1e19*nu_exch*(Te - Ti)*1e3*e  # W/m^3 (N_roa,)
+    q_ie = 3 / mp_over_me / mi_ref_u * ne * 1e19 * nu_x * (Ti-Te) * e * 1e3 * 1e-6
 
-    return s_exch*1e-6  # MW/m^3 (N_roa,)
+    return q_ie  # MW/m^3 (N_roa,)
 
 
 def calculate_collisionalities(
@@ -1025,6 +1026,8 @@ def build_flux_flow_dict(
 
     q_gb = _interp_state_quantity(state, 'q_gb', roa_points)
     g_gb = _interp_state_quantity(state, 'g_gb', roa_points)
+    c_gb = _interp_state_quantity(state, 'c_gb', roa_points) # convective norm
+    s_gb = _interp_state_quantity(state, 's_gb', roa_points) # exchange norm
     surfArea = _interp_state_quantity(state, 'surfArea', roa_points)
     Te = _interp_state_quantity(state, 'te', roa_points)
     Ti = _interp_state_quantity(state, 'ti', roa_points)
