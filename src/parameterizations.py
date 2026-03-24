@@ -1845,6 +1845,217 @@ class Mtanh(ParameterBase):
         raise NotImplementedError("MTanhParameterModel.update not yet implemented")
 
 
+class LogSpline(Spline):
+    """ Spline parameter model with parameters in log space"""
+
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+        self.defined_on = "aLy"
+        self.param_names = ['log_' + self.defined_on + str(i) for i in range(len(self.knots))]
+
+    def _to_physical_params(self, params: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+        """Exponentiate log-space values in-place under the same log_aLy keys.
+
+        Keys stay as 'log_aLy0', 'log_aLy1', ... so that the parent Spline methods
+        (which iterate self.param_names = ['log_aLy0', ...]) can still look them up,
+        but the stored values become physical aLy (not log aLy).
+        """
+        phys = {}
+        for prof, prof_params in params.items():
+            inner = {}
+            for key, val in prof_params.items():
+                inner[key] = np.exp(val) if key.startswith('log_aLy') else val
+            phys[prof] = inner
+        return phys
+
+    def _to_log_params(self, params: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+        """Apply log transform to values stored under log_aLy keys.
+
+        After Spline.parameterize (called via super()), self.param_names is already
+        ['log_aLy0', ...], so the returned dict has log_aLy keys with *physical* aLy
+        values.  This method takes the log of those values.
+        """
+        log_params = {}
+        for prof, prof_params in params.items():
+            inner = {}
+            for key, val in prof_params.items():
+                if key.startswith('log_aLy'):
+                    inner[key] = np.log(val) if val > 0 else -np.inf
+                else:
+                    inner[key] = val
+            log_params[prof] = inner
+        return log_params
+
+    def _to_log_std(self, params: Dict[str, Dict[str, float]], params_std: Dict[str, Dict[str, float]]) -> Dict[str, Dict[str, float]]:
+        """Convert physical uncertainties to log-space (σ_log = σ/μ for log-normal)."""
+        log_std = {}
+        for prof, prof_params in params.items():
+            inner = {}
+            for key, val in prof_params.items():
+                if key.startswith('log_aLy'):
+                    inner[key] = (params_std[prof][key] / val) if val > 0 else self.sigma
+                else:
+                    inner[key] = params_std[prof][key]
+            log_std[prof] = inner
+        return log_std
+
+    
+    def parameterize(self, state, bc_dict: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+        """ Fit parameters then transform to log space for storage."""
+        params, params_std = super().parameterize(state, bc_dict)
+        log_params = self._to_log_params(params)
+        log_params_std = self._to_log_std(params, params_std)
+
+        return log_params, log_params_std
+    
+    def get_aLy(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Override to convert log-space parameters back to physical space before evaluation."""
+        phys_params = self._to_physical_params(params)
+        return super().get_aLy(phys_params, x_eval)
+    
+    def get_y(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Override to convert log-space parameters back to physical space before evaluation."""
+        phys_params = self._to_physical_params(params)
+        return super().get_y(phys_params, x_eval)
+    
+    def get_curvature(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Override to convert log-space parameters back to physical space before evaluation."""
+        phys_params = self._to_physical_params(params)
+        return super().get_curvature(phys_params, x_eval)
+
+class LogSlopeSpline(Spline):
+    """ Spline parameter model with slope parameters in log space"""
+
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+        self.defined_on = "aLy"
+        self.param_names = ['log_slope_' + self.defined_on + str(i) for i in range(len(self.knots))]
+
+    def _to_physical_params(self, params: Dict[str, float]) -> Dict[str, float]:
+        """Convert log-space slope parameters to physical space."""
+        phys = params.copy()
+        # log_slope_aLy0 = log(aLy0), then log_slope_aLy1 = log(aLy1/aLy0) = log(aLy1) - log(aLy0)
+        # So we can reconstruct aLy1 = aLy0 * exp(log_slope_aLy1) = exp(log_slope_aLy0) * exp(log_slope_aLy1) = exp(log_slope_aLy0 + log_slope_aLy1)
+        for key in phys:
+            if key.startswith('log_slope_aLy'):
+                idx = int(key.replace('log_slope_aLy', ''))
+                if idx == 0:
+                    phys['aLy0'] = np.exp(phys[key])
+                else:
+                    prev_key = f'log_slope_aLy{idx - 1}'
+                    phys[f'aLy{idx}'] = np.exp(phys[key] + phys[prev_key])
+        return phys
+    
+    def _to_log_slope_params(self, params: Dict[str, float]) -> Dict[str, float]:
+        """Convert physical slope parameters to log space."""
+        log_slope = {}
+        for key in params:
+            if key.startswith('aLy'):
+                idx = int(key.replace('aLy', ''))
+                if idx == 0:
+                    log_slope[f'log_slope_aLy{idx}'] = np.log(params[key])
+                else:
+                    prev_key = f'aLy{idx - 1}'
+                    if prev_key in params and params[prev_key] != 0:
+                        log_slope[f'log_slope_aLy{idx}'] = np.log(params[key] / params[prev_key])
+                    else:
+                        log_slope[f'log_slope_aLy{idx}'] = np.log(params[key])
+        return log_slope
+    
+    def _to_log_slope_std(self, params: Dict[str, float], params_std: Dict[str, float]) -> Dict[str, float]:
+        """Convert physical slope parameter uncertainties to log space using error propagation."""
+        log_slope_std = {}
+        for key in params:
+            if key.startswith('aLy'):
+                idx = int(key.replace('aLy', ''))
+                if idx == 0:
+                    log_slope_std[f'log_slope_aLy{idx}'] = (params_std[key] / params[key]) if params[key] != 0 else self.sigma
+                else:
+                    prev_key = f'aLy{idx - 1}'
+                    if prev_key in params and params[prev_key] != 0:
+                        log_slope_std[f'log_slope_aLy{idx}'] = np.sqrt((params_std[key] / params[key])**2 + (params_std[prev_key] / params[prev_key])**2)
+                    else:
+                        log_slope_std[f'log_slope_aLy{idx}'] = (params_std[key] / params[key]) if params[key] != 0 else self.sigma
+        return log_slope_std
+    
+    def parameterize(self, state, bc_dict: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+        """ Fit parameters then transform slope parameters to log space for storage."""
+        params, params_std = super().parameterize(state, bc_dict)
+        log_slope_params = self._to_log_slope_params(params)
+        # For uncertainties, we can use error propagation: σ_log_slope = σ_aLy / aLy for the first parameter, and for subsequent parameters, we can use the ratio of uncertainties.
+        log_slope_params_std = self._to_log_slope_std(params, params_std)
+        
+        return log_slope_params, log_slope_params_std
+    
+    def get_y(self, params, x_eval):
+        phys_params = self._to_physical_params(params)
+        return super().get_y(phys_params, x_eval)
+    
+    def get_aLy(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Override to convert log-space slope parameters back to physical space before evaluation."""
+        phys_params = self._to_physical_params(params)
+        return super().get_aLy(phys_params, x_eval)
+    
+    def get_curvature(self, params, x_eval):
+        phys_params = self._to_physical_params(params)
+        return super().get_curvature(phys_params, x_eval)
+
+class LogPolynomial(Polynomial):
+    """ Polynomial parameter model with parameters in log space"""
+
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+        self.defined_on = "aLy"
+        self.param_names = ['log_' + self.defined_on + str(i) for i in range(self.degree + 1)]
+
+    def _to_physical_params(self, params: Dict[str, float]) -> Dict[str, float]:
+        """Convert log-space parameters to physical space."""
+        phys = params.copy()
+        for key in phys:
+            if key.startswith('log_aLy'):
+                phys[key.replace('log_', '')] = np.exp(phys[key])
+        return phys
+    
+    def _to_log_params(self, params: Dict[str, float]) -> Dict[str, float]:
+        """Convert physical parameters to log space."""
+        log_params = {}
+        for key in params:
+            if key.startswith('aLy'):
+                log_params[f'log_{key}'] = np.log(params[key]) if params[key] > 0 else -np.inf
+        return log_params
+    
+    def _to_log_std(self, params: Dict[str, float], params_std: Dict[str, float]) -> Dict[str, float]:
+        """Convert physical parameter uncertainties to log space using error propagation."""
+        log_std = {}
+        for key in params:
+            if key.startswith('aLy'):
+                log_std[f'log_{key}'] = (params_std[key] / params[key]) if params[key] > 0 else self.sigma
+        return log_std
+
+    def parameterize(self, state, bc_dict: Dict[str, Any]) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:  
+        """ Fit parameters then transform to log space for storage."""
+        params, params_std = super().parameterize(state, bc_dict)
+        log_params = self._to_log_params(params)
+        log_params_std = self._to_log_std(params, params_std)
+
+        return log_params, log_params_std
+    
+    def get_aLy(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Override to convert log-space parameters back to physical space before evaluation."""
+        phys_params = self._to_physical_params(params)
+        return super().get_aLy(phys_params, x_eval)
+    
+    def get_y(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Override to convert log-space parameters back to physical space before evaluation."""
+        phys_params = self._to_physical_params(params)
+        return super().get_y(phys_params, x_eval)
+
+    def get_curvature(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
+        """Override to convert log-space parameters back to physical space before evaluation."""
+        phys_params = self._to_physical_params(params)
+        return super().get_curvature(phys_params, x_eval)
+
+
 # -------------------------
 # Factory and registry
 # -------------------------
@@ -1856,6 +2067,9 @@ PARAMETER_MODELS = {
     'gaussian': Gaussian,
     'polynomial': Polynomial,
     'basis': BasisFunction,
+    'log_spline': LogSpline,
+    'log_slope_spline': LogSlopeSpline,
+    'log_polynomial': LogPolynomial,
 }
 
 
@@ -1863,7 +2077,7 @@ def create_parameter_model(config: Dict[str, Any]) -> ParameterBase:
     """Create a parameter model instance from config.
 
     Expected config format:
-    {"type": "spline"|"mtanh"|"gaussian", "kwargs": { ... model options ... }}
+    {"type": "spline"|"mtanh"|"gaussian"|"log_spline"|"log_slope_spline", "kwargs": { ... model options ... }}
     """
     model_type = (config or {}).get('type', 'spline')
     kwargs = (config or {}).get('kwargs', {})

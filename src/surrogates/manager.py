@@ -50,13 +50,29 @@ class SurrogateManager:
         self.state_features: List[str] = []
         self.param_features: List[str] = []
         self.all_features: List[str] = []
-        self._full_state_features = [
-            "aLne", "aLte", "aLti", "vexb_shear",   # stage 1: gradients + rotation shear
-            "nustar", "tite",                          # stage 2: collisionality, Ti/Te ratio
-            "betae",                                   # stage 3: electromagnetic effects
-        ]
+        if self.mode == 'global':
+            self._full_state_features = [
+                "aLne", "aLte", "aLti", "q", "vexb_shear",  # stage 1: gradients + q + rotation shear
+                "nustar", "tite",                              # stage 2: collisionality, Ti/Te ratio
+                "betae",                                       # stage 3: electromagnetic effects
+            ]
+        else:
+            self._full_state_features = [
+                "aLne", "aLte", "aLti", "vexb_shear",   # stage 1: gradients + rotation shear
+                "nustar", "tite",                          # stage 2: collisionality, Ti/Te ratio
+                "betae",                                   # stage 3: electromagnetic effects
+            ]
         self._full_all_features: List[str] = []
         self._active_stage: Optional[str] = None
+        # Mask of features retained after the near-constant-feature filter in fit().
+        # None = no fit yet; populated as a bool ndarray by fit().
+        self._active_feature_mask: Optional[np.ndarray] = None
+        # Features with relative range (range / max_range across features) below this
+        # threshold are dropped before MinMaxScaler fitting to avoid degenerate ARD
+        # lengthscale dimensions.  Set to 0 to disable.
+        self.min_feature_relative_range: float = float(
+            options.get("min_feature_relative_range", 1e-4)
+        )
 
         # Unit system in which this surrogate stores training data and makes
         # predictions internally.  Configured via ``surrogate.args.train_units``
@@ -91,7 +107,7 @@ class SurrogateManager:
         self.output_list = self.transport_vars + self.target_vars
         if solver_output_units is not None:
             self.solver_output_units = dict(solver_output_units)
-        self._ensure_param_features(X_params)
+        #self._ensure_param_features(X_params)
         self._refresh_full_features()
         self._set_active_features(len(self.X_train))
         self.get_features(state, X_params)
@@ -156,9 +172,12 @@ class SurrogateManager:
 
     def _stage_state_features(self, n_samples: int) -> List[str]:
         # Thresholds aligned with PORTALS: stage transitions at 10 and 30 evaluations
-        stage1 = ["aLne", "aLte", "aLti", "vexb_shear"]    # gradients + rotation shear
+        stage1 = ["aLne", "aLte", "aLti"]    # gradients
+        if self.mode == 'global': stage1 += ["q"]  # add q for global surrogate to capture magnetic geometry effects
         stage2 = stage1 + ["nustar", "tite"]               # + collisionality, Ti/Te
+        if self.mode == 'global': stage2 += ["vexb_shear"]  # add rotation shear for global surrogate to capture flow effects
         stage3 = stage2 + ["betae"]                        # + electromagnetic effects
+        # vexb_shear explicitly anywhere?
         if n_samples < 10:
             return stage1
         if n_samples < 30:
@@ -251,7 +270,7 @@ class SurrogateManager:
             - Single input: shape (n_roa_eval, n_features)
             - Batched input: shape (n_batch, n_roa_eval, n_features)
         """
-        self._ensure_param_features(X_params)
+        #self._ensure_param_features(X_params)
         if not self._full_all_features:
             self._refresh_full_features()
         if state_features is None or all_features is None:
@@ -468,7 +487,7 @@ class SurrogateManager:
         transport_dict : dict, optional
             Full nested transport dict; takes precedence over transport_gB.
         """
-        self._ensure_param_features(X_params)
+        #self._ensure_param_features(X_params)
         self._refresh_full_features()
         # Always extract ALL features (stage 3) for storage
         X_features_array = self.get_features(
@@ -534,20 +553,61 @@ class SurrogateManager:
             for o_idx, output in enumerate(self.output_list):
                 Y_all_samples[s_idx, :, o_idx] = sample_dict[output]
 
-        # Stage 1: Normalise inputs to [0, 1] per feature (calibrates lengthscale priors)
+        # Drop near-constant features before fitting the scaler.
+        # Features whose data range is smaller than min_feature_relative_range × the
+        # widest feature range are degenerate: MinMaxScaler maps them to all-zero,
+        # wasting an ARD lengthscale parameter and perturbing hyperparameter optimisation.
+        X_flat_raw = X_all_samples.reshape(-1, n_features)
+        feat_ranges = X_flat_raw.max(axis=0) - X_flat_raw.min(axis=0)
+        max_range = feat_ranges.max() if feat_ranges.max() > 0 else 1.0
+        new_mask = (feat_ranges / max_range) >= self.min_feature_relative_range
+        mask_changed = (
+            self._active_feature_mask is None
+            or not np.array_equal(new_mask, self._active_feature_mask)
+        )
+        self._active_feature_mask = new_mask
+        dropped = [f for f, keep in zip(self.all_features, new_mask) if not keep]
+        if dropped and self.verbose:
+            print(
+                f"  Dropping near-constant features "
+                f"(relative range < {self.min_feature_relative_range}): {dropped}"
+            )
+        n_active = int(new_mask.sum())
+        if n_active == 0:
+            print("Warning: All features are near-constant; cannot train surrogate.")
+            return
+        if mask_changed:
+            active_feats = [f for f, keep in zip(self.all_features, new_mask) if keep]
+            for key in self.output_list:
+                if self.mode == 'local':
+                    self.models[key] = [
+                        self.create_surrogate_model(
+                            self.model_config, features=active_feats, output_key=key
+                        )
+                        for _ in range(len(self.roa_eval))
+                    ]
+                else:
+                    self.models[key] = self.create_surrogate_model(
+                        self.model_config, features=active_feats, output_key=key
+                    )
+        X_active = X_flat_raw[:, new_mask].reshape(n_samples, n_roa, n_active)
+
+        # Stage 1: Normalise active-feature inputs to [0, 1] per feature (calibrates lengthscale priors)
         self.x_scaler = MinMaxScaler()
-        X_scaled = self.x_scaler.fit_transform(X_all_samples.reshape(-1, n_features)).reshape(n_samples, n_roa, n_features)
+        X_scaled = self.x_scaler.fit_transform(
+            X_active.reshape(-1, n_active)
+        ).reshape(n_samples, n_roa, n_active)
 
         # Stage 2: Standardize outputs per variable (StandardScaler)
         self.y_scalers = {key: StandardScaler() for key in self.output_list}
 
         # Track training bounds for extrapolation detection (available post-fit via x_scaler)
-        X_flat = X_scaled.reshape(-1, n_features)
+        X_flat = X_scaled.reshape(-1, n_active)
 
         # Train all models using stage-appropriate features
         for j, key in enumerate(self.models.keys()):
             if self.mode == 'global':
-                X_fit = X_scaled.reshape(-1, n_features)
+                X_fit = X_scaled.reshape(-1, n_active)
                 Y_fit = self.y_scalers[key].fit_transform(Y_all_samples[:, :, j].reshape(-1, 1))
                 self.models[key].fit(X_fit, Y_fit)
                 scores[key] = self.models[key].score(X_fit, Y_fit)
@@ -820,16 +880,22 @@ class SurrogateManager:
         if is_batched:
             # X_features is (n_batch, n_roa, n_features)
             n_batch, n_roa, n_feat = X_features.shape
-            # Stage 1: Apply input normalization
+            # Stage 1: Apply input normalization (active features only)
             if self.x_scaler is None:
                 raise RuntimeError("Input scaler not initialized; call fit() first")
-            X = self.x_scaler.transform(X_features.reshape(-1, n_feat)).reshape(n_batch, n_roa, n_feat)
+            mask = self._active_feature_mask
+            X_in = X_features.reshape(-1, n_feat)
+            if mask is not None:
+                X_in = X_in[:, mask]
+            X = self.x_scaler.transform(X_in).reshape(n_batch, n_roa, -1)
         else:
             # X_features is (n_roa, n_features)
-            # Stage 1: Apply input normalization
+            # Stage 1: Apply input normalization (active features only)
             if self.x_scaler is None:
                 raise RuntimeError("Input scaler not initialized; call fit() first")
-            X = self.x_scaler.transform(X_features)
+            mask = self._active_feature_mask
+            X_in = X_features if mask is None else X_features[:, mask]
+            X = self.x_scaler.transform(X_in)
 
         # Initialize storage based on batching
         if is_batched:
@@ -968,11 +1034,17 @@ class SurrogateManager:
 
         if is_batched:
             n_batch, n_roa, n_feat = X_features.shape
-            # Apply input normalization
-            X = self.x_scaler.transform(X_features.reshape(-1, n_feat)).reshape(n_batch, n_roa, n_feat)
+            # Apply input normalization (active features only)
+            mask = self._active_feature_mask
+            X_in = X_features.reshape(-1, n_feat)
+            if mask is not None:
+                X_in = X_in[:, mask]
+            X = self.x_scaler.transform(X_in).reshape(n_batch, n_roa, -1)
         else:
-            # Apply input normalization
-            X = self.x_scaler.transform(X_features)
+            # Apply input normalization (active features only)
+            mask = self._active_feature_mask
+            X_in = X_features if mask is None else X_features[:, mask]
+            X = self.x_scaler.transform(X_in)
 
         transport_grads = {}
         target_grads = {}

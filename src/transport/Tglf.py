@@ -44,7 +44,17 @@ class Tglf(TransportBase):
             raise RuntimeError(f"locpargen did not produce input.tglf.locpargen at rho={rho}")
 
         f_trap_at_rho = float(np.interp(rho, state.roa, state.f_trap))
-        settings = {**self.settings, "THETA_TRAPPED": f_trap_at_rho}
+        n_tglf_species = len(getattr(state, "species", [])) + 1
+        # zero_vpar_settings = {
+        #     key: 0
+        #     for index in range(1, n_tglf_species + 1)
+        #     for key in (f"VPAR_{index}", f"VPAR_SHEAR_{index}")
+        # }
+        settings = {
+            **self.settings,
+            "THETA_TRAPPED": f_trap_at_rho,
+            #**zero_vpar_settings,
+        }
 
         controls_lines = _load_controls("tglf")
         lines = _merge_controls_and_locpargen(

@@ -748,7 +748,9 @@ def feature_importance(modules, cfg: Dict[str, Any], outdir: Path) -> List[str]:
 
     for s_idx, sample_dict in enumerate(surrogate.X_train):
         for f_idx, feature in enumerate(surrogate.all_features):
-            X_all_samples[s_idx, :, f_idx] = sample_dict[feature]
+            if feature in sample_dict:
+                X_all_samples[s_idx, :, f_idx] = sample_dict[feature]
+            # else: leave as 0.0 (feature absent in older stored data)
 
     for s_idx, sample_dict in enumerate(surrogate.Y_train):
         for o_idx, output in enumerate(surrogate.output_list):
@@ -850,7 +852,9 @@ def surrogate_sensitivity(modules, top_features: List[str], cfg: Dict[str, Any],
 
     for s_idx, sample_dict in enumerate(surrogate.X_train):
         for f_idx, feature in enumerate(surrogate.all_features):
-            X_all_samples[s_idx, :, f_idx] = sample_dict[feature]
+            if feature in sample_dict:
+                X_all_samples[s_idx, :, f_idx] = sample_dict[feature]
+            # else: leave as 0.0 (feature absent in older stored data)
 
     for s_idx, sample_dict in enumerate(surrogate.Y_train):
         for o_idx, output in enumerate(surrogate.output_list):

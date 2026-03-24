@@ -33,12 +33,25 @@ class PlasmaState:
     Each quantity is an attribute (e.g., ne, te, ti, q, rho, etc.).
     
     Supports parameter scan workflows:
-    - Heating/particle source scaling via metadata['unscaled_heating']
+    - Source scaling via source_scales (applied once at workflow start)
     - Checkpoint/restart with apply_scaling() method
     """
 
     # Arbitrary metadata and derived values
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+    # Scaling factors for input power and particle sources.
+    # Applied once at the start of the workflow via apply_scaling().
+    source_scales: Dict[str, float] = field(default_factory=lambda: {
+        'scale_Pe_beam':  1.0,
+        'scale_Pi_beam':  1.0,
+        'scale_Qpar_beam': 1.0,
+        'scale_Qpar_wall': 1.0,
+        'scale_ohmic_e':  1.0,
+        'scale_ohmic_i':  1.0,
+        'scale_rf_e':     1.0,
+        'scale_rf_i':     1.0,
+    })
 
     # ---------- conversion hooks ----------
 
@@ -150,9 +163,10 @@ class PlasmaState:
             self.B_unit = plasma.Bunit(self.torflux, self.r)
             self.B_T = self.bcentr*(self.R0/self.R)
             self.B_p = self.R**(-1)*np.gradient(self.polflux,self.r) #(self.r * self.B_T) / (self.q * self.R) # T
+            # ~ B_p_eich
             self.B = np.sqrt(self.B_T**2 + self.B_p**2) # T
-            self.kappa_hat = np.sqrt((1 + self.kappa**2)/2)
-            self.q_cyl = self.kappa_hat*self.B_T/np.maximum(self.aspect_ratio*np.abs(self.B_p), 1e-30)
+            self.kappa_hat = np.sqrt((1 + self.kappa**2*(1+2*self.delta**2-1.2*self.delta**3))/2)
+            self.q_cyl = self.kappa_hat*np.abs(self.B_T)/np.maximum(self.aspect_ratio*np.abs(self.B_p), 1e-30)
 
             # --- Compute species and shaping info ---
             self._read_species(gacode_obj=gacode_obj)
@@ -241,23 +255,27 @@ class PlasmaState:
         self._get_norms()
 
         # --- Misc derived ---
+        self.tite = self.ti / self.te
         self.shear = plasma.magnetic_shear(self.q, self.r)
         self.rhostar = plasma.rho_star(self.te,self.mi_ref,self.a,self.B)
         self.nustar = plasma.nu_star(self.te,self.ne,self.a,self.mi_ref)
         self.eps = self.r / self.R0
         self.q95 = np.interp(0.95, self.rho, self.q) if self.q is not None else np.nan
-        self.Lpar = pi * abs(self.q95) * self.R[-1] * self.kappa_hat[-1] / 2  # m
+        self.Lpar = pi * abs(self.q_cyl[-1]) * self.R[-1]  # m , Peret: pi * abs(self.q95) * self.R[-1] * self.kappa_hat[-1] / 2
         self.kappa95 = np.interp(0.95, self.rho, self.kappa) if self.kappa is not None else np.nan
         self.delta95 = np.interp(0.95, self.rho, self.delta) if self.delta is not None else np.nan
-        self.alphat = (1. + self.ti / self.te) * self.alphat_norm * self.ne / self.te**2
+        #self.alphat = (1. + self.ti / self.te) * self.alphat_norm * self.ne / self.te**2
+        #alphat = (1+ti/te) * C * wb ~ (1+ti/te) * (me/mi)*nuei*q_cyl^2*R/cs
         #self.omega_star_i,self.omega_star_e = plasma.drift_frequencies
         # Collision frequencies, nuee ~ nuei >> nuii >> nuie
         self.nuii = 4.8e-8 * self.Zeff**4 * self.ni*1e13 * self.LogLam / (np.sqrt(self.mi_over_mp) * (self.ti*1e3)**1.5)
         self.nuei = 2.91e-6 * self.ne*(self.n_norm*1e-6) * self.LogLam / ( (self.te*1e3)**1.5 ) # ~ nu_ee
-        self.nuexch = (self.Z_ref/self.mi_over_me)*self.nuei # ~nu_ie
+        self.nuexch = self.nuei/self.mi_over_me # ~nu_ie
         self.nu_eff = self.nuei * self.R / self.vthe / self.eps**1.5
         # Trapping fraction
         self.f_trap = 1.45 * np.sqrt(self.eps)
+
+        self.alphat = (1+self.tite) * (1/self.mi_over_me)*self.nuei*self.q_cyl**2*self.R0/self.c_s
 
         (
             self.ptot_manual,
@@ -277,7 +295,6 @@ class PlasmaState:
 
         # TGLF stuff
 
-        self.tite = self.ti / self.te
         self.tite_full = self.ti_full / self.te[:,np.newaxis]
         self.nine_full = self.ni_full / self.ne[:,np.newaxis]
         self.betae = plasma.betae(self.te, self.ne, self.B)
@@ -474,21 +491,21 @@ class PlasmaState:
             # Update: w0 = w_tor + w1_new = (w0_input - w1_ref) + w1_new
             w0 = self._w0_input + (w1 - self._w1_ref)
 
-        self.w0 = w0  # Angular frequency [rad/s]
-        self.w1 = w1  # Diamagnetic angular frequency [rad/s]
+        self.w0 = w1 #w0  # Angular frequency [rad/s]
+        self.w1 = w1 #._w1_ref  # Diamagnetic angular frequency [rad/s]
         
         # Compute derivatives
-        spl_w0 = akima(self.r, w0)
+        spl_w0 = akima(self.r, self.w0)
         dw0dr = spl_w0.derivative()(self.r)  # [rad/s/m]
         
         # Normalized for downstream solvers (NEO/CGYRO)
-        self.omega_rot = w0 * self.tau_norm  # Normalized angular frequency [-]
+        self.omega_rot = self.w0 * self.tau_norm  # Normalized angular frequency [-]
         self.omega_rot_deriv = dw0dr * self.a  # Normalized angular shear [-]
 
         # -------------------------------------------------
         # 4. Radial electric field (GACODE: Er = -R*B_p*w0)
         # -------------------------------------------------
-        self.Er = -self.R * self.B_p * w0
+        self.Er = -self.R * self.B_p * self.w0
 
         # -------------------------------------------------
         # 5. ExB velocity and shearing rate (GACODE/TGLF convention)
@@ -730,59 +747,63 @@ class PlasmaState:
         if process and hasattr(self, "process"):
             self.process(neutrals=neutrals)
 
-    def apply_scaling(self, scale_factors: Dict[str, float], verbose: bool = True):
-        """Apply or re-apply scaling factors to heating/particle sources.
-        
-        This method allows scaling to be applied or modified after state initialization,
-        useful for parameter scans or restart scenarios.
-        
+    def apply_scaling(self, scale_factors: Dict[str, float] = None, verbose: bool = True):
+        """Apply scaling factors to heating/particle sources.
+
+        Called once at the start of the workflow to bake source scaling into
+        the state.  Defaults to ``self.source_scales`` so no argument is needed
+        in the normal workflow path.
+
         Parameters
         ----------
-        scale_factors : Dict[str, float]
-            Dictionary of scaling factors with keys like:
-            - 'scale_Pe_beam', 'scale_Pi_beam', 'scale_Qpar_beam'
-            - 'scale_ohmic_e', 'scale_ohmic_i'
-            - 'scale_rf_e', 'scale_rf_i'
+        scale_factors : Dict[str, float], optional
+            Overrides ``self.source_scales`` when provided.
         verbose : bool, default True
-            If True, print applied scaling factors
-            
+            If True, print applied scaling factors.
+
         Notes
         -----
-        - Requires metadata['unscaled_heating'] to be populated (set by workflow)
-        - Scaling is applied to original unscaled values, not cumulative
-        - Powers (Paux_e, Paux_i) must be recomputed after scaling via _get_power_flows()
-        
+        - Original unscaled values are saved to metadata['unscaled_heating'] on
+          first call so that scaling can be re-applied from fresh originals.
+        - Scaling is applied to the original unscaled values, never cumulatively.
+        - Powers (Paux_e, Paux_i) must be recomputed after scaling via
+          _get_power_flows().
+
         Examples
         --------
-        >>> state.apply_scaling({'scale_Pe_beam': 1.2, 'scale_Pi_beam': 0.8})
-        >>> state._get_power_flows()  # Recompute integrated powers
+        >>> state.apply_scaling()                       # uses state.source_scales
+        >>> state.apply_scaling({'scale_Pe_beam': 1.2}) # explicit override
         """
-        if 'unscaled_heating' not in self.metadata:
-            if verbose:
-                print("Warning: No unscaled_heating in metadata. Cannot apply scaling.")
-            return
-        
+        if scale_factors is None:
+            scale_factors = self.source_scales
+
         # Define scaling mappings
         scaling_map = {
-            'scale_Pe_beam': 'qbeame',
-            'scale_Pi_beam': 'qbeami',
+            'scale_Pe_beam':  'qbeame',
+            'scale_Pi_beam':  'qbeami',
             'scale_Qpar_beam': 'qpar_beam',
             'scale_Qpar_wall': 'qpar_wall',
-            'scale_ohmic_e': 'qohme',
-            'scale_ohmic_i': 'qohmi',
-            'scale_rf_e': 'qrfe',
-            'scale_rf_i': 'qrfi',
+            'scale_ohmic_e':  'qohme',
+            'scale_ohmic_i':  'qohmi',
+            'scale_rf_e':     'qrfe',
+            'scale_rf_i':     'qrfi',
         }
-        
+
+        # Save originals on first call so scaling is never applied cumulatively
+        if 'unscaled_heating' not in self.metadata:
+            self.metadata['unscaled_heating'] = {}
+            for state_var in scaling_map.values():
+                if hasattr(self, state_var):
+                    self.metadata['unscaled_heating'][state_var] = np.array(getattr(self, state_var)).copy()
+
         scaling_applied = []
         for scale_key, state_var in scaling_map.items():
             if scale_key in scale_factors:
                 scale_factor = scale_factors[scale_key]
                 original = self.metadata['unscaled_heating'].get(state_var)
-                
+
                 if original is not None and hasattr(self, state_var):
-                    scaled_value = original * scale_factor
-                    setattr(self, state_var, scaled_value)
+                    setattr(self, state_var, original * scale_factor)
                     scaling_applied.append(f"{scale_key}={scale_factor:.3f}")
         
         if verbose and scaling_applied:

@@ -7,7 +7,7 @@ based on MINTboundary.LCFShandler.
 
 import numpy as np
 from typing import Dict, Tuple, Optional
-from scipy.optimize import least_squares, fsolve
+from scipy.optimize import least_squares, fsolve, brentq
 from scipy.integrate import cumulative_trapezoid
 from scipy.constants import e, m_p, mu_0, k
 from tools import plasma, calc
@@ -42,6 +42,11 @@ class BoundaryConditions:
         self.Bp = abs(state.B_p[-1])
         self.Lpar = state.Lpar
         self.mi_ref = state.mi_ref
+        self.shear = state.shear[-1]
+        self.q_cyl = state.q_cyl[-1]
+        self.nuei = state.nuei[-1]
+        self.LogLam = state.LogLam[-1]
+        self.A = state.surfArea[-1]
 
 
 class FixedInitial(BoundaryConditions):
@@ -80,15 +85,17 @@ class TwoFluidTwoPoint_PeretSSF(BoundaryConditions):
 
 
     def solve_peret_SSF(self,
-        G0=1.5, alpha_s=0.3, f_Delta=1.0, Lambda=3.0
+        G0=1.5, alpha_s=-0.3, f_Delta=1.0, Lambda=3.0
         ):
         """
         Solve for lambda_p, lambda_n, and lambda_T using the Peret 2025 SSF flux decay length model.
 
         Parameters:
             state (PlasmaState): Plasma state object
-            G0 (float): Curvature drive coefficient (default: 2.0)
-            alpha_s (float): Shear suppression coefficient (default: 0.25)
+            G0 (float): Curvature drive coefficient (default: 1.5)
+            alpha_s (float): Shear suppression coefficient (default: -0.3)
+                Up-down symmetric in SOL, broken by X-point, averages to 0 in closed flux region
+                -0.3 for LSN, 0.3 for USN until flux tube averaging method is implemented
             f_Delta (float): Blob width scaling factor (default: 1.0)
             Lambda (float): Potential sheath drop (default: 3.0)
 
@@ -102,6 +109,7 @@ class TwoFluidTwoPoint_PeretSSF(BoundaryConditions):
         ti = self.ti
         te = self.te
         Te_J = self.te*e
+        Ti_J = self.ti*e
         ne = self.ne
 
         # Sheath power exhaust factor
@@ -119,55 +127,50 @@ class TwoFluidTwoPoint_PeretSSF(BoundaryConditions):
         # instability curvature drive due to magnetic topology
         g = G0*rho_s/R0
 
-        # Solve nonlinear equations (24) and (11)
-        def equations(vars):
-            lambda_pe, lambda_n, lambda_T = vars
+        # Solve nonlinear equation (11)
+        def residual(lp):
+            # lambda_T from lambda_p analytically
+            sqrt_gamma = np.sqrt(gamma)
+            lT = sqrt_gamma / (sqrt_gamma - 1) * lp
 
-            # Avoid divide-by-zero
-            if lambda_pe <= 0 or lambda_n <= 0 or lambda_T <= 0:
-                return [1e10, 1e10, 1e10]
+            beta = f_Delta * (1/Lambda + lp/lT)
+            alpha_ExB = -0.43 * beta * Lambda * (rho_s/lp)**1.5 / g**0.5
 
-            beta = f_Delta*(1/Lambda + lambda_pe/lambda_T)
-            #gamma_ExB = Lambda*beta*rho_s**2/lambda_pe**2 # eqn 21
-            #tau = 0.43*np.sqrt(lambda_pe/(rho_s*g)) # characteristic turbulent time
-            #alpha_ExB = -tau*gamma_ExB # eqn 22
-            alpha_ExB = -0.43*beta*Lambda*(rho_s/lambda_pe)**1.5/g**0.5
+            lhs = lp / rho_s
+            rhs = 3.9 * g**(3/11) * (2*rho_s/Lpar)**(-6/11) * \
+                gamma**(-4/11) / (1 + (alpha_s + alpha_ExB)**2)**(9/11)
 
-            # Eqn 24
-            eq1 = (lambda_pe / rho_s) - 3.9*g**(3/11)*(2*rho_s/Lpar)**(-6/11)*\
-                gamma**(-4/11)/(1+(alpha_s+alpha_ExB)**2)**(9/11)
-            
-            # Eqn 18
+            return lhs - rhs
 
-            eq2 = lambda_n/lambda_pe - gamma**0.5
+        # Bracket: search over physically reasonable range
+        # lambda_p should be between ~0.1*rho_s and ~1000*rho_s
+        lo = 15. * rho_s
+        hi = 100.0 * rho_s
 
-            # Eqn 11: lambda_T definition
-            eq3 = (1 / lambda_pe - (1 / lambda_T + 1 / lambda_n))*rho_s
+        # Verify bracket is valid
+        f_lo = residual(lo)
+        f_hi = residual(hi)
+        if f_lo * f_hi > 0:
+            raise ValueError(f"brentq bracket invalid: f({lo:.2e})={f_lo:.2e}, "
+                            f"f({hi:.2e})={f_hi:.2e}")
 
-            return np.nan_to_num(np.array([eq1, eq2, eq3]),nan=1e6,posinf=1e6,neginf=-1e6)
+        lambda_p = brentq(residual, lo, hi, xtol=1e-10, rtol=1e-10)
 
-        # Initial guesses
-        lambda_pe0,lambda_n0 = 0.01,0.02
-        lambda_T0 = 1 / (1 / lambda_pe0 - 1 / lambda_n0)
+        sqrt_gamma = np.sqrt(gamma)
+        lambda_n = sqrt_gamma * lambda_p
+        lambda_T = sqrt_gamma / (sqrt_gamma - 1) * lambda_p
 
-        # Solve
-        sol = least_squares(equations, [lambda_pe0, lambda_n0, lambda_T0], bounds=(1e-6,0.2), max_nfev=int(1e2))
-        # fsolve(equations, [lambda_pe0, lambda_n0, lambda_T0])
-        if sol.success is False:
-            raise Exception("Peret SSF solver did not converge")
-        lambda_pe, lambda_n, lambda_T = sol.x
-
-        beta = f_Delta*(1/Lambda + lambda_pe/lambda_T)
-        alpha_ExB = -0.43*beta*Lambda*(rho_s/lambda_pe)**1.5/g**0.5
+        beta = f_Delta*(1/Lambda + lambda_p/lambda_T)
+        alpha_ExB = -0.43*beta*Lambda*(rho_s/lambda_p)**1.5/g**0.5
 
         # Perpendicular turbulent fluxes, Eqn 7-8
-        q0 = 41*g**0.75*(2*rho_s/Lpar)**-0.5*(rho_s/lambda_pe)**(7/4)/\
+        q0 = 41*g**0.75*(2*rho_s/Lpar)**-0.5*(rho_s/lambda_p)**(7/4)/\
             (1+(alpha_s+alpha_ExB)**2)**(9/4)
-        Gamma_e = q0*(lambda_pe/lambda_n)*ne*c_s # eqn 7
-        q_e = q0*(ne*Te_J)*c_s # eqn 8, W/m^2
-        lambda_qe = (2/7)*lambda_T*gamma**0.5/(gamma**0.5-1) # Spitzer-Harm, m
+        Gamma_e = q0*(lambda_p/lambda_n)*ne*c_s # eqn 7
+        q_e = q0* ne * (Te_J + Ti_J)*c_s # eqn 8, W/m^2
+        lambda_qe = (2/7)*lambda_T # Spitzer-Harm, m
 
-        return a/lambda_pe, a/lambda_n, a/lambda_T, Gamma_e, q_e,lambda_qe
+        return a/lambda_p, a/lambda_n, a/lambda_T, Gamma_e, q_e,lambda_qe
 
     
     def solve_two_fluid_two_point(self, lambda_q: float, fmom=0.5,
@@ -350,12 +353,16 @@ class Tftp_SepOS(BoundaryConditions):
         Lpar = self.Lpar
         a = self.a
         rho_s_pol = rho_s * (self.BT/self.Bp) # poloidal Larmor radius
+        nuei = 2.91e-6 * ne*1e-6 * self.LogLam / ( self.te**1.5 )
+        alpha_t = (1+ti/te) * me_over_mi*nuei*self.q_cyl**2*R0/c_s
 
         # Eich-Manz SepOS scaling
-        aLne = a*max(0.0, 1.0 / (2.9 * (1 + 10.4 * self.alpha_t**2.5) *
-                                   rho_s_pol))
-        aLte = a*max(0.0, 1.0 / (2.1 * (1 + 2.1 * self.alpha_t**1.7) *
-                                   rho_s_pol))
+        lambda_n = (2.9 * (1 + 10.4 * alpha_t**2.5) *
+                                   rho_s_pol)
+        lambda_T = (2.1 * (1 + 2.1 * alpha_t**1.7) *
+                                   rho_s_pol)
+        aLne = a*max(0.0,1/lambda_n)
+        aLte = a*max(0.0, 1.0 / lambda_T)
         
         # Try later
         # aLne = a*max(0.0, 1.0 / ((1 + 10 * self.alpha_t**2) *
@@ -363,7 +370,8 @@ class Tftp_SepOS(BoundaryConditions):
         # aLte = a*max(0.0, 1.0 / ((1 + self.alpha_t**2) *
         #                            rho_s_pol))
         
-        lambda_q = (2/7)*self.te*1e-3*gamma**0.5/(gamma**0.5-1)*aLte*self.a
+        #lambda_q = (2/7)*self.te*1e-3*gamma**0.5/(gamma**0.5-1)*aLte*self.a
+        lambda_q = (2/7)*lambda_T
 
         return aLne, aLte, lambda_q
 
@@ -479,9 +487,9 @@ class Tftp_SepOS(BoundaryConditions):
 
         
         # Final calculation of scale lengths (note: solve_peret_SSF reads from state)
-        _, self.aLne, self.aLTe, _, _, _ = self.solve_peret_SSF()
-        self.aLTi = (self.te/self.ti)*self.aLTe  # TODO: implement proper ion scale length
-        self.aLni = (self.ne/self.ni)*self.aLne
+        self.aLne, self.aLTe, self.lambda_q = self.get_SepOS_aLy()
+        self.aLTi = (self.te/self.ti)*self.aLTe  #Try eta_i,crit=0.8 -> aLTi = 0.8*aLne
+        self.aLni = self.aLne # (self.ne/self.ni)
 
         # Store results. (value, location in roa or rho)
         self.bc_dict = {y: [val, 1] for y, val in zip(

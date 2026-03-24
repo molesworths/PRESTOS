@@ -156,6 +156,7 @@ def build_state(config_entry: Dict[str, Any]):
     state:
       args:
         from_gacode: ~/path/to/input.gacode
+        scale_Pe_beam: 1.2   # optional source scaling
     """
     args = (config_entry or {}).get("args", {})
     gacode_path = args.get("from_gacode")
@@ -167,6 +168,12 @@ def build_state(config_entry: Dict[str, Any]):
         st = PlasmaState.from_gacode(gc)
         # Populate derived quantities with access to original profiles
         st.process(gc)
+
+        # Store any scale_* args from the state config into source_scales
+        for key, val in args.items():
+            if key.startswith('scale_') and key in st.source_scales:
+                st.source_scales[key] = float(val)
+
         return st
 
     # Fallback: try to instantiate a class if provided
@@ -339,6 +346,8 @@ def run_workflow(setup_file="setup.yaml"):
         if state is None:
             # Fallback to building fresh state
             state = build_state(config.get("state", {}))
+        # Apply source scaling once from the state's own source_scales
+        state.apply_scaling()
         
         # Restore other modules with new configurations from run_config
         params_cfg = config.get("parameters") or config.get("parameterization") or config.get("parameterizations")
@@ -370,11 +379,6 @@ def run_workflow(setup_file="setup.yaml"):
         if targets is None:
             targets = build_module(_inject_verbose(targets_cfg, verbose), module_prefix="targets")
         
-        # Apply scaling factors to state for parameter scans
-        # This must happen at initialization and be held constant
-        if targets and hasattr(targets, 'targets') and hasattr(targets.targets, 'options'):
-            _apply_target_scaling_to_state(state, targets.targets.options)
-        
         surrogate = restore_module_from_checkpoint("surrogate", module_specs, _inject_verbose(config.get("surrogate", {}), verbose))
         if surrogate is None:
             surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose), module_prefix="surrogates")
@@ -382,6 +386,8 @@ def run_workflow(setup_file="setup.yaml"):
         # Fresh run: build all modules from config
         # Build state first (supports from_gacode path)
         state = build_state(config.get("state", {}))
+        # Apply source scaling once from the state's own source_scales
+        state.apply_scaling()
 
         # Parameters: accept either 'parameters' or legacy 'parameterization' or 'parameterizations'
         params_cfg = config.get("parameters") or config.get("parameterization") or config.get("parameterizations")
@@ -406,11 +412,6 @@ def run_workflow(setup_file="setup.yaml"):
         
         targets_cfg = config.get("targets", {})
         targets = build_module(_inject_verbose(targets_cfg, verbose), module_prefix="targets")
-        
-        # Apply scaling factors to state for parameter scans
-        # This must happen at initialization and be held constant
-        if targets and hasattr(targets, 'targets') and hasattr(targets.targets, 'options'):
-            _apply_target_scaling_to_state(state, targets.targets.options)
         
         surrogate = build_module(_inject_verbose(config.get("surrogate", {}), verbose), module_prefix="surrogates")
     

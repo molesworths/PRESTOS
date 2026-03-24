@@ -20,6 +20,8 @@ from .parameterizations import (
     Spline,
     Mtanh,
     Gaussian,
+    LogSpline,
+    LogSlopeSpline,
 )
 
 # Transport and targets
@@ -75,7 +77,7 @@ __all__ = [
     'gacode',
     # state & params
     'PlasmaState',
-    'create_parameter_model', 'ParameterBase', 'Spline', 'Mtanh', 'Gaussian',
+    'create_parameter_model', 'ParameterBase', 'Spline', 'Mtanh', 'Gaussian', 'LogSpline', 'LogSlopeSpline',
     # transport & targets
     'create_transport_model', 'TransportBase', 'Fingerprints', 'CH_fingerprints', 'Cgyro', 'Tglf', 'Qlgyro', 'Fixed', 'Analytic',
     'TargetModel', 'Analytic', 'create_target_model',

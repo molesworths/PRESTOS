@@ -170,7 +170,7 @@ class Analytic(TargetModel):
         # ------------------------------------------------------------------
         # 1. Volumetric source/sink densities [MW/m³]
         # ------------------------------------------------------------------
-        self._evaluate_energy_exchange(state)   # → state.qie
+        self._evaluate_energy_exchange(state)   # → state.qei
         self._evaluate_alpha_heating(state)     # → state.qfuse, state.qfusi
         self._evaluate_radiation(state)         # → state.qrade, state.qradi
 
@@ -181,16 +181,22 @@ class Analytic(TargetModel):
         Pfus_i = calc.volume_integrate(state.r, state.qfusi, state.dVdr)
         Prad_e = calc.volume_integrate(state.r, state.qrade, state.dVdr)
         Prad_i = calc.volume_integrate(state.r, state.qradi, state.dVdr)
-        Pexch  = calc.volume_integrate(state.r, state.qie,   state.dVdr) + state.Pei_0
+        Pei    = calc.volume_integrate(state.r, state.qei,   state.dVdr) - state.Pei_0
         Paux_e = getattr(state, 'Paux_e', np.zeros_like(state.r))
         Paux_i = getattr(state, 'Paux_i', np.zeros_like(state.r))
+
+        state.Pfus_e,state.Pfus_i = Pfus_e,Pfus_i
+        state.Prad_e,state.Prad_i = Prad_e,Prad_i
+        state.Pexch = Pei
 
         # ------------------------------------------------------------------
         # 3. Net total heat flows [MW]
         #    sign convention: Prad / Pexch are losses for electrons, gains for ions
         # ------------------------------------------------------------------
-        Pe = Paux_e + Pfus_e - Prad_e + Pexch
-        Pi = Paux_i + Pfus_i - Prad_i - Pexch
+        Pe = Paux_e + Pfus_e - Prad_e - state.Pei
+        Pi = Paux_i + Pfus_i - Prad_i + state.Pei
+        state.Pe = Pe
+        state.Pi = Pi
 
         # ------------------------------------------------------------------
         # 4. Particle fluxes [1e19/m²/s]
@@ -234,11 +240,11 @@ class Analytic(TargetModel):
         #    Component keys:  'aux', 'alpha', 'rad', 'exch', 'total', 'conv', 'cond'
         # ------------------------------------------------------------------
         Pe_comps_real = {
-            'aux': Paux_e, 'alpha': Pfus_e, 'rad': Prad_e, 'exch': Pexch,
+            'aux': Paux_e, 'alpha': Pfus_e, 'rad': Prad_e, 'exch': Pei,
             'total': Pe, 'conv': Ce, 'cond': De,
         }
         Pi_comps_real = {
-            'aux': Paux_i, 'alpha': Pfus_i, 'rad': Prad_i, 'exch': Pexch,
+            'aux': Paux_i, 'alpha': Pfus_i, 'rad': Prad_i, 'exch': Pei,
             'total': Pi, 'conv': Ci, 'cond': Di,
         }
         self.flows = {
@@ -316,7 +322,7 @@ class Analytic(TargetModel):
         """Classical electron-ion energy exchange power density (MW/m^3)."""
 
         q_ie = plasma.energy_exchange(state.ne,state.te,state.ti,state.nuei)  # MW/m^3
-        state.qie = q_ie
+        state.qei = -q_ie
 
 
     def _evaluate_alpha_heating(self, state: PlasmaState) -> tuple[np.ndarray, np.ndarray]:

@@ -265,7 +265,7 @@ def magnetic_shear(q: np.ndarray, r: np.ndarray) -> np.ndarray:
     np.ndarray
         Magnetic shear profile.
     """
-    dqdr = np.gradient(q, r, edge_order=2)
+    dqdr = np.gradient(q, r)
     # Avoid division by zero at the magnetic axis
     q_safe = np.where(np.abs(q) > 1e-6, q, 1e-6)
     return (r / q_safe) * dqdr

@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 import numpy as np
+from scipy.constants import e
 
 
 def _resolve_gacode_executable(executable: str, options: Dict[str, Any]) -> str:
@@ -360,10 +361,39 @@ def _run_neo_single_rho(
         raise RuntimeError(f"locpargen did not produce input.neo.locpargen at rho={rho}")
 
     controls_lines = _load_controls("neo")
+
+    settings_run = dict(settings or {})
+    dphi_setting = settings_run.get("DPHI0DR")
+    dphi_requested = False
+    if isinstance(dphi_setting, str):
+        dphi_requested = dphi_setting.strip().lower() in {"1", "1.0", "true", ".true.", "t", "yes", "on"}
+    elif isinstance(dphi_setting, bool):
+        dphi_requested = dphi_setting
+    elif dphi_setting is not None:
+        try:
+            dphi_requested = float(dphi_setting) == 1.0
+        except (TypeError, ValueError):
+            dphi_requested = False
+
+    if dphi_requested:
+        if not all(hasattr(state, name) for name in ("Er", "te", "roa", "a")):
+            raise RuntimeError("DPHI0DR=1 requested, but state is missing one of Er/te/roa/a")
+
+        roa = np.asarray(state.roa, dtype=float)
+        er = np.asarray(state.Er, dtype=float)
+        te = np.asarray(state.te, dtype=float)
+
+        er_eval = float(np.interp(float(rho), roa, er))
+        te_eval = float(np.interp(float(rho), roa, te))
+        te_safe = te_eval if abs(te_eval) > 1e-30 else np.copysign(1e-30, te_eval if te_eval != 0.0 else 1.0)
+
+        # User-requested normalization: DPHI0DR = -Er * (a * e / te)
+        settings_run["DPHI0DR"] = -er_eval * (float(state.a) * e / te_safe)
+
     lines = _merge_controls_and_locpargen(
         controls_lines,
         locpargen_file,
-        settings,
+        settings_run,
         multipliers,
     )
 
