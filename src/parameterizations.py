@@ -25,7 +25,7 @@ import numpy as np
 from scipy.interpolate import InterpolatedUnivariateSpline as linear, Akima1DInterpolator as akima, PchipInterpolator as pchip, CubicSpline
 from tools import calc
 from scipy.special import erf
-from scipy.optimize import curve_fit
+from scipy.optimize import curve_fit, brentq
 import scipy as sp  
 from scipy.optimize import least_squares, minimize
 from scipy.special import gamma as Gamma
@@ -232,10 +232,12 @@ class Spline(ParameterBase):
     def _integrate_aLy(self, prof: str, x_eval: np.ndarray, spl: Any, bc_value: float, bc_loc: float) -> np.ndarray:
         """
         Integrate spline of a/Ly to recover y(x) via
-            dy/dx = -(aLy/a) * y
+            dy/dx = -aLy * y   (for x = r/a dimensionless)
 
-            => y(x) = y_bc * exp(-∫[bc_loc to x] (aLy/a) dx')
-        
+            => y(x) = y_bc * exp(-∫[bc_loc to x] aLy dx')
+
+        For coord='roa', x = r/a is dimensionless and aLy ≡ a/Ly = -d(ln y)/dx,
+        so no 1/a factor appears in the exponent.
         For bc_loc = 1.0 (edge), integrating inward (decreasing x) gives positive integral.
         For bc_loc = 0.0 (axis), integrating outward (increasing x) gives negative integral.
         """
@@ -243,24 +245,11 @@ class Spline(ParameterBase):
         if not hasattr(spl, "antiderivative"):
             raise TypeError(f"Spline type {type(spl)} has no .antiderivative()")
 
-        # Antiderivative F(x) = ∫ aLy dx
-        #F = spl.antiderivative()
-        #F_bc = float(F(bc_loc))
-        #F_eval = F(x_eval)
-        
-        # Integral from bc_loc to x_eval: ∫[bc_loc to x] aLy dx' = F(x) - F(bc_loc)
-        #integral = np.nan_to_num(F_eval - F_bc, nan=0.0)
-        
-        # y(x) = y_bc * exp(-∫[bc_loc to x] (aLy/a) dx')
-        # Note: aLy spline is already in units of a/Ly, so we need to divide by a
-        # Since x = r/a is dimensionless and aLy ≡ a/Ly,
-        # the integral ∫ aLy dx is dimensionless and no extra factor of a appears.
-        # y(x) = y_bc * exp(-∫[bc_loc to x] aLy dx')
-        #phase = -integral / self.a  # Divide by a to convert aLy → gradient
-
+        # y(x) = y_bc * exp(-∫[bc_loc→x] aLy dx')
+        # aLy = a/Ly = -d(ln y)/d(r/a), so the integral is already dimensionless.
         F = spl.antiderivative()
         phase = -(F(x_eval) - F(bc_loc))
-        
+
         return bc_value * np.exp(phase)
 
     # ------------------------------
@@ -400,10 +389,9 @@ class Spline(ParameterBase):
             elif self.defined_on == "y":
                 y = spline(x_eval)
                 dy = spline.derivative(1)(x_eval)
-                # aLy = -a * (dy/dx) / y
-                # Avoid division by zero
+                # aLy = a/Ly = -(dy/dx)/y  for x = r/a dimensionless
                 y_safe = np.where(np.abs(y) < 1e-12, 1e-12, y)
-                aLy = -self.a * dy / y_safe
+                aLy = -dy / y_safe
             else:
                 raise ValueError(f"Invalid defined_on: {self.defined_on}")
             out[prof] = np.clip(aLy, a_min=0, a_max=None)
@@ -412,11 +400,10 @@ class Spline(ParameterBase):
 
     def get_curvature(self, params: Dict[str, np.ndarray], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
         """Compute d²y/dx² on x_eval.
-        
-        When defined_on='aLy':
-            y' = -(aLy/a) * y
-            y'' = -(1/a) * (aLy' * y + aLy * y')
-            y'' = -(y/a) * (aLy' - (aLy²/a))
+
+        For coord='roa' (x = r/a dimensionless), aLy = -d(ln y)/dx, so:
+            y' = -aLy * y
+            y'' = -(aLy' * y + aLy * y') = -y * (aLy' - aLy²)
         """
         out = {}
         for prof, prof_params in params.items():
@@ -459,10 +446,10 @@ class Spline(ParameterBase):
                 
                 # Avoid division issues and NaN propagation
                 y_safe = np.where(np.abs(y) < 1e-12, 1e-12, y)
-                
-                # y'' = -(y/a) * (aLy' - (aLy²/a))
-                curv = -(y_safe / self.a) * (aLy_prime - (aLy**2) / self.a)
-                
+
+                # y'' = -y * (aLy' - aLy²)  for x = r/a dimensionless
+                curv = -y_safe * (aLy_prime - aLy**2)
+
                 # Clean up any remaining NaN/inf values
                 curv = np.nan_to_num(curv, nan=0.0, posinf=0.0, neginf=0.0)
             else:
@@ -1285,7 +1272,7 @@ class Polynomial(ParameterBase):
         
         self.polynomial_class = options.get('polynomial_class', 'legendre').lower()
         self.degree = int(options.get('degree', 3))  # Degree of polynomial
-        self.defined_on = 'aLy'
+        self.defined_on = options.get('defined_on', 'aLy')
         
         # Generate parameter names: a_0, a_1, ..., a_{degree}
         self.param_names = [f"a_{i}" for i in range(self.degree + 1)]
@@ -1404,24 +1391,31 @@ class Polynomial(ParameterBase):
             aLy_key = f"aL{prof}"
             
             if hasattr(state, aLy_key):
+                y_data = np.asarray(getattr(state, prof))[mask]
                 aLy_data = np.asarray(getattr(state, aLy_key))[mask]
             else:
                 # Compute a/Ly from profile data if not available
                 y_data = np.asarray(getattr(state, prof))[mask]
                 dy_dx = np.gradient(y_data, x_fit)
                 aLy_data = -self.a * dy_dx / (y_data + 1e-12)
+
+            if self.defined_on == 'aLy':
+                fit_data = aLy_data
+            else:
+                fit_data = y_data
+
             
             # Fit polynomial coefficients using least squares
             # numpy polynomial fit returns coefficients in increasing degree order
             try:
                 if self.polynomial_class == 'legendre':
-                    coeffs = np.polynomial.legendre.legfit(x_fit_canonical, aLy_data, deg=self.degree, 
+                    coeffs = np.polynomial.legendre.legfit(x_fit_canonical, fit_data, deg=self.degree, 
                                                           full=False)
                 elif self.polynomial_class == 'chebyshev':
-                    coeffs = np.polynomial.chebyshev.chebfit(x_fit_canonical, aLy_data, deg=self.degree, 
+                    coeffs = np.polynomial.chebyshev.chebfit(x_fit_canonical, fit_data, deg=self.degree, 
                                                             full=False)
                 elif self.polynomial_class == 'hermite':
-                    coeffs = np.polynomial.hermite.hermfit(x_fit_canonical, aLy_data, deg=self.degree, 
+                    coeffs = np.polynomial.hermite.hermfit(x_fit_canonical, fit_data, deg=self.degree, 
                                                           full=False)
                 
                 # Store coefficients as parameters
@@ -1429,7 +1423,7 @@ class Polynomial(ParameterBase):
                 
                 # Estimate uncertainties (simplified - use residual-based estimate)
                 poly_eval = self._create_polynomial(coeffs)(x_fit_canonical)
-                residual_std = np.std(aLy_data - poly_eval)
+                residual_std = np.std(fit_data - poly_eval)
                 params_std[prof] = {f"a_{i}": residual_std * self.sigma for i in range(len(coeffs))}
                 
             except Exception as e:
@@ -1443,144 +1437,137 @@ class Polynomial(ParameterBase):
         return params, params_std
     
     def get_aLy(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute a/Ly(x) = Σ(a_i * P_i(x)) using polynomial evaluation.
-        
-        Rescales x from user domain to canonical [-1, 1] before evaluation.
+        """Compute a/Ly(x) on x_eval.
+
+        When defined_on='aLy': evaluate the polynomial directly.
+        When defined_on='y':   aLy = -a * (dy/dx) / y, using poly.deriv() with chain rule.
         """
         out = {}
         x_eval = np.asarray(x_eval)
-        
-        # Rescale to canonical domain
         x_canonical = self._rescale_to_canonical(x_eval)
-        
+        dx_canonical_dx = 2.0 / (self.domain[1] - self.domain[0])
+
         for prof, prof_params in params.items():
-            # Extract coefficients in order
             coeffs = np.array([prof_params.get(f"a_{i}", 0.0) for i in range(self.degree + 1)])
-            
-            # Create and evaluate polynomial (on canonical domain)
             poly = self._create_polynomial(coeffs)
-            aLy_eval = poly(x_canonical)
-            
-            # Store polynomial for later use
-            self.poly_aLy[prof] = poly
-            
-            out[prof] = aLy_eval
-        
+
+            if self.defined_on == 'aLy':
+                self.poly_aLy[prof] = poly
+                out[prof] = poly(x_canonical)
+
+            elif self.defined_on == 'y':
+                self.poly_y[prof] = poly
+                # Enforce y BC via constant shift (same as get_y)
+                bc_y = self.get_nearest_bc(prof, 1.0)
+                if bc_y is not None:
+                    bc_loc_canonical = self._rescale_to_canonical(np.array([bc_y['loc']]))[0]
+                    y_offset = bc_y['val'] - float(poly(bc_loc_canonical))
+                else:
+                    y_offset = 0.0
+                y_eval = poly(x_canonical) + y_offset
+                # dy/dx via chain rule; constant offset does not affect derivative
+                dy_dx = poly.deriv()(x_canonical) * dx_canonical_dx
+                y_safe = np.where(np.abs(y_eval) < 1e-12, 1e-12, y_eval)
+                out[prof] = np.clip(-self.a * dy_dx / y_safe, a_min=0, a_max=None)
+
+            else:
+                raise ValueError(f"Invalid defined_on: '{self.defined_on}'")
+
         self.aLy = out
         return out
     
     def get_y(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
-        """Compute y(x) by integrating a/Ly.
-        
-        Uses the relation: y(x) = y_bc * exp(-(1/a) ∫ aLy dx)
-        where integration is performed using the antiderivative of the polynomial.
-        
-        Rescales x from user domain to canonical [-1, 1] before integration.
+        """Compute y(x) on x_eval.
+
+        When defined_on='y':   evaluate polynomial directly; enforce y BC via constant shift.
+        When defined_on='aLy': y(x) = y_bc * exp(-(1/a) ∫[bc→x] aLy dx) using poly.integ().
         """
         out = {}
         x_eval = np.asarray(x_eval)
-        
-        # Rescale to canonical domain for integration
         x_canonical = self._rescale_to_canonical(x_eval)
-        
-        # First get aLy polynomials
-        aLy_dict = self.get_aLy(params, x_eval)
-        
-        for prof in params:
-            bc_y = self.get_nearest_bc(prof, 1.0)
-            if bc_y is None:
-                raise ValueError(f"No boundary condition for profile '{prof}' at x=1.0")
-            
-            # Get the aLy polynomial
-            poly_aLy = self.poly_aLy.get(prof)
-            if poly_aLy is None:
-                # Fallback to numerical integration on original coordinates
-                aLy_eval = aLy_dict[prof]
-                x_sorted = x_eval
-                aLy_sorted = aLy_eval
-                sort_idx = np.argsort(x_eval)
-                x_sorted = x_eval[sort_idx]
-                aLy_sorted = aLy_eval[sort_idx]
-                
-                integral = cumulative_trapezoid(aLy_sorted, x_sorted, initial=0.0)
-                integral_bc = np.interp(bc_y['loc'], x_sorted, integral)
-                phase = -(1.0 / self.a) * (integral - integral_bc)
-                y_sorted = bc_y['val'] * np.exp(phase)
-                
-                # Unsort
-                y_eval = np.empty_like(y_sorted)
-                y_eval[sort_idx] = y_sorted
-            else:
-                # Use polynomial integration (antiderivative) on canonical domain
+
+        if self.defined_on == 'y':
+            for prof, prof_params in params.items():
+                coeffs = np.array([prof_params.get(f"a_{i}", 0.0) for i in range(self.degree + 1)])
+                poly = self._create_polynomial(coeffs)
+                self.poly_y[prof] = poly
+                y_eval = poly(x_canonical)
+                # Enforce y BC via constant shift (preserves polynomial shape)
+                bc_y = self.get_nearest_bc(prof, 1.0)
+                if bc_y is not None:
+                    bc_loc_canonical = self._rescale_to_canonical(np.array([bc_y['loc']]))[0]
+                    y_eval = y_eval + (bc_y['val'] - float(poly(bc_loc_canonical)))
+                out[prof] = np.clip(y_eval, a_min=0, a_max=None)
+
+        elif self.defined_on == 'aLy':
+            # Populate poly_aLy cache
+            self.get_aLy(params, x_eval)
+            # Convert canonical integral d(x_canonical) to physical-x integral dx
+            # x_canonical = 2*(x - x_min)/(x_max - x_min) - 1  =>  dx = (x_range/2) d(x_canonical)
+            integral_scale = (self.domain[1] - self.domain[0]) / 2.0
+            for prof in params:
+                bc_y = self.get_nearest_bc(prof, 1.0)
+                if bc_y is None:
+                    raise ValueError(f"No boundary condition for profile '{prof}' at x=1.0")
+                poly_aLy = self.poly_aLy.get(prof)
+                if poly_aLy is None:
+                    raise ValueError(f"No aLy polynomial found for profile '{prof}'")
+                # Antiderivative F(ξ) = ∫ aLy dξ on canonical domain
                 poly_integral = poly_aLy.integ()
-                
-                # Rescale bc_y['loc'] to canonical domain
                 bc_loc_canonical = self._rescale_to_canonical(np.array([bc_y['loc']]))[0]
-                
-                # Evaluate integral at x and at boundary (on canonical domain)
-                integral_x = poly_integral(x_canonical)
-                integral_bc = poly_integral(bc_loc_canonical)
-
-                # Convert canonical integral d(x_canonical) to physical-x integral dx
-                # x_canonical = 2*(x - x_min)/(x_max - x_min) - 1  =>  dx = (x_range/2) d(x_canonical)
-                x_range = (self.domain[1] - self.domain[0])
-                integral_scale = x_range / 2.0
-                
-                # Compute phase: ∫[bc_loc to x] aLy dx' = F(x) - F(bc_loc)
-                phase = -(1.0 / self.a) * (integral_scale * (integral_x - integral_bc))
-
-                # Clip phase to prevent overflow
+                # phase = -(1/a) * ∫[bc_loc→x] aLy dx  (scale converts canonical → physical)
+                phase = -(1.0 / 1) * integral_scale * (
+                    poly_integral(x_canonical) - poly_integral(bc_loc_canonical)
+                )
                 phase = np.clip(phase, -50, 50)
-                
-                y_eval = bc_y['val'] * np.exp(phase)
-            
-            out[prof] = y_eval
-        
+                out[prof] = bc_y['val'] * np.exp(phase)
+
+        else:
+            raise ValueError(f"Invalid defined_on: '{self.defined_on}'")
+
         self.y = out
         return out
     
     def get_curvature(self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray) -> Dict[str, np.ndarray]:
         """Compute d²y/dx² using polynomial derivatives.
-        
-        Given y' = -(aLy/a) * y, we have:
-            y'' = -(1/a) * (aLy' * y + aLy * y')
-            y'' = -(y/a) * (aLy' - (aLy²/a))
-        
-        For polynomials, aLy' is computed using .deriv() method.
-        Rescales x from user domain to canonical [-1, 1] before differentiation.
+
+        When defined_on='y':   d²y/dx² = poly.deriv(2)(ξ) * (dξ/dx)², with chain rule.
+        When defined_on='aLy': y'' = -(y/a) * (aLy' - aLy²/a), with aLy' from poly.deriv().
         """
         out = {}
         x_eval = np.asarray(x_eval)
-        
-        # Rescale to canonical domain for differentiation
         x_canonical = self._rescale_to_canonical(x_eval)
-        
-        # Get y and aLy
-        y_dict = self.get_y(params, x_eval)
-        aLy_dict = self.get_aLy(params, x_eval)
-        
-        for prof in params:
-            y_eval = y_dict[prof]
-            aLy_eval = aLy_dict[prof]
-            
-            # Get derivative of aLy using polynomial (on canonical domain)
-            poly_aLy = self.poly_aLy.get(prof)
-            if poly_aLy is not None:
-                poly_deriv = poly_aLy.deriv()
-                # Note: poly_deriv.deriv() is d/d(x_canonical), not d/dx
-                # For physical curvature, we need d/dx, so chain rule applies
-                # dx_canonical/dx = 2/(x_max - x_min)
-                dx_canonical_dx = 2.0 / (self.domain[1] - self.domain[0])
-                aLy_prime = poly_deriv(x_canonical) * dx_canonical_dx
-            else:
-                # Fallback to numerical derivative
-                aLy_prime = np.gradient(aLy_eval, x_eval)
-            
-            # Compute curvature: y'' = -(y/a) * (aLy' - aLy²/a)
-            curvature = -(y_eval / self.a) * (aLy_prime - (aLy_eval**2 / self.a))
-            
-            out[prof] = curvature
-        
+        # Chain-rule factor: dξ/dx = 2/(x_max - x_min)
+        dx_canonical_dx = 2.0 / (self.domain[1] - self.domain[0])
+
+        if self.defined_on == 'y':
+            # Populate poly_y cache via get_y
+            self.get_y(params, x_eval)
+            for prof in params:
+                poly = self.poly_y.get(prof)
+                if poly is None:
+                    raise ValueError(f"No y polynomial found for profile '{prof}'")
+                # d²y/dx² = (d²y/dξ²) * (dξ/dx)²
+                out[prof] = poly.deriv(2)(x_canonical) * dx_canonical_dx**2
+
+        elif self.defined_on == 'aLy':
+            y_dict = self.get_y(params, x_eval)
+            aLy_dict = self.get_aLy(params, x_eval)
+            for prof in params:
+                y_eval = y_dict[prof]
+                aLy_eval = aLy_dict[prof]
+                poly_aLy = self.poly_aLy.get(prof)
+                if poly_aLy is None:
+                    raise ValueError(f"No aLy polynomial found for profile '{prof}'")
+                # aLy' in physical x via chain rule
+                aLy_prime = poly_aLy.deriv()(x_canonical) * dx_canonical_dx
+                # y'' = -(y/a) * (aLy' - aLy²/a)
+                curvature = -(y_eval / self.a) * (aLy_prime - (aLy_eval**2 / self.a))
+                out[prof] = curvature
+
+        else:
+            raise ValueError(f"Invalid defined_on: '{self.defined_on}'")
+
         self.curv = out
         return out
 
@@ -1813,36 +1800,846 @@ class BasisFunction(ParameterBase):
 
 
 class Mtanh(ParameterBase):
-    """Modified-tanh parameter model (stub)."""
+    """Modified-tanh parameter model with asymmetric (position-dependent) width.
+
+    Model
+    -----
+    y(x) = A * (-tanh(u(x)) + 1) - m*(x-1) + b
+
+    where the argument uses a spatially varying width:
+
+        w(x)  = Delta_0 * (1 + delta*(x - c))
+        u(x)  = (x - c) / w(x)
+        du/dx = Delta_0 / w(x)^2 = 1 / (Delta_0 * (1 + delta*(x-c))^2)
+
+    So:
+
+        dy/dx = -A * sech^2(u(x)) / (Delta_0*(1+delta*(x-c))^2) - m
+
+    Free parameters (solver space): {log_A, log_Delta_0, delta, m}
+        A      > 0  : amplitude
+        Delta_0 > 0 : characteristic width (at the pedestal centre x=c)
+        delta       : width asymmetry  — w stretches linearly with distance from c
+        m      >= 0 : linear slope contribution to gradient
+
+    Boundary conditions enforced deterministically at x = 1
+    --------------------------------------------------------
+    Define:
+        f1  = 1 + delta*(1 - c)         [= w(1)/Delta_0]
+        u1  = (c - 1) / (Delta_0 * f1)  [tanh argument at x=1; note tanh(u1) < 0]
+
+    Then the aLy BC gives the root-finding equation for c:
+
+        A * sech^2(u1) / (Delta_0 * f1^2) = y(1)*aLy(1) - m      ... (*)
+
+    and b is solved explicitly:
+
+        b = y(1) - A*(tanh(u1) + 1)
+
+    Note: the sign convention means tanh(u1)+1 plays the role of (-tanh((1-c)/w)+1).
+
+    Existence condition
+    -------------------
+    The RHS of (*) must be positive, so:
+
+        m < y(1) * aLy(1)
+
+    Given that, the maximum of the LHS over c (attained at c→1 where sech^2→1
+    and f1→1) is A/Delta_0, so a sufficient condition for (*) to have a solution is:
+
+        A / Delta_0 >= y(1)*aLy(1) - m
+
+    The upper bound on the RHS depends on c once delta != 0, so existence is
+    checked iteratively inside _derive_c_and_b.
+    """
 
     def __init__(self, options: Dict[str, Any]):
-        self.options = options or {}
+        super().__init__(options)
         self.defined_on = "y"
+        self.param_names = ['log_A', 'log_Delta_0', 'delta', 'm']
+        self.n_params_per_profile = len(self.param_names)
+        self.include_zero_grad_on_axis = False  # BCs enforced analytically
 
+    # ─────────────────────────────────────────────────────────
+    # Internal helpers
+    # ─────────────────────────────────────────────────────────
 
-    def get_aLy(self,params: np.ndarray, x_eval) -> np.ndarray:
-        raise NotImplementedError("MTanhParameterModel.aLy not yet implemented")
+    def _to_physical(self, p: Dict[str, float]) -> Tuple[float, float, float, float]:
+        """Return (A, Delta_0, delta, m) from solver-space params."""
+        return (
+            float(np.exp(p['log_A'])),
+            float(np.exp(p['log_Delta_0'])),
+            float(p['delta']),
+            float(p['m']),
+        )
 
-    def get_y(self,params: np.ndarray,x_eval: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("MTanhParameterModel.y not yet implemented")
+    def _resolve_bcs(self, prof: str) -> Tuple[float, float]:
+        """Return (y_bc, aLy_bc) at x=1 for the given profile."""
+        bc_y   = self.get_nearest_bc(prof, 1.0)
+        bc_aLy = self.get_nearest_bc(f'aL{prof}', 1.0)
+        if bc_y is None:
+            raise ValueError(f"No y BC found for profile '{prof}'")
+        if bc_aLy is None:
+            raise ValueError(f"No aLy BC found for profile '{prof}'")
+        return float(bc_y['val']), float(bc_aLy['val'])
 
-    def get_curvature(self,params: np.ndarray,x_eval: np.ndarray) -> np.ndarray:
-        raise NotImplementedError("MTanhParameterModel.curvature not yet implemented")
+    @staticmethod
+    def _f1(c: float, delta: float) -> float:
+        """Width factor at x=1:  f1 = 1 + delta*(1-c). Floored at 1e-6."""
+        return max(1.0 + delta * (1.0 - c), 1e-6)
+
+    @staticmethod
+    def _u1(c: float, Delta_0: float, delta: float) -> float:
+        """Tanh argument at x=1:  u1 = (c-1) / (Delta_0 * f1)."""
+        f1 = Mtanh._f1(c, delta)
+        return (c - 1.0) / (Delta_0 * f1)
+
+    def _derive_c_and_b(
+        self,
+        A: float, Delta_0: float, delta: float, m: float,
+        y_bc: float, aLy_bc: float,
+    ) -> Tuple[float, float, float]:
+        """Solve for c and b from the BC equations (root-finding on c).
+
+        Root-finding equation (*):
+            F(c) = A*sech^2(u1(c)) / (Delta_0*f1(c)^2) - (y_bc*aLy_bc - m) = 0
+
+        b is then:
+            b = y_bc - A*(tanh(u1) + 1)
+
+        Returns (c, b, A_used).  A may be raised to satisfy existence.
+        """
+        rhs = y_bc * aLy_bc - m   # must be > 0
+
+        if rhs <= 0.0:
+            # m already accounts for all edge gradient; park tanh plateau far inside
+            c = -5.0
+            f1 = self._f1(c, delta)
+            u1 = self._u1(c, Delta_0, delta)
+            b  = y_bc - A * (np.tanh(u1) + 1.0)
+            return c, b, A
+
+        # Enforce sufficient existence condition: A/Delta_0 >= rhs  =>  A >= Delta_0*rhs
+        A_min = Delta_0 * rhs + 1e-10
+        A = max(A, A_min)
+
+        def F(c_):
+            f1 = self._f1(c_, delta)
+            u1 = (c_ - 1.0) / (Delta_0 * f1)
+            sech2 = 1.0 - np.tanh(u1) ** 2
+            return A * sech2 / (Delta_0 * f1 ** 2) - rhs
+
+        # F(c→1⁻) ≈ A/Delta_0 - rhs >= 0  (by existence projection above)
+        # F(c→-∞) → -rhs < 0   (sech^2→0 faster than denominator grows)
+        # So the root is bracketed in [c_lo, 1-eps].
+        c_hi = 1.0 - 1e-6
+        c_lo = -20.0
+
+        # Verify bracket (F could be non-monotone for large |delta|)
+        F_hi = F(c_hi)
+        F_lo = F(c_lo)
+
+        if F_hi < 0.0:
+            # A/Delta_0 < rhs after all (numerical edge case) — park c far inside
+            c = -5.0
+        elif F_lo > 0.0:
+            # Function positive everywhere in bracket; take leftmost boundary
+            c = c_lo
+        else:
+            try:
+                c = float(brentq(F, c_lo, c_hi, xtol=1e-8, maxiter=200))
+            except Exception:
+                c = -5.0
+
+        f1 = self._f1(c, delta)
+        u1 = self._u1(c, Delta_0, delta)
+        b  = y_bc - A * (np.tanh(u1) + 1.0)
+        return c, b, A
+
+    def _w_eval(self, x: np.ndarray, Delta_0: float, delta: float, c: float) -> np.ndarray:
+        """Spatially varying width w(x) = Delta_0*(1+delta*(x-c)), floored at 1e-6."""
+        return np.maximum(Delta_0 * (1.0 + delta * (x - c)), 1e-6)
+
+    def _y_eval(self, x: np.ndarray, A: float, Delta_0: float, delta: float,
+                m: float, c: float, b: float) -> np.ndarray:
+        w  = self._w_eval(x, Delta_0, delta, c)
+        u  = (x - c) / w
+        return A * (-np.tanh(u) + 1.0) - m * (x - 1.0) + b
+
+    def _dydx_eval(self, x: np.ndarray, A: float, Delta_0: float, delta: float,
+                   m: float, c: float) -> np.ndarray:
+        """dy/dx = -A * sech^2(u) / (Delta_0*(1+delta*(x-c))^2) - m"""
+        f     = np.maximum(1.0 + delta * (x - c), 1e-6)
+        u     = (x - c) / (Delta_0 * f)
+        sech2 = 1.0 - np.tanh(u) ** 2
+        return -A * sech2 / (Delta_0 * f ** 2) - m
+
+    # ─────────────────────────────────────────────────────────
+    # Public projection (called by solver after box-clipping)
+    # ─────────────────────────────────────────────────────────
+
+    def project_params(
+        self,
+        params: Dict[str, Dict[str, float]],
+        bc_dict: Dict[str, Any],
+    ) -> Dict[str, Dict[str, float]]:
+        """Project parameters to satisfy the existence condition m < y(1)*aLy(1).
+
+        If violated, A is raised to Delta_0*(y_bc*aLy_bc - m) so that the
+        root-finding in _derive_c_and_b succeeds.  All other params unchanged.
+        """
+        if not bc_dict:
+            return params
+        self.build_bcs(bc_dict)
+        out = {}
+        for prof, p in params.items():
+            A, Delta_0, delta, m = self._to_physical(p)
+            try:
+                y_bc, aLy_bc = self._resolve_bcs(prof)
+            except ValueError:
+                out[prof] = p
+                continue
+            rhs = y_bc * aLy_bc - m
+            if rhs > 0.0:
+                A = max(A, Delta_0 * rhs + 1e-10)
+            out[prof] = {
+                'log_A':      float(np.log(A)),
+                'log_Delta_0': p['log_Delta_0'],
+                'delta':       delta,
+                'm':           m,
+            }
+        return out
+
+    # ─────────────────────────────────────────────────────────
+    # ParameterBase interface
+    # ─────────────────────────────────────────────────────────
 
     def parameterize(
         self,
         state: Any,
         bc_dict: Dict[str, Any],
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-        raise NotImplementedError("MTanhParameterModel.parameterize not yet implemented")
-    
-    def update(
+    ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+        """Fit (A, Delta_0, delta, m) to y(x) in *state* satisfying the BCs exactly.
+
+        c and b are derived via root-finding / explicit formula inside the model
+        function, so the fit residual is purely over the free parameters.
+        """
+        self.build_bcs(bc_dict)
+        params: Dict[str, Dict[str, float]] = {}
+        params_std: Dict[str, Dict[str, float]] = {}
+
+        x_data = np.asarray(getattr(state, self.coord)).flatten()
+
+        for prof in self.predicted_profiles:
+            y_data = np.asarray(getattr(state, prof)).flatten()
+            y_bc, aLy_bc = self._resolve_bcs(prof)
+
+            def _model(x, log_A, log_D0, delta_, m_val,
+                       _y_bc=y_bc, _aLy_bc=aLy_bc):
+                A_  = np.exp(log_A)
+                D0_ = np.exp(log_D0)
+                c_, b_, A_used = self._derive_c_and_b(A_, D0_, delta_, m_val, _y_bc, _aLy_bc)
+                return self._y_eval(x, A_used, D0_, delta_, m_val, c_, b_)
+
+            p0  = [np.log(1.0),  np.log(0.01), 0,  1.]
+            blo = [np.log(1e-6), np.log(1e-6),    -100.0,    0.0]
+            bhi = [np.log(10.0),  np.log(1.0),      100.0,    10.]
+
+            try:
+                popt, pcov = curve_fit(
+                    _model, x_data, y_data,
+                    p0=p0,
+                    bounds=(blo, bhi),
+                    maxfev=20000,
+                    xtol=1e-12,
+                    ftol=1e-12,
+                )
+                perr = np.sqrt(np.maximum(np.diag(pcov), 0.0))
+            except Exception:
+                popt = np.array(p0)
+                perr = np.abs(popt) * self.sigma
+
+            params[prof]     = {'log_A': float(popt[0]), 'log_Delta_0': float(popt[1]),
+                                 'delta': float(popt[2]), 'm': float(popt[3])}
+            params_std[prof] = {'log_A': float(perr[0]), 'log_Delta_0': float(perr[1]),
+                                 'delta': float(perr[2]), 'm': float(perr[3])}
+
+        self.params     = params
+        self.params_std = params_std
+        return params, params_std
+
+    def get_y(
+        self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Evaluate y(x) on *x_eval* for each profile."""
+        x_eval = np.asarray(x_eval)
+        out: Dict[str, np.ndarray] = {}
+        for prof, p in params.items():
+            A, Delta_0, delta, m = self._to_physical(p)
+            y_bc, aLy_bc = self._resolve_bcs(prof)
+            c, b, A = self._derive_c_and_b(A, Delta_0, delta, m, y_bc, aLy_bc)
+            out[prof] = np.clip(self._y_eval(x_eval, A, Delta_0, delta, m, c, b), 0.0, None)
+        self.y = out
+        return out
+
+    def get_aLy(
+        self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Evaluate a/Ly(x) = -(dy/dx)/y on *x_eval* for each profile."""
+        x_eval = np.asarray(x_eval)
+        out: Dict[str, np.ndarray] = {}
+        for prof, p in params.items():
+            A, Delta_0, delta, m = self._to_physical(p)
+            y_bc, aLy_bc = self._resolve_bcs(prof)
+            c, b, A = self._derive_c_and_b(A, Delta_0, delta, m, y_bc, aLy_bc)
+            y    = self._y_eval(x_eval, A, Delta_0, delta, m, c, b)
+            dydx = self._dydx_eval(x_eval, A, Delta_0, delta, m, c)
+            y_safe = np.where(np.abs(y) < 1e-12, 1e-12, y)
+            out[prof] = np.clip(-dydx / y_safe, 0.0, None)
+        self.aLy = out
+        return out
+
+    def get_curvature(
+        self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Evaluate d²y/dx² on *x_eval*.
+
+        With w(x) = Delta_0*(1+delta*(x-c)) and u(x) = (x-c)/w(x):
+
+            d²y/dx² = 2A*sech^2(u) / Delta_0 * [tanh(u) / (Delta_0*f^4) + delta/f^3]
+
+        where f = 1+delta*(x-c).
+        """
+        x_eval = np.asarray(x_eval)
+        out: Dict[str, np.ndarray] = {}
+        for prof, p in params.items():
+            A, Delta_0, delta, m = self._to_physical(p)
+            y_bc, aLy_bc = self._resolve_bcs(prof)
+            c, b, A = self._derive_c_and_b(A, Delta_0, delta, m, y_bc, aLy_bc)
+            f     = np.maximum(1.0 + delta * (x_eval - c), 1e-6)
+            u     = (x_eval - c) / (Delta_0 * f)
+            tanh_ = np.tanh(u)
+            sech2 = 1.0 - tanh_ ** 2
+            out[prof] = (2.0 * A * sech2 / Delta_0) * (
+                tanh_ / (Delta_0 * f ** 4) + delta / f ** 3
+            )
+        self.curv = out
+        return out
+
+
+class SplineMtanh(ParameterBase):
+    """Hybrid: Spline parameter backbone with Mtanh profile constructor.
+
+    The optimizer works with y or a/Ly values at user-defined knot positions
+    (identical to the Spline class).  Profile evaluation uses the modified-tanh
+    analytic formula and its exact analytic first and second derivatives fitted
+    to those knot values, rather than an Akima/PCHIP/Cubic spline.
+
+    Parameters (options)
+    --------------------
+    knots : Sequence[float]
+        Positions in rho = r/a where the free parameters are defined.
+    defined_on : str
+        'y'   – knot parameters are profile values y(x_k).
+        'aLy' – knot parameters are normalised-gradient a/Ly(x_k).
+        'mixed' – requires exactly 2 knots [x_0, x_mid].  Parameters are the
+                  (y, a/Ly) pair at each knot: (y0, aLy0, y1, aLy1).  The
+                  Mtanh is solved exactly (4 equations, 4 unknowns) via
+                  nonlinear root-finding.  bc_mode='spline' not supported.
+    bc_mode : str
+        'mtanh'  (default)
+            Boundary conditions (y(1), a/Ly(1)) are sourced entirely from
+            the external bc_dict.  The pedestal centre c and offset b are
+            derived from them via root-finding, exactly as in the standalone
+            Mtanh class — the Mtanh curve passes exactly through the BC
+            values at x = 1.  Free optimizer parameters are the knot values
+            only.
+        'spline'
+            The boundary value (y(1) if defined_on='y', a/Ly(1) if
+            defined_on='aLy') is appended to the parameter vector as an
+            extra entry, making it an optimizer degree of freedom rather than
+            a fixed constraint.  c and b are still derived analytically, but
+            y_bc (or aLy_bc) is taken from the parameter vector instead of
+            bc_dict.
+    include_zero_grad_on_axis : bool
+        When True (default), and defined_on='aLy', a virtual data point
+        (x=0, a/Ly=0) is added to the knot data used for Mtanh fitting.
+    coord : str
+        'rho' or 'roa' (default).
+
+    Notes
+    -----
+    For defined_on='y' or 'aLy': the Mtanh is fitted at evaluation time via
+    least-squares.  The fit is exact for N ≤ 4 knots and approximate for N > 4.
+
+    For defined_on='mixed': the Mtanh is solved exactly from the two (y, a/Ly)
+    pairs via scipy.optimize.least_squares (trust-region, 4 equations/4 unknowns).
+
+    parameterize() always builds initial estimates from an Akima spline on
+    state.y (not state.aLy) for robustness, regardless of defined_on.
+    """
+
+    def __init__(self, options: Dict[str, Any]):
+        super().__init__(options)
+        self.knots = np.array(options.get('knots', []) or [], dtype=float)
+        self.defined_on = options.get('defined_on', 'y')
+        self.bc_mode = options.get('bc_mode', 'mtanh').lower()
+
+        if self.bc_mode not in ('mtanh', 'spline'):
+            raise ValueError("bc_mode must be 'mtanh' or 'spline'")
+        if self.defined_on not in ('y', 'aLy', 'mixed'):
+            raise ValueError("defined_on must be 'y', 'aLy', or 'mixed'")
+
+        if self.defined_on == 'mixed':
+            if len(self.knots) != 2:
+                raise ValueError("defined_on='mixed' requires exactly 2 knots: [x_0, x_mid]")
+            if self.bc_mode == 'spline':
+                raise ValueError("bc_mode='spline' is incompatible with defined_on='mixed'")
+            self.param_names = ['y0', 'aLy0', 'y1', 'aLy1']
+        else:
+            base = self.defined_on
+            self.param_names = [f'{base}{i}' for i in range(len(self.knots))]
+        self.n_params_per_profile = len(self.param_names)
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Mtanh analytic formulae (self-contained; no dependency on Mtanh class)
+    # ──────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _f(x, c: float, delta: float) -> np.ndarray:
+        """Spatially varying width factor  f(x) = 1 + δ·(x−c), floored at 1e-6."""
+        return np.maximum(1.0 + delta * (np.asarray(x, dtype=float) - c), 1e-6)
+
+    @staticmethod
+    def _y_mtanh(x, A: float, Delta_0: float, delta: float,
+                 m: float, c: float, b: float) -> np.ndarray:
+        """y(x) = A·(1 − tanh(u)) − m·(x−1) + b,   u = (x−c)/(Δ₀·f)."""
+        x = np.asarray(x, dtype=float)
+        f = SplineMtanh._f(x, c, delta)
+        u = (x - c) / (Delta_0 * f)
+        return A * (1.0 - np.tanh(u)) - m * (x - 1.0) + b
+
+    @staticmethod
+    def _dydx_mtanh(x, A: float, Delta_0: float, delta: float,
+                    m: float, c: float) -> np.ndarray:
+        """dy/dx = −A·sech²(u) / (Δ₀·f²) − m."""
+        x = np.asarray(x, dtype=float)
+        f = SplineMtanh._f(x, c, delta)
+        u = (x - c) / (Delta_0 * f)
+        sech2 = 1.0 - np.tanh(u) ** 2
+        return -A * sech2 / (Delta_0 * f ** 2) - m
+
+    @staticmethod
+    def _d2ydx2_mtanh(x, A: float, Delta_0: float, delta: float,
+                      c: float) -> np.ndarray:
+        """d²y/dx² = (2A·sech²(u)/Δ₀)·[ tanh(u)/(Δ₀·f⁴) + δ/f³ ]."""
+        x = np.asarray(x, dtype=float)
+        f = SplineMtanh._f(x, c, delta)
+        u = (x - c) / (Delta_0 * f)
+        tanh_ = np.tanh(u)
+        sech2 = 1.0 - tanh_ ** 2
+        return (2.0 * A * sech2 / Delta_0) * (
+            tanh_ / (Delta_0 * f ** 4) + delta / f ** 3
+        )
+
+    @staticmethod
+    def _derive_c_b(
+        A: float, Delta_0: float, delta: float, m: float,
+        y_bc: float, aLy_bc: float,
+    ) -> Tuple[float, float, float]:
+        """Solve for pedestal centre c and offset b from edge BCs at x = 1.
+
+        Mirrors Mtanh._derive_c_and_b exactly.  Returns (c, b, A) where A
+        may be raised to satisfy the existence condition.
+        """
+        rhs = y_bc * aLy_bc - m  # must be > 0 for a root to exist
+
+        if rhs <= 0.0:
+            c = -5.0
+            f1 = max(1.0 + delta * (1.0 - c), 1e-6)
+            u1 = (c - 1.0) / (Delta_0 * f1)
+            return c, y_bc - A * (np.tanh(u1) + 1.0), A
+
+        # Existence condition: A/Δ₀ ≥ rhs
+        A = max(A, Delta_0 * rhs + 1e-10)
+
+        def F(c_: float) -> float:
+            f1 = max(1.0 + delta * (1.0 - c_), 1e-6)
+            u1 = (c_ - 1.0) / (Delta_0 * f1)
+            return A * (1.0 - np.tanh(u1) ** 2) / (Delta_0 * f1 ** 2) - rhs
+
+        c_hi, c_lo = 1.0 - 1e-6, -20.0
+        if F(c_hi) < 0.0:
+            c = -5.0
+        elif F(c_lo) > 0.0:
+            c = c_lo
+        else:
+            try:
+                c = float(brentq(F, c_lo, c_hi, xtol=1e-8, maxiter=200))
+            except Exception:
+                c = -5.0
+
+        f1 = max(1.0 + delta * (1.0 - c), 1e-6)
+        u1 = (c - 1.0) / (Delta_0 * f1)
+        b = y_bc - A * (np.tanh(u1) + 1.0)
+        return c, b, A
+
+    # ──────────────────────────────────────────────────────────────────────
+    # Internal: Mtanh fitting to knot data
+    # ──────────────────────────────────────────────────────────────────────
+
+    def _fit_mtanh_to_knots(
         self,
-        params: Dict[str, np.ndarray],
+        x_k: np.ndarray,
+        val_k: np.ndarray,
+        y_bc: float,
+        aLy_bc: float,
+    ) -> Dict[str, float]:
+        """Fit Mtanh (A, Δ₀, δ, m) to the knot data (x_k, val_k).
+
+        c and b are derived analytically from (y_bc, aLy_bc) inside the model
+        for every candidate parameter set, so the fit residual is purely over
+        the four free shape parameters.
+
+        For defined_on='y'   : val_k = y values  → minimise ‖y_mtanh − val_k‖
+        For defined_on='aLy' : val_k = a/Ly values → minimise ‖aLy_mtanh − val_k‖
+        """
+        if self.defined_on == 'y':
+            def _model(x, log_A, log_D0, delta_, m_):
+                A_ = np.exp(log_A)
+                D0_ = np.exp(log_D0)
+                c_, b_, A_ = self._derive_c_b(A_, D0_, delta_, m_, y_bc, aLy_bc)
+                return self._y_mtanh(x, A_, D0_, delta_, m_, c_, b_)
+        else:  # defined_on == 'aLy'
+            def _model(x, log_A, log_D0, delta_, m_):
+                A_ = np.exp(log_A)
+                D0_ = np.exp(log_D0)
+                c_, b_, A_ = self._derive_c_b(A_, D0_, delta_, m_, y_bc, aLy_bc)
+                y_    = self._y_mtanh(x, A_, D0_, delta_, m_, c_, b_)
+                dydx_ = self._dydx_mtanh(x, A_, D0_, delta_, m_, c_)
+                y_safe = np.where(np.abs(y_) < 1e-12, 1e-12, y_)
+                return np.clip(-dydx_ / y_safe, 0.0, None)
+
+        # Initial guess: amplitude from knot data, moderate width
+        p0  = [np.log(1.0),  np.log(0.01), 0,  1.]
+        blo = [np.log(1e-6), np.log(1e-6),    -100.0,    0.0]
+        bhi = [np.log(10.0),  np.log(1.0),      100.0,    10.]
+
+        try:
+            popt, _ = curve_fit(
+                _model, x_k, val_k,
+                p0=p0, bounds=(blo, bhi),
+                maxfev=20000, xtol=1e-10, ftol=1e-10,
+            )
+        except Exception:
+            popt = p0
+
+        return {
+            'log_A':       float(popt[0]),
+            'log_Delta_0': float(popt[1]),
+            'delta':       float(popt[2]),
+            'm':           float(popt[3]),
+        }
+
+    @staticmethod
+    def _solve_mtanh_from_pairs(
+        x_0: float, y_0: float, aLy_0: float,
+        x_mid: float, y_mid: float, aLy_mid: float,
+        y_bc: float, aLy_bc: float,
+    ) -> Dict[str, float]:
+        """Exactly determine (A, Δ₀, δ, m) from (y, a/Ly) at two interior points.
+
+        c and b are derived from BCs at x=1 inside the residual function.
+        Solves the 4×4 nonlinear system:
+            y(x_0)      = y_0,    a/Ly(x_0)   = aLy_0
+            y(x_mid)    = y_mid,  a/Ly(x_mid) = aLy_mid
+        via scipy.optimize.least_squares (trust-region).
+        Residuals are normalised by target magnitude to balance y vs a/Ly scales.
+        """
+        def _residuals(p: np.ndarray) -> np.ndarray:
+            A_  = np.exp(p[0])
+            D0_ = np.exp(p[1])
+            try:
+                c_, b_, A_ = SplineMtanh._derive_c_b(A_, D0_, p[2], p[3], y_bc, aLy_bc)
+            except Exception:
+                return np.array([1e6, 1e6, 1e6, 1e6])
+            xs    = np.array([x_0, x_mid])
+            y_p   = SplineMtanh._y_mtanh(xs, A_, D0_, p[2], p[3], c_, b_)
+            dy_p  = SplineMtanh._dydx_mtanh(xs, A_, D0_, p[2], p[3], c_)
+            y_s   = np.where(np.abs(y_p) < 1e-12, 1e-12, y_p)
+            aLy_p = np.clip(-dy_p / y_s, 0.0, None)
+            return np.array([
+                (y_p[0]   - y_0)   / (abs(y_0)   + 1e-12),
+                (aLy_p[0] - aLy_0) / (abs(aLy_0) + 1e-12),
+                (y_p[1]   - y_mid) / (abs(y_mid)  + 1e-12),
+                (aLy_p[1] - aLy_mid) / (abs(aLy_mid) + 1e-12),
+            ])
+
+        A0  = max(y_0, y_mid, y_bc, 1e-6)
+        m0  = float(np.clip(aLy_0 * y_0, 0.0, 100.0))
+        p0  = [np.log(A0), np.log(0.05), 0.0, m0]
+        blo = [np.log(1e-6), np.log(1e-6), -100.0,   0.0]
+        bhi = [np.log(1e4),  np.log(2.0),   100.0, 100.0]
+        try:
+            res  = least_squares(_residuals, p0, bounds=(blo, bhi),
+                                 method='trf', max_nfev=20000,
+                                 xtol=1e-10, ftol=1e-10)
+            popt = res.x
+        except Exception:
+            popt = np.asarray(p0)
+        return {
+            'log_A':       float(popt[0]),
+            'log_Delta_0': float(popt[1]),
+            'delta':       float(popt[2]),
+            'm':           float(popt[3]),
+        }
+
+    def _resolve(
+        self,
+        prof: str,
+        prof_params: Dict[str, float],
+    ) -> Tuple[float, float, float, float, float, float]:
+        """Assemble knot data, fit/solve Mtanh, derive (c, b) and return full tuple.
+
+        Returns (A, Δ₀, δ, m, c, b).
+        """
+        # Collect BCs from dict (always needed for _derive_c_b)
+        bc_y   = self.get_nearest_bc(prof,        1.0)
+        bc_aLy = self.get_nearest_bc(f'aL{prof}', 1.0)
+        y_bc   = float(bc_y['val'])   if bc_y   is not None else 1.0
+        aLy_bc = float(bc_aLy['val']) if bc_aLy is not None else 1.0
+
+        if self.defined_on == 'mixed':
+            # Exact 4×4 solve: (y, aLy) pairs at x_0 and x_mid
+            fit = self._solve_mtanh_from_pairs(
+                float(self.knots[0]), float(prof_params['y0']),  float(prof_params['aLy0']),
+                float(self.knots[1]), float(prof_params['y1']),  float(prof_params['aLy1']),
+                y_bc, aLy_bc,
+            )
+        else:
+            base = self.defined_on
+            n    = len(self.knots)
+            vals = np.array([prof_params[f'{base}{i}'] for i in range(n)], dtype=float)
+            x_k  = self.knots.copy()
+
+            if self.bc_mode == 'spline':
+                bc_val = float(prof_params[f'{base}_bc'])
+                if not np.any(np.isclose(x_k, 1.0)):
+                    x_k  = np.append(x_k,  1.0)
+                    vals = np.append(vals, bc_val)
+                else:
+                    idx = int(np.argmin(np.abs(x_k - 1.0)))
+                    vals[idx] = bc_val
+                if self.defined_on == 'y':
+                    y_bc = bc_val
+                else:
+                    aLy_bc = bc_val
+
+            if self.include_zero_grad_on_axis and self.defined_on == 'aLy':
+                if not np.any(np.isclose(x_k, 0.0)):
+                    x_k  = np.insert(x_k,  0, 0.0)
+                    vals = np.insert(vals, 0, 0.0)
+
+            fit = self._fit_mtanh_to_knots(x_k, vals, y_bc, aLy_bc)
+
+        A  = np.exp(fit['log_A'])
+        D0 = np.exp(fit['log_Delta_0'])
+        c, b, A = self._derive_c_b(A, D0, fit['delta'], fit['m'], y_bc, aLy_bc)
+        return A, D0, fit['delta'], fit['m'], c, b
+
+    # ──────────────────────────────────────────────────────────────────────
+    # ParameterBase interface
+    # ──────────────────────────────────────────────────────────────────────
+
+    def project_params(
+        self,
+        params: Dict[str, Dict[str, float]],
         bc_dict: Dict[str, Any],
-        x_eval: np.ndarray,
-    ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray]]:
-        raise NotImplementedError("MTanhParameterModel.update not yet implemented")
+    ) -> Dict[str, Dict[str, float]]:
+        """Snap knot values to what the fitted Mtanh actually predicts at those knots.
+
+        After bound-clipping, individual knot values may be inconsistent with
+        the best-fit Mtanh through the full set.  When N > 4 knots the Mtanh
+        fit is overdetermined; the optimizer can accumulate 'phantom' degrees
+        of freedom where a single knot drifts far from the curve without
+        significantly changing the output, because the least-squares fit
+        averages across all knots.  This causes inaccurate Jacobian estimates
+        and poor solver convergence.
+
+        This projection re-evaluates the Mtanh (fitted from the *current* knot
+        values) at every knot location and stores those values back as the
+        parameters, keeping the parameter vector consistent with the curve.
+        For N ≤ 4 this is a no-op (the Mtanh passes exactly through all knots).
+        """
+        if not bc_dict:
+            return params
+        self.build_bcs(bc_dict)
+        out = {}
+        for prof, pv in params.items():
+            try:
+                A, D0, delta, m, c, b = self._resolve(prof, pv)
+            except Exception:
+                out[prof] = pv
+                continue
+
+            if self.defined_on == 'mixed':
+                x_k    = self.knots
+                y_k    = self._y_mtanh(x_k, A, D0, delta, m, c, b)
+                dydx_k = self._dydx_mtanh(x_k, A, D0, delta, m, c)
+                y_safe = np.where(np.abs(y_k) < 1e-12, 1e-12, y_k)
+                aLy_k  = np.clip(-dydx_k / y_safe, 0.0, None)
+                out[prof] = {
+                    'y0': float(y_k[0]),   'aLy0': float(aLy_k[0]),
+                    'y1': float(y_k[1]),   'aLy1': float(aLy_k[1]),
+                }
+            else:
+                base = self.defined_on
+                n    = len(self.knots)
+                if self.defined_on == 'y':
+                    projected = self._y_mtanh(self.knots, A, D0, delta, m, c, b)
+                else:  # 'aLy'
+                    y_k    = self._y_mtanh(self.knots, A, D0, delta, m, c, b)
+                    dydx_k = self._dydx_mtanh(self.knots, A, D0, delta, m, c)
+                    y_safe = np.where(np.abs(y_k) < 1e-12, 1e-12, y_k)
+                    projected = np.clip(-dydx_k / y_safe, 0.0, None)
+                new_pv = {f'{base}{i}': float(projected[i]) for i in range(n)}
+                if self.bc_mode == 'spline':
+                    x_bc = np.array([1.0])
+                    if self.defined_on == 'y':
+                        bc_proj = float(self._y_mtanh(x_bc, A, D0, delta, m, c, b)[0])
+                    else:
+                        y_b  = self._y_mtanh(x_bc, A, D0, delta, m, c, b)
+                        dy_b = self._dydx_mtanh(x_bc, A, D0, delta, m, c)
+                        y_safe_b = float(max(abs(float(y_b[0])), 1e-12))
+                        bc_proj = float(np.clip(-float(dy_b[0]) / y_safe_b, 0.0, None))
+                    new_pv[f'{base}_bc'] = bc_proj
+                out[prof] = new_pv
+        return out
+
+    def parameterize(
+        self, state, bc_dict: Dict[str, Any]
+    ) -> Tuple[Dict[str, Dict[str, float]], Dict[str, Dict[str, float]]]:
+        """Fit Mtanh to the full state.y profile; extract knot parameters per defined_on.
+
+        Workflow (same for all modes):
+        1. Fit (A, Δ₀, δ, m) to the complete y(x) profile via least-squares,
+           with c and b derived from edge BCs at each candidate evaluation.
+        2. Evaluate the fitted Mtanh at self.knots to obtain y_k and aLy_k.
+        3. Assemble pdict according to defined_on:
+           'y'     → y_k values at knots
+           'aLy'   → aLy_k = −(dy/dx)/y at knots
+           'mixed' → (y_k, aLy_k) pair at each of the two knots
+        """
+        self.build_bcs(bc_dict)
+        self.a = getattr(state, 'a', 1.0)
+        params: Dict[str, Dict[str, float]] = {}
+        params_std: Dict[str, Dict[str, float]] = {}
+
+        x_data = np.asarray(getattr(state, self.coord)).flatten()
+
+        for prof in self.predicted_profiles:
+            y_raw = np.asarray(getattr(state, prof)).flatten()
+
+            bc_y   = self.get_nearest_bc(prof,        1.0)
+            bc_aLy = self.get_nearest_bc(f'aL{prof}', 1.0)
+            y_bc   = float(bc_y['val'])   if bc_y   is not None else float(y_raw[-1]) if len(y_raw) else 1.0
+            aLy_bc = float(bc_aLy['val']) if bc_aLy is not None else 1.0
+
+            # Fit Mtanh to the full y(x) profile regardless of defined_on
+            def _model_y(x, log_A, log_D0, delta_, m_):
+                A_  = np.exp(log_A)
+                D0_ = np.exp(log_D0)
+                c_, b_, A_ = self._derive_c_b(A_, D0_, delta_, m_, y_bc, aLy_bc)
+                return self._y_mtanh(x, A_, D0_, delta_, m_, c_, b_)
+
+            log_A0 = np.log(max(float(np.mean(np.abs(y_raw))), 1e-6))
+            p0  = [log_A0, np.log(0.01), 0.0, 1.0]
+            blo = [np.log(1e-6), np.log(1e-6), -100.0,   0.0]
+            bhi = [np.log(1e4),  np.log(2.0),   100.0, 100.0]
+            try:
+                popt, _ = curve_fit(
+                    _model_y, x_data, y_raw,
+                    p0=p0, bounds=(blo, bhi),
+                    maxfev=20000, xtol=1e-10, ftol=1e-10,
+                )
+            except Exception:
+                popt = np.asarray(p0)
+
+            A     = np.exp(popt[0])
+            D0    = np.exp(popt[1])
+            delta = float(popt[2])
+            m     = float(popt[3])
+            c, b, A = self._derive_c_b(A, D0, delta, m, y_bc, aLy_bc)
+
+            # Evaluate the fitted Mtanh at knot positions
+            y_k    = self._y_mtanh(self.knots, A, D0, delta, m, c, b)
+            dydx_k = self._dydx_mtanh(self.knots, A, D0, delta, m, c)
+            y_safe = np.where(np.abs(y_k) < 1e-12, 1e-12, y_k)
+            aLy_k  = np.clip(-dydx_k / y_safe, 0.0, None)
+
+            if self.defined_on == 'y':
+                pdict: Dict[str, float] = {f'y{i}': float(y_k[i]) for i in range(len(self.knots))}
+                if self.bc_mode == 'spline':
+                    pdict['y_bc'] = float(self._y_mtanh(np.array([1.0]), A, D0, delta, m, c, b)[0])
+            elif self.defined_on == 'aLy':
+                pdict = {f'aLy{i}': float(aLy_k[i]) for i in range(len(self.knots))}
+                if self.bc_mode == 'spline':
+                    y_1  = self._y_mtanh(np.array([1.0]), A, D0, delta, m, c, b)
+                    dy_1 = self._dydx_mtanh(np.array([1.0]), A, D0, delta, m, c)
+                    pdict['aLy_bc'] = float(np.clip(-float(dy_1[0]) / max(abs(float(y_1[0])), 1e-12), 0.0, None))
+            else:  # 'mixed'
+                pdict = {
+                    'y0':   float(y_k[0]),   'aLy0': float(aLy_k[0]),
+                    'y1':   float(y_k[1]),   'aLy1': float(aLy_k[1]),
+                }
+
+            params[prof]     = pdict
+            params_std[prof] = {k: abs(v) * self.sigma for k, v in pdict.items()}
+
+        self.params     = params
+        self.params_std = params_std
+        return params, params_std
+
+    def get_y(
+        self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Evaluate y(x) on *x_eval* using the Mtanh fitted to knot data."""
+        x_eval = np.asarray(x_eval)
+        out: Dict[str, np.ndarray] = {}
+        for prof, pv in params.items():
+            A, D0, delta, m, c, b = self._resolve(prof, pv)
+            out[prof] = np.clip(
+                self._y_mtanh(x_eval, A, D0, delta, m, c, b), 0.0, None
+            )
+        self.y = out
+        return out
+
+    def get_aLy(
+        self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Evaluate a/Ly(x) = −(dy/dx)/y on *x_eval* using the Mtanh formula."""
+        x_eval = np.asarray(x_eval)
+        out: Dict[str, np.ndarray] = {}
+        for prof, pv in params.items():
+            A, D0, delta, m, c, b = self._resolve(prof, pv)
+            y    = self._y_mtanh(x_eval, A, D0, delta, m, c, b)
+            dydx = self._dydx_mtanh(x_eval, A, D0, delta, m, c)
+            y_safe = np.where(np.abs(y) < 1e-12, 1e-12, y)
+            out[prof] = np.clip(-dydx / y_safe, 0.0, None)
+        self.aLy = out
+        return out
+
+    def get_curvature(
+        self, params: Dict[str, Dict[str, float]], x_eval: np.ndarray
+    ) -> Dict[str, np.ndarray]:
+        """Evaluate d²y/dx² on *x_eval* using the analytic Mtanh second derivative."""
+        x_eval = np.asarray(x_eval)
+        out: Dict[str, np.ndarray] = {}
+        for prof, pv in params.items():
+            A, D0, delta, m, c, b = self._resolve(prof, pv)
+            out[prof] = self._d2ydx2_mtanh(x_eval, A, D0, delta, c)
+        self.curv = out
+        return out
 
 
 class LogSpline(Spline):
@@ -2064,6 +2861,7 @@ class LogPolynomial(Polynomial):
 PARAMETER_MODELS = {
     'spline': Spline,
     'mtanh': Mtanh,
+    'spline_mtanh': SplineMtanh,
     'gaussian': Gaussian,
     'polynomial': Polynomial,
     'basis': BasisFunction,
